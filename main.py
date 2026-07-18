@@ -2,6 +2,8 @@ import json
 import os
 import sys
 import logging
+from datetime import datetime
+from urllib.parse import quote
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton,
@@ -9,9 +11,10 @@ from PySide6.QtWidgets import (
     QTabWidget, QFormLayout, QGroupBox, QMessageBox,
     QAbstractItemView, QDialog, QSplitter, QScrollArea,
     QCheckBox, QFrame,
+    QMenu, QInputDialog,
 )
 from PySide6.QtCore import Qt, QTimer, QThread, QUrl, QTime
-from PySide6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QLinearGradient, QBrush
+from PySide6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QLinearGradient, QBrush, QDesktopServices
 
 from modules.db_manager import DBManager
 from modules.workers import ApiWorker, MarketRefreshWorker, C5RentalWorker
@@ -179,6 +182,82 @@ class ItemEditDialog(QDialog):
         }
 
 
+def _rental_float_key(value) -> str:
+    try:
+        return f"{float(str(value).strip()):.12f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _parse_rental_datetime(value) -> datetime:
+    try:
+        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return datetime.min
+
+
+class RentalHistoryDialog(QDialog):
+    """Shows all manually imported orders for one physical float value."""
+
+    def __init__(self, item_name, float_value, orders, parent=None):
+        super().__init__(parent)
+        self.orders = sorted(orders, key=lambda order: _parse_rental_datetime(order.get("start_time")))
+        self.setWindowTitle("出租订单历史")
+        self.resize(920, 430)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"{item_name}  ·  磨损 {float_value}"))
+        layout.addWidget(QLabel("双击订单查看完整日期、收入和同步来源。"))
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels([
+            "类型", "平台", "状态", "出租时间", "归还时间", "实际收入", "日租估算",
+        ])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        for index, order in enumerate(self.orders):
+            self.table.insertRow(index)
+            start = _parse_rental_datetime(order.get("start_time"))
+            end = _parse_rental_datetime(order.get("return_time"))
+            income = float(order.get("income", 0.0) or 0.0)
+            duration = (end - start).total_seconds() / 86400 if end > start else 0.0
+            daily = income / duration if duration > 0 else 0.0
+            values = [
+                "首次出租" if index == 0 else "转租",
+                order.get("platform", ""), order.get("status", ""),
+                order.get("start_time", ""), order.get("return_time", ""),
+                f"¥ {income:.2f}", f"¥ {daily:.2f}" if daily > 0 else "—",
+            ]
+            for column, value in enumerate(values):
+                self.table.setItem(index, column, QTableWidgetItem(str(value)))
+        self.table.doubleClicked.connect(self._show_order_detail)
+        layout.addWidget(self.table)
+
+        close_button = QPushButton("关闭")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+
+    def _show_order_detail(self, index):
+        if not index.isValid() or index.row() >= len(self.orders):
+            return
+        order = self.orders[index.row()]
+        order_type = "首次出租" if index.row() == 0 else "转租"
+        QMessageBox.information(
+            self,
+            "订单详情",
+            "\n".join([
+                f"类型：{order_type}",
+                f"平台：{order.get('platform', '')}",
+                f"订单号：{order.get('order_no', '')}",
+                f"状态：{order.get('status', '')}",
+                f"出租：{order.get('start_time', '')}",
+                f"归还：{order.get('return_time', '')}",
+                f"实际收入：¥ {float(order.get('income', 0.0) or 0.0):.2f}",
+            ]),
+        )
+
+
 class CS2ManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -260,10 +339,6 @@ class CS2ManagerApp(QMainWindow):
         self.init_dashboard_tab()
         self.tabs.addTab(self.tab_dashboard, "📊 资产与出租管理")
 
-        self.tab_orders = QWidget()
-        self.init_orders_tab()
-        self.tabs.addTab(self.tab_orders, "📋 出租订单")
-
         self.tab_market = QWidget()
         self.init_market_tab()
         self.tabs.addTab(self.tab_market, "🔍 一览式大盘行情")
@@ -335,6 +410,9 @@ class CS2ManagerApp(QMainWindow):
         edit_btn.setObjectName("primaryBtn")
         edit_btn.clicked.connect(self.edit_selected_item)
 
+        history_btn = QPushButton("📜 订单历史")
+        history_btn.clicked.connect(self.show_selected_rental_history)
+
         del_btn = QPushButton("🗑️ 删除")
         del_btn.setObjectName("dangerBtn")
         del_btn.clicked.connect(self.delete_selected_item)
@@ -349,6 +427,7 @@ class CS2ManagerApp(QMainWindow):
 
         toolbar.addWidget(add_btn)
         toolbar.addWidget(edit_btn)
+        toolbar.addWidget(history_btn)
         toolbar.addWidget(del_btn)
         toolbar.addWidget(refresh_btn)
         toolbar.addStretch()
@@ -358,12 +437,16 @@ class CS2ManagerApp(QMainWindow):
 
         # ── 饰品表格 ──
         self.table = QTableWidget()
-        self.table.setColumnCount(12)
+        self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
             "ID", "饰品名称", "相位", "模板", "磨损度", "成本(元)",
             "平台", "状态/倒计时", "日租金", "已租天数", "累计收益", "备注"
         ])
 
+        self.table.setHorizontalHeaderLabels([
+            "ID", "饰品名称", "相位", "模板", "磨损度", "成本(元)", "平台",
+            "状态 / 倒计时", "日租估算", "最新出租日期", "订单收入", "订单类型", "备注",
+        ])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
@@ -372,7 +455,7 @@ class CS2ManagerApp(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet("alternate-background-color: #1e1e2e;")
-        self.table.doubleClicked.connect(self.edit_selected_item)
+        self.table.doubleClicked.connect(self.show_selected_rental_history)
 
         layout.addWidget(self.table)
 
@@ -494,6 +577,7 @@ class CS2ManagerApp(QMainWindow):
         orders = result.get("orders", [])
         self.db.upsert_rental_orders("C5GAME", orders)
         self._refresh_orders_table()
+        self.load_data()
         snapshot_path = result.get("snapshot_path", "")
         self.c5_sync_status.setText(f"C5 已同步 {len(orders)} 条订单；原始页面快照已私有保存。")
         logger.info("[C5] 手动同步 %s 条订单，页面快照：%s", len(orders), snapshot_path)
@@ -551,17 +635,27 @@ class CS2ManagerApp(QMainWindow):
         force_eco_btn.clicked.connect(lambda: self._refresh_all_market_data(force_eco=True))
         search_layout.addWidget(force_eco_btn)
 
+        self.market_remove_btn = QPushButton("🗑 删除选中")
+        self.market_remove_btn.setObjectName("dangerBtn")
+        self.market_remove_btn.clicked.connect(self._remove_selected_market_items)
+        search_layout.addWidget(self.market_remove_btn)
+
         layout.addLayout(search_layout)
 
         # ── 一览式大盘表格 ──
         # 列: 图片(48x48) | 饰品名称+Phase | CSQAQ最低售价 | ECO最低日租 | IGXE最低日租 | 更新时间 | 展开明细
         self.market_table = QTableWidget()
-        self.market_table.setColumnCount(7)
+        self.market_table.setColumnCount(8)
         self.market_table.setHorizontalHeaderLabels([
             "图片", "饰品名称 / Phase", "CSQAQ 最低售价",
             "ECO 最低日租", "IGXE 最低日租", "更新时间", "操作"
         ])
         hdr = self.market_table.horizontalHeader()
+        self.market_table.setHorizontalHeaderLabels([
+            "图片", "饰品名称 / Phase", "CSQAQ 最低售价", "ECO 最低日租",
+            "C5 租金（短 / 长）", "悠悠 租金（短 / 长）",
+            "IGXE 租金（短 / 长）", "更新时间",
+        ])
         hdr.setSectionResizeMode(0, QHeaderView.Fixed)
         hdr.setSectionResizeMode(1, QHeaderView.Stretch)
         hdr.setSectionResizeMode(2, QHeaderView.ResizeToContents)
@@ -576,6 +670,12 @@ class CS2ManagerApp(QMainWindow):
         self.market_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.market_table.setAlternatingRowColors(True)
         self.market_table.setStyleSheet("alternate-background-color: #1e1e2e;")
+        for column in range(2, 8):
+            hdr.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.market_table.verticalHeader().setDefaultSectionSize(62)
+        self.market_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.market_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.market_table.customContextMenuRequested.connect(self._show_market_context_menu)
         # 双击单行刷新该饰品行情
         self.market_table.doubleClicked.connect(self._on_market_table_double_click)
         layout.addWidget(self.market_table)
@@ -798,7 +898,180 @@ class CS2ManagerApp(QMainWindow):
 
         return name
 
+    @staticmethod
+    def _market_number(value):
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _market_price_text(self, value, unavailable_reason, suffix=""):
+        amount = self._market_number(value)
+        return f"¥ {amount:.2f}{suffix}" if amount > 0 else f"暂无（{unavailable_reason}）"
+
+    def _market_rent_text(self, short_value, long_value, unavailable_reason):
+        short_rent = self._market_number(short_value)
+        long_rent = self._market_number(long_value)
+        if short_rent <= 0 and long_rent <= 0:
+            return f"暂无（{unavailable_reason}）"
+        short_text = f"短 ¥ {short_rent:.2f}" if short_rent > 0 else "短 —"
+        long_text = f"长 ¥ {long_rent:.2f}" if long_rent > 0 else "长 —"
+        return f"{short_text}\n{long_text}/天"
+
+    @staticmethod
+    def _market_link_platform(column):
+        return {
+            1: "csqaq",
+            2: "csqaq",
+            3: "eco",
+            4: "c5",
+            5: "yyyp",
+            6: "igxe",
+        }.get(column, "")
+
+    def _default_market_link(self, entry, platform):
+        detail = entry.get("detail", {})
+        name = detail.get("name_zh") or entry.get("name", "")
+        if platform == "csqaq":
+            good_id = entry.get("csqaq_good_id") or detail.get("csqaq_good_id") or detail.get("good_id")
+            return f"https://csqaq.com/goods/{good_id}" if good_id else ""
+        if platform == "c5":
+            item_id = entry.get("c5_id") or detail.get("c5_id")
+            if item_id:
+                return f"https://www.c5game.com/csgo/{item_id}/"
+            return f"https://www.c5game.com/csgo?marketKeyword={quote(name)}" if name else ""
+        if platform == "igxe":
+            item_id = entry.get("igxe_id") or detail.get("igxe_id")
+            if item_id:
+                return f"https://www.igxe.cn/product/trade/730/{item_id}"
+            return f"https://www.igxe.cn/market/csgo?keyword={quote(name)}" if name else ""
+        # 悠悠和 ECO 当前没有由 CSQAQ 返回的稳定网页详情 URL；用户可在右键菜单中保存自己的链接。
+        return ""
+
+    def _market_link(self, entry, platform):
+        return (entry.get("links", {}) or {}).get(platform) or self._default_market_link(entry, platform)
+
+    def _open_market_link(self, row, column):
+        if row < 0 or row >= len(self._market_tracked_items):
+            return
+        platform = self._market_link_platform(column)
+        if not platform:
+            return
+        entry = self._market_tracked_items[row]
+        url = self._market_link(entry, platform)
+        if not url:
+            QMessageBox.information(
+                self,
+                "未设置链接",
+                "该平台没有稳定的自动跳转地址。请右键该价格单元格，选择“设置自定义链接”。",
+            )
+            return
+        QDesktopServices.openUrl(QUrl(url))
+
+    def _show_market_context_menu(self, position):
+        index = self.market_table.indexAt(position)
+        if not index.isValid() or index.row() >= len(self._market_tracked_items):
+            return
+        platform = self._market_link_platform(index.column())
+        if not platform:
+            return
+        entry = self._market_tracked_items[index.row()]
+        menu = QMenu(self)
+        open_action = menu.addAction("打开链接")
+        edit_action = menu.addAction("设置自定义链接")
+        clear_action = menu.addAction("清除自定义链接")
+        chosen = menu.exec(self.market_table.viewport().mapToGlobal(position))
+        if chosen == open_action:
+            self._open_market_link(index.row(), index.column())
+        elif chosen == edit_action:
+            current = self._market_link(entry, platform)
+            url, accepted = QInputDialog.getText(
+                self, "设置平台链接", "网页链接（留空可取消自定义）：", text=current
+            )
+            if accepted:
+                entry.setdefault("links", {})[platform] = url.strip()
+                self._save_market_cache()
+        elif chosen == clear_action:
+            links = entry.get("links", {})
+            if platform in links:
+                links.pop(platform)
+                self._save_market_cache()
+
+    def _remove_selected_market_items(self):
+        rows = sorted({index.row() for index in self.market_table.selectionModel().selectedRows()}, reverse=True)
+        if not rows:
+            QMessageBox.information(self, "大盘编辑", "请先选择要从大盘移除的饰品（可按 Ctrl 或 Shift 多选）。")
+            return
+        names = [self._market_tracked_items[row].get("name", "") for row in rows]
+        answer = QMessageBox.question(
+            self,
+            "确认移除",
+            f"从大盘移除 {len(rows)} 个饰品？这不会删除资产库存。\n\n" + "\n".join(names[:8]),
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        for row in rows:
+            self._market_tracked_items.pop(row)
+        self._populate_market_table()
+        self._save_market_cache()
+
     def _populate_market_table(self):
+        """Render cached CSQAQ aggregate quotes and ECO rental prices only."""
+        self.market_table.setRowCount(0)
+        for i, entry in enumerate(self._market_tracked_items):
+            self.market_table.insertRow(i)
+            self.market_table.setRowHeight(i, 62)
+
+            image_label = QLabel()
+            image_label.setFixedSize(48, 48)
+            image_label.setAlignment(Qt.AlignCenter)
+            image_label.setStyleSheet("background-color: #181825; border-radius: 4px;")
+            local_img = ImageCache.get_local_path(entry.get("market_hash_name", entry["name"]))
+            if os.path.exists(local_img):
+                pixmap = QPixmap(local_img)
+                if not pixmap.isNull():
+                    image_label.setPixmap(pixmap.scaled(48, 48, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            else:
+                image_label.setText("图片")
+            self.market_table.setCellWidget(i, 0, image_label)
+
+            display_name = entry["name"]
+            if entry.get("phase") and entry["phase"] != "-":
+                display_name += f"  [{entry['phase']}]"
+            name_item = QTableWidgetItem(display_name)
+            name_item.setToolTip(entry.get("market_hash_name", entry["name"]))
+            self.market_table.setItem(i, 1, name_item)
+
+            lowest = self._market_number(entry.get("csqaq_min_sell_price", entry.get("csqaq_price")))
+            platform = entry.get("csqaq_min_sell_platform", "")
+            lowest_text = self._market_price_text(lowest, "CSQAQ 未提供")
+            if lowest > 0 and platform:
+                lowest_text += f"\n· {platform}"
+            csqaq_item = QTableWidgetItem(lowest_text)
+            csqaq_item.setForeground(QColor("#a6e3a1") if lowest > 0 else QColor("#6c7086"))
+            self.market_table.setItem(i, 2, csqaq_item)
+
+            eco_rent = self._market_number(entry.get("eco_min_rent"))
+            eco_item = QTableWidgetItem(self._market_price_text(eco_rent, "ECO 无租金", "/天"))
+            eco_item.setForeground(QColor("#89b4fa") if eco_rent > 0 else QColor("#6c7086"))
+            self.market_table.setItem(i, 3, eco_item)
+
+            rent_columns = (
+                (4, "c5_short_rent", "c5_long_rent", "CSQAQ 未提供 C5 报价", "#f9e2af"),
+                (5, "yyyp_short_rent", "yyyp_long_rent", "CSQAQ 未提供悠悠报价", "#94e2d5"),
+                (6, "igxe_short_rent", "igxe_long_rent", "CSQAQ 未提供 IGXE 报价", "#cba6f7"),
+            )
+            for column, short_key, long_key, unavailable, color in rent_columns:
+                rent_text = self._market_rent_text(entry.get(short_key), entry.get(long_key), unavailable)
+                rent_item = QTableWidgetItem(rent_text)
+                available = self._market_number(entry.get(short_key)) > 0 or self._market_number(entry.get(long_key)) > 0
+                rent_item.setForeground(QColor(color) if available else QColor("#6c7086"))
+                self.market_table.setItem(i, column, rent_item)
+
+            updated = entry.get("updated_at") or "--"
+            self.market_table.setItem(i, 7, QTableWidgetItem(updated))
+        return
         """填充一览式大盘表格"""
         self.market_table.setRowCount(0)
         for i, entry in enumerate(self._market_tracked_items):
@@ -1037,8 +1310,21 @@ class CS2ManagerApp(QMainWindow):
                 "market_hash_name": entry.get("market_hash_name", entry["name"]),
                 "image_url": entry.get("image_url", ""),
                 "csqaq_price": entry.get("csqaq_price", 0.0),
+                "csqaq_good_id": entry.get("csqaq_good_id", ""),
+                "csqaq_min_sell_price": entry.get("csqaq_min_sell_price", entry.get("csqaq_price", 0.0)),
+                "csqaq_min_sell_platform": entry.get("csqaq_min_sell_platform", ""),
+                "csqaq_detail_fetched_at": entry.get("csqaq_detail_fetched_at", 0),
                 "eco_min_rent": entry.get("eco_min_rent", 0.0),
-                "igxe_min_rent": entry.get("igxe_min_rent", 0.0),
+                "c5_id": entry.get("c5_id", ""),
+                "yyyp_id": entry.get("yyyp_id", ""),
+                "igxe_id": entry.get("igxe_id", ""),
+                "c5_short_rent": entry.get("c5_short_rent", 0.0),
+                "c5_long_rent": entry.get("c5_long_rent", 0.0),
+                "yyyp_short_rent": entry.get("yyyp_short_rent", 0.0),
+                "yyyp_long_rent": entry.get("yyyp_long_rent", 0.0),
+                "igxe_short_rent": entry.get("igxe_short_rent", 0.0),
+                "igxe_long_rent": entry.get("igxe_long_rent", 0.0),
+                "links": entry.get("links", {}),
                 "updated_at": QTime.currentTime().toString("HH:mm:ss"),
                 "detail": entry.get("detail", {}),
             }
@@ -1092,8 +1378,10 @@ class CS2ManagerApp(QMainWindow):
                 "phase": "-",
                 "market_hash_name": mhn,
                 "csqaq_price": float(prices.get("min_sell_price", prices.get("buff_price", 0.0))),
+                "csqaq_good_id": prices.get("good_id", ""),
+                "csqaq_min_sell_price": float(prices.get("min_sell_price", prices.get("buff_price", 0.0))),
                 "eco_min_rent": 0.0,
-                "igxe_min_rent": 0.0,
+                "links": {},
                 "updated_at": QTime.currentTime().toString("HH:mm:ss"),
                 "detail": {
                     "buff_price": prices.get("buff_price", 0.0),
@@ -1215,6 +1503,9 @@ class CS2ManagerApp(QMainWindow):
     # ── 双击单行刷新行情 ──
 
     def _on_market_table_double_click(self, index):
+        self._open_market_link(index.row(), index.column())
+        return
+
         """双击大盘表格某行，仅刷新该行饰品的行情数据"""
         row = index.row()
         if row < 0 or row >= len(self._market_tracked_items):
@@ -1326,7 +1617,112 @@ class CS2ManagerApp(QMainWindow):
     # 数据加载
     # ═══════════════════════════════════════════
 
+    def _rental_history_for_item(self, item):
+        float_key = _rental_float_key(item.get("float_val"))
+        if not float_key:
+            return []
+        orders = [
+            order for order in self.db.get_rental_orders()
+            if _rental_float_key(order.get("float_val")) == float_key
+        ]
+        return sorted(orders, key=lambda order: _parse_rental_datetime(order.get("start_time")))
+
+    def _latest_rental_for_item(self, item):
+        history = self._rental_history_for_item(item)
+        if not history:
+            return None, []
+        return history[-1], history
+
+    @staticmethod
+    def _countdown_text(end_time):
+        remaining = end_time - datetime.now()
+        if remaining.total_seconds() <= 0:
+            return "已到期"
+        total_hours = int(remaining.total_seconds() // 3600)
+        days, hours = divmod(total_hours, 24)
+        return f"剩 {days}天 {hours}小时"
+
+    def show_selected_rental_history(self):
+        selected_row = self.table.currentRow()
+        if selected_row < 0:
+            QMessageBox.information(self, "订单历史", "请先选择一个资产。")
+            return
+        item_id_cell = self.table.item(selected_row, 0)
+        if item_id_cell is None:
+            return
+        item_id = int(item_id_cell.text())
+        item = next((candidate for candidate in self.current_items if candidate["id"] == item_id), None)
+        if not item:
+            return
+        history = self._rental_history_for_item(item)
+        if not history:
+            QMessageBox.information(self, "订单历史", "该磨损度尚未同步到出租订单。")
+            return
+        RentalHistoryDialog(item["name"], item.get("float_val", ""), history, self).exec()
+
     def load_data(self):
+        """Render assets using the newest imported order for each float value."""
+        self.current_items = self.db.get_all_items()
+        filter_platform = self.filter_box.currentText()
+        self.table.setRowCount(0)
+        total_cost = 0.0
+        daily_rent = 0.0
+        rented_count = 0
+
+        row = 0
+        for item in self.current_items:
+            if filter_platform != "全部平台" and item["platform"] != filter_platform:
+                continue
+            total_cost += float(item.get("cost", 0.0) or 0.0)
+            latest_order, history = self._latest_rental_for_item(item)
+            status_text = item.get("status", "在库")
+            status_color = None
+            daily_estimate = float(item.get("rent", 0.0) or 0.0)
+            start_text = "—"
+            income_text = float(item.get("income", 0.0) or 0.0)
+            order_type = "手动"
+
+            if latest_order:
+                start = _parse_rental_datetime(latest_order.get("start_time"))
+                end = _parse_rental_datetime(latest_order.get("return_time"))
+                income_text = float(latest_order.get("income", 0.0) or 0.0)
+                duration_days = (end - start).total_seconds() / 86400 if end > start else 0.0
+                daily_estimate = income_text / duration_days if duration_days > 0 else 0.0
+                start_text = latest_order.get("start_time") or "—"
+                order_type = "首次出租" if len(history) == 1 else "转租"
+                order_status = latest_order.get("status", "")
+                if order_status == "租赁中":
+                    rented_count += 1
+                    daily_rent += daily_estimate
+                    status_text = f"租赁中 · {self._countdown_text(end)}" if end > datetime.min else "租赁中"
+                    status_color = QColor("#a6e3a1") if end > datetime.now() else QColor("#f38ba8")
+                else:
+                    status_text = order_status or status_text
+
+            self.table.insertRow(row)
+            values = [
+                str(item["id"]), item["name"], item.get("phase", "-"), item.get("pattern", "-"),
+                item.get("float_val", ""), f"¥ {float(item.get('cost', 0.0) or 0.0):.2f}",
+                item.get("platform", ""), status_text,
+                f"¥ {daily_estimate:.2f}" if daily_estimate > 0 else "—",
+                start_text, f"¥ {income_text:.2f}" if income_text > 0 else "—",
+                order_type, item.get("note", ""),
+            ]
+            for column, value in enumerate(values):
+                table_item = QTableWidgetItem(str(value))
+                if column == 7 and status_color:
+                    table_item.setForeground(status_color)
+                self.table.setItem(row, column, table_item)
+            row += 1
+
+        annual_rate = (daily_rent * 365 / total_cost * 100) if total_cost > 0 else 0.0
+        self.card_cost.findChildren(QLabel)[1].setText(f"¥ {total_cost:,.2f}")
+        self.card_income.findChildren(QLabel)[1].setText(f"¥ {daily_rent:.2f}")
+        self.card_rented.findChildren(QLabel)[1].setText(f"{rented_count} / {len(self.current_items)} 件")
+        self.card_rate.findChildren(QLabel)[1].setText(f"{annual_rate:.2f}%")
+        self.lbl_last_update.setText(f"最后更新：{QTime.currentTime().toString('HH:mm:ss')}")
+        return
+
         self.current_items = self.db.get_all_items()
         filter_p = self.filter_box.currentText()
 

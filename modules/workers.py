@@ -9,6 +9,48 @@ from modules.image_cache import ImageCache
 from modules.c5_rental_browser import C5RentalBrowser
 
 logger = logging.getLogger("CS2Rental")
+CSQAQ_DETAIL_CACHE_TTL_SECONDS = 15 * 60
+
+
+def _number(value):
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_csqaq_market_detail(info: dict) -> dict:
+    """Normalize documented CSQAQ per-item fields for the market grid."""
+    sell_sources = {
+        "BUFF": _number(info.get("buff_sell_price")),
+        "悠悠有品": _number(info.get("yyyp_sell_price")),
+        "C5": _number(info.get("c5_sell_price")),
+        "IGXE": _number(info.get("igxe_sell_price")),
+        "ECO": _number(info.get("eco_sell_price")),
+        "R8": _number(info.get("r8_sell_price")),
+    }
+    valid_sources = {name: price for name, price in sell_sources.items() if price > 0}
+    lowest_platform, lowest_price = ("", 0.0)
+    if valid_sources:
+        lowest_platform, lowest_price = min(valid_sources.items(), key=lambda item: item[1])
+
+    return {
+        "csqaq_good_id": info.get("id", info.get("good_id", "")),
+        "csqaq_min_sell_price": lowest_price,
+        "csqaq_min_sell_platform": lowest_platform,
+        "c5_id": str(info.get("c5_id") or ""),
+        "yyyp_id": str(info.get("yyyp_id") or ""),
+        "igxe_id": str(info.get("igxe_id") or ""),
+        "c5_short_rent": _number(info.get("c5_lease_price")),
+        "c5_long_rent": _number(info.get("c5_long_lease_price")),
+        "yyyp_short_rent": _number(info.get("yyyp_lease_price")),
+        "yyyp_long_rent": _number(info.get("yyyp_long_lease_price")),
+        "igxe_short_rent": _number(info.get("igxe_lease_price")),
+        "igxe_long_rent": _number(info.get("igxe_long_lease_price")),
+        "c5_lease_num": int(info.get("c5_lease_num") or 0),
+        "yyyp_lease_num": int(info.get("yyyp_lease_num") or 0),
+        "igxe_lease_num": int(info.get("igxe_lease_num") or 0),
+    }
 
 
 class ApiWorker(QObject):
@@ -218,6 +260,19 @@ class MarketRefreshWorker(QObject):
                                 "min_sell_price": prices.get("min_sell_price", 0.0),
                                 "name_zh": prices.get("name_zh", ""),
                             })
+                            good_id = prices.get("good_id")
+                            detail_is_fresh = (
+                                time.time() - float(entry.get("csqaq_detail_fetched_at", 0) or 0)
+                                <= CSQAQ_DETAIL_CACHE_TTL_SECONDS
+                            )
+                            if good_id and not detail_is_fresh:
+                                detail_info = csqaq_client.get_good_detail(good_id)
+                                if detail_info:
+                                    normalized = build_csqaq_market_detail(detail_info)
+                                    entry.update(normalized)
+                                    entry["csqaq_price"] = normalized["csqaq_min_sell_price"]
+                                    entry.setdefault("detail", {}).update(normalized)
+                                    entry["csqaq_detail_fetched_at"] = int(time.time())
             except Exception as e:
                 self.error.emit(f"CSQAQ 批量查询异常: {e}")
 
@@ -266,21 +321,6 @@ class MarketRefreshWorker(QObject):
                     entry["eco_min_rent"] = eco_item.get("eco_rent_price", 0.0)
                     entry.setdefault("detail", {})["eco_sell_price"] = eco_item.get("eco_sell_price", 0.0)
                     entry.setdefault("detail", {})["eco_style_name"] = eco_item.get("style_name", "")
-
-            # 5b. IGXE 租赁查询（搜索 + 获取详情）
-            if not self._is_canceled:
-                try:
-                    igxe_client = IGXEClient()
-                    search_result = igxe_client.search_product(mhn)
-                    if search_result.get("success") and search_result.get("results"):
-                        product_id = search_result["results"][0].get("product_id")
-                        if product_id:
-                            lease_result = igxe_client.get_lease_market_info(product_id)
-                            if lease_result.get("success"):
-                                entry["igxe_min_rent"] = lease_result.get("min_rent", 0.0)
-                                entry.setdefault("detail", {})["igxe_listings"] = lease_result.get("listings", [])
-                except Exception as e:
-                    self.error.emit(f"IGXE 查询异常 ({mhn}): {e}")
 
             # Download the standard schema image once; subsequent refreshes use
             # the local cache and do not download it again.

@@ -26,7 +26,9 @@ class CSQAQClient(BaseAPIClient):
     BASE_URL = "https://api.csqaq.com"
 
     def __init__(self, api_token: str, timeout: int = 10):
-        super().__init__(min_interval=1.05)
+        # Detailed item endpoints are more restrictive than the batch price
+        # endpoint.  Keep the whole client deliberately low-frequency.
+        super().__init__(min_interval=3.0)
         self.api_token = api_token.strip()
         self.timeout = timeout
         self.session = requests.Session()
@@ -157,6 +159,47 @@ class CSQAQClient(BaseAPIClient):
             logger.error(f"[CSQAQ] 解析响应异常: {e}")
 
         return {}
+
+    @retry(max_retries=2, delay=1.5)
+    def get_good_detail(self, good_id: int | str) -> dict:
+        """Return the detailed CSQAQ platform quote for one known ``good_id``.
+
+        The batch endpoint intentionally contains only the quick sell prices.
+        Rental short/long prices and C5/IGXE/悠悠 IDs are exposed by this
+        documented per-item endpoint instead.
+        """
+        if not self.api_token or not good_id:
+            return {}
+
+        try:
+            self._wait_rate_limit()
+            response = self.session.get(
+                f"{self.BASE_URL}/api/v1/info/good",
+                params={"id": good_id},
+                headers={"ApiToken": self.api_token},
+                timeout=self.timeout,
+            )
+            if response.status_code == 429:
+                logger.warning("[CSQAQ] get_good_detail throttled for id=%s; keep cached detail", good_id)
+                return {}
+            if response.status_code != 200:
+                logger.warning("[CSQAQ] get_good_detail HTTP %s for id=%s", response.status_code, good_id)
+                return {}
+            payload = response.json()
+            if payload.get("code") != 200:
+                logger.warning(
+                    "[CSQAQ] get_good_detail business error for id=%s: %s",
+                    good_id,
+                    payload.get("msg", ""),
+                )
+                return {}
+            info = (payload.get("data") or {}).get("goods_info") or {}
+            if not isinstance(info, dict):
+                return {}
+            return info
+        except Exception as exc:
+            logger.warning("[CSQAQ] get_good_detail failed for id=%s: %s", good_id, exc)
+            return {}
 
     # ── 兼容旧调用方 ──────────────────────────────────────────
     # 保留旧方法名作为别名，方便逐步迁移
