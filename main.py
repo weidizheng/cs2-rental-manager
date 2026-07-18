@@ -679,12 +679,15 @@ class CS2ManagerApp(QMainWindow):
         self._market_refresh_worker = None
         self._market_auto_refresh_deadline = 0.0
         self._market_auto_refresh_enabled = False
+        self._market_search_in_progress = False
         self._dashboard_rental_rows = {}
 
         # 当前市场详情页选中的物品标识 (name|phase)
         self._current_market_item_key = ""
         # 市场页数据列表: [{name, phase, market_hash_name, ...}]
         self._market_tracked_items = []
+        self._market_categories = {}
+        self._active_market_category_id = "rentals"
 
         self.apply_theme()
         self.init_ui()
@@ -1129,6 +1132,37 @@ class CS2ManagerApp(QMainWindow):
         header.addWidget(self.lbl_market_update)
         layout.addLayout(header)
 
+        category_layout = QHBoxLayout()
+        category_layout.setSpacing(8)
+        category_label = QLabel("观察分类")
+        category_label.setStyleSheet("color: #a6adc8; font-weight: 700;")
+        self.market_category_box = QComboBox()
+        self.market_category_box.setMinimumWidth(180)
+        self.market_category_box.currentIndexChanged.connect(self._on_market_category_changed)
+        new_category_btn = QPushButton("新建分类")
+        self._set_button_icon(new_category_btn, "add")
+        new_category_btn.clicked.connect(self._create_market_category)
+        rename_category_btn = QPushButton("重命名")
+        self._set_button_icon(rename_category_btn, "edit")
+        rename_category_btn.clicked.connect(self._rename_market_category)
+        delete_category_btn = QPushButton("删除分类")
+        delete_category_btn.setObjectName("dangerBtn")
+        self._set_button_icon(delete_category_btn, "delete", "#11111b")
+        delete_category_btn.clicked.connect(self._delete_market_category)
+        self.market_category_controls = [
+            self.market_category_box,
+            new_category_btn,
+            rename_category_btn,
+            delete_category_btn,
+        ]
+        category_layout.addWidget(category_label)
+        category_layout.addWidget(self.market_category_box)
+        category_layout.addWidget(new_category_btn)
+        category_layout.addWidget(rename_category_btn)
+        category_layout.addWidget(delete_category_btn)
+        category_layout.addStretch()
+        layout.addLayout(category_layout)
+
         # ── 搜索栏 ──
         search_layout = QHBoxLayout()
         self.market_input = QLineEdit()
@@ -1242,27 +1276,172 @@ class CS2ManagerApp(QMainWindow):
         self._init_market_from_cache()
 
     def _init_market_from_cache(self):
-        """冷启动时从 market_cache.json 加载缓存数据并渲染大盘，绝不发送网络请求"""
+        """Load category-aware market cache without making a network request."""
         cached = MarketCache.load()
+        migrated_legacy_cache = False
+        if isinstance(cached, dict) and isinstance(cached.get("categories"), list):
+            for index, raw_category in enumerate(cached["categories"], start=1):
+                if not isinstance(raw_category, dict):
+                    continue
+                category_id = str(raw_category.get("id") or f"category_{index}")
+                category_name = str(raw_category.get("name") or f"分类 {index}").strip()
+                raw_items = raw_category.get("items", [])
+                if isinstance(raw_items, dict):
+                    raw_items = raw_items.values()
+                if not isinstance(raw_items, (list, tuple)):
+                    raw_items = []
+                self._market_categories[category_id] = {
+                    "name": category_name or f"分类 {index}",
+                    "items": [dict(entry) for entry in raw_items if isinstance(entry, dict)],
+                }
+            self._active_market_category_id = str(cached.get("active_category_id") or "rentals")
+        elif cached:
+            # Version 3.0 wrote a flat key-to-entry dictionary.  Keep every
+            # existing watched item and migrate it to the default category.
+            migrated_legacy_cache = True
+            self._market_categories = {
+                "rentals": {
+                    "name": "出租品",
+                    "items": [dict(entry) for entry in cached.values() if isinstance(entry, dict)],
+                }
+            }
+
+        self._ensure_market_categories()
+        self._activate_market_category(self._active_market_category_id, render=False)
+        for entry in self._market_tracked_items:
+            self._apply_schema_mapping(entry)
+        changed = self._deduplicate_market_tracked_items()
+        self._refresh_market_category_selector()
+
         if cached:
-            logger.info(f"[大盘] 从缓存加载 {len(cached)} 条行情数据")
-            self._market_tracked_items = list(cached.values())
-            for entry in self._market_tracked_items:
-                self._apply_schema_mapping(entry)
-            if self._deduplicate_market_tracked_items():
+            logger.info(
+                "[大盘] 已加载 %s 个分类，当前“%s”有 %s 条行情数据",
+                len(self._market_categories),
+                self._market_categories[self._active_market_category_id]["name"],
+                len(self._market_tracked_items),
+            )
+            if migrated_legacy_cache or changed:
                 self._save_market_cache()
             self._populate_market_table()
             self.lbl_market_update.setText(f"最后更新: {QTime.currentTime().toString('HH:mm:ss')} (缓存)")
         else:
-            # 无缓存时从第一页库存饰品自动同步到大盘
+            # No prior list: seed the default "出租品" category from inventory.
             self._refresh_market_tracked_list()
+            self._save_market_cache()
             self.lbl_market_update.setText("最后更新: -- (来自库存)")
+
+    def _ensure_market_categories(self):
+        if not self._market_categories:
+            self._market_categories = {"rentals": {"name": "出租品", "items": []}}
+        if self._active_market_category_id not in self._market_categories:
+            self._active_market_category_id = next(iter(self._market_categories))
+
+    def _refresh_market_category_selector(self):
+        if not hasattr(self, "market_category_box"):
+            return
+        previous = self.market_category_box.blockSignals(True)
+        self.market_category_box.clear()
+        for category_id, category in self._market_categories.items():
+            count = len(category.get("items", []))
+            self.market_category_box.addItem(f"{category['name']} · {count} 件", category_id)
+        index = self.market_category_box.findData(self._active_market_category_id)
+        self.market_category_box.setCurrentIndex(max(0, index))
+        self.market_category_box.blockSignals(previous)
+
+    def _activate_market_category(self, category_id, render=True):
+        self._ensure_market_categories()
+        if category_id not in self._market_categories:
+            category_id = next(iter(self._market_categories))
+        self._active_market_category_id = category_id
+        self._market_tracked_items = self._market_categories[category_id]["items"]
+        self._current_market_item_key = ""
+        for entry in self._market_tracked_items:
+            self._apply_schema_mapping(entry)
+        if hasattr(self, "detail_frame"):
+            self.detail_frame.setVisible(False)
+        self._refresh_market_category_selector()
+        if render and hasattr(self, "market_table"):
+            self._populate_market_table()
+
+    def _on_market_category_changed(self, index):
+        category_id = self.market_category_box.itemData(index)
+        if not category_id or category_id == self._active_market_category_id:
+            return
+        self._activate_market_category(category_id)
+        self._save_market_cache()
+
+    def _set_market_category_controls_enabled(self, enabled):
+        for control in getattr(self, "market_category_controls", []):
+            control.setEnabled(enabled)
+
+    def _market_refresh_is_running(self):
+        return bool(self._market_refresh_thread and self._market_refresh_thread.isRunning())
+
+    def _update_market_category_controls(self):
+        self._set_market_category_controls_enabled(
+            not self._market_search_in_progress and not self._market_refresh_is_running()
+        )
+
+    def _create_market_category(self):
+        name, accepted = QInputDialog.getText(self, "新建观察分类", "分类名称：")
+        name = name.strip()
+        if not accepted or not name:
+            return
+        if any(category["name"] == name for category in self._market_categories.values()):
+            QMessageBox.warning(self, "新建观察分类", "已存在同名分类，请换一个名称。")
+            return
+        category_id = f"category_{int(time.time() * 1000)}"
+        while category_id in self._market_categories:
+            category_id = f"{category_id}_1"
+        self._market_categories[category_id] = {"name": name, "items": []}
+        self._activate_market_category(category_id)
+        self._save_market_cache()
+
+    def _rename_market_category(self):
+        category = self._market_categories.get(self._active_market_category_id)
+        if category is None:
+            return
+        name, accepted = QInputDialog.getText(
+            self, "重命名观察分类", "分类名称：", text=category["name"]
+        )
+        name = name.strip()
+        if not accepted or not name or name == category["name"]:
+            return
+        if any(
+            other_id != self._active_market_category_id and other["name"] == name
+            for other_id, other in self._market_categories.items()
+        ):
+            QMessageBox.warning(self, "重命名观察分类", "已存在同名分类，请换一个名称。")
+            return
+        category["name"] = name
+        self._refresh_market_category_selector()
+        self._save_market_cache()
+
+    def _delete_market_category(self):
+        if len(self._market_categories) <= 1:
+            QMessageBox.information(self, "删除观察分类", "至少需要保留一个观察分类。")
+            return
+        category = self._market_categories.get(self._active_market_category_id)
+        if category is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "删除观察分类",
+            f"删除“{category['name']}”及其中 {len(category['items'])} 个观察饰品？\n此操作不会删除资产或订单。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        deleted_id = self._active_market_category_id
+        del self._market_categories[deleted_id]
+        self._activate_market_category(next(iter(self._market_categories)))
+        self._save_market_cache()
 
     def _refresh_market_tracked_list(self):
         """从数据库加载库存物品，按 (名称 + 相位) 去重后填充到大盘表格"""
         db_items = self.db.get_all_items()
         seen = set()
-        self._market_tracked_items = []
+        refreshed_items = []
         for item in db_items:
             name = item["name"]
             phase = item.get("phase", "-")
@@ -1282,9 +1461,12 @@ class CS2ManagerApp(QMainWindow):
                 "updated_at": "",
                 "detail": {},
             }
-            self._market_tracked_items.append(entry)
+            refreshed_items.append(entry)
             self._apply_schema_mapping(entry)
+        self._market_categories[self._active_market_category_id]["items"] = refreshed_items
+        self._market_tracked_items = refreshed_items
         self._deduplicate_market_tracked_items()
+        self._refresh_market_category_selector()
         self._populate_market_table()
 
     @staticmethod
@@ -1337,6 +1519,7 @@ class CS2ManagerApp(QMainWindow):
 
         if changed:
             self._market_tracked_items = merged
+            self._market_categories[self._active_market_category_id]["items"] = merged
             logger.info("[大盘] 已合并 P1/P3 重复行情项，剩余 %s 条", len(merged))
         return changed
 
@@ -1582,6 +1765,7 @@ class CS2ManagerApp(QMainWindow):
         for row in rows:
             self._market_tracked_items.pop(row)
         self._populate_market_table()
+        self._refresh_market_category_selector()
         self._save_market_cache()
 
     def _populate_market_table(self):
@@ -1862,6 +2046,7 @@ class CS2ManagerApp(QMainWindow):
 
         self.lbl_market_update.setText("正在强制更新 ECO..." if force_eco else "正在刷新行情...")
         self.title_bar.set_sync_status("行情刷新中", "#89b4fa")
+        self._set_market_category_controls_enabled(False)
 
         self._market_refresh_thread = QThread()
         self._market_refresh_worker = MarketRefreshWorker()
@@ -1919,15 +2104,18 @@ class CS2ManagerApp(QMainWindow):
         """清理市场刷新线程引用"""
         self._market_refresh_thread = None
         self._market_refresh_worker = None
+        self._update_market_category_controls()
 
     # ── 市场数据缓存 ──
 
     def _save_market_cache(self):
-        """将当前大盘数据保存到 market_cache.json"""
-        cache_data = {}
-        for entry in self._market_tracked_items:
+        """Persist every category, including its independently cached quotes and links."""
+        self._ensure_market_categories()
+        self._market_categories[self._active_market_category_id]["items"] = self._market_tracked_items
+
+        def cache_entry(entry):
             key = entry["key"]
-            cache_data[key] = {
+            return {
                 "key": key,
                 "name": entry["name"],
                 "phase": entry.get("phase", "-"),
@@ -1953,7 +2141,19 @@ class CS2ManagerApp(QMainWindow):
                 "updated_at": entry.get("updated_at", ""),
                 "detail": entry.get("detail", {}),
             }
-        MarketCache.save(cache_data)
+
+        categories = []
+        for category_id, category in self._market_categories.items():
+            categories.append({
+                "id": category_id,
+                "name": category["name"],
+                "items": [cache_entry(entry) for entry in category.get("items", [])],
+            })
+        MarketCache.save({
+            "format": "market_categories_v1",
+            "active_category_id": self._active_market_category_id,
+            "categories": categories,
+        })
 
     @staticmethod
     def _normalize_market_phase(value) -> str:
@@ -2047,6 +2247,7 @@ class CS2ManagerApp(QMainWindow):
         if added:
             self._deduplicate_market_tracked_items()
             self._populate_market_table()
+            self._refresh_market_category_selector()
             self._save_market_cache()
         QMessageBox.information(
             self,
@@ -2070,7 +2271,9 @@ class CS2ManagerApp(QMainWindow):
             return
 
         self.market_search_btn.setEnabled(False)
-        self.market_search_btn.setText("⏳ 搜索中...")
+        self.market_search_btn.setText("搜索中...")
+        self._market_search_in_progress = True
+        self._update_market_category_controls()
 
         # 直接使用批量价格查询接口，传入关键词作为 market_hash_name
         self._start_worker(
@@ -2083,6 +2286,8 @@ class CS2ManagerApp(QMainWindow):
         """CSQAQ 搜索回调：自动将结果添加到大盘"""
         self.market_search_btn.setEnabled(True)
         self.market_search_btn.setText("搜索并添加")
+        self._market_search_in_progress = False
+        self._update_market_category_controls()
 
         tag, data = result
         if tag != "batch_price" or not data.get("success"):
@@ -2121,13 +2326,16 @@ class CS2ManagerApp(QMainWindow):
             added += 1
 
         self._populate_market_table()
+        self._refresh_market_category_selector()
         self._save_market_cache()
         QMessageBox.information(self, "成功", f"已添加 {added} 个饰品到大盘！")
 
     def _on_csqaq_error(self, error_msg):
         """CSQAQ 错误回调"""
         self.market_search_btn.setEnabled(True)
-        self.market_search_btn.setText("🔍 搜索并添加")
+        self.market_search_btn.setText("搜索并添加")
+        self._market_search_in_progress = False
+        self._update_market_category_controls()
         QMessageBox.critical(self, "API 错误", error_msg)
 
     def _on_bind_csqaq_ip(self):

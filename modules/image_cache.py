@@ -81,6 +81,19 @@ class MarketCache:
     """行情数据缓存管理器（落盘到 data/market_cache.json）"""
 
     @staticmethod
+    def _summary(data: Dict[str, Any]) -> str:
+        """Human-readable entry count for both legacy and category-aware caches."""
+        categories = data.get("categories") if isinstance(data, dict) else None
+        if isinstance(categories, list):
+            item_count = sum(
+                len(category.get("items", []))
+                for category in categories
+                if isinstance(category, dict) and isinstance(category.get("items", []), list)
+            )
+            return f"{item_count} 条，{len(categories)} 个分类"
+        return f"{len(data) if isinstance(data, dict) else 0} 条"
+
+    @staticmethod
     def save(data: Dict[str, Any]):
         """
         保存行情缓存到 JSON 文件。
@@ -92,7 +105,7 @@ class MarketCache:
             os.makedirs(DATA_DIR, exist_ok=True)
             with open(MARKET_CACHE_PATH, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.info(f"[MarketCache] 行情缓存已保存 ({len(data)} 条)")
+            logger.info(f"[MarketCache] 行情缓存已保存 ({MarketCache._summary(data)})")
         except Exception as e:
             logger.warning(f"[MarketCache] 保存失败: {e}")
 
@@ -108,7 +121,7 @@ class MarketCache:
             try:
                 with open(MARKET_CACHE_PATH, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                logger.info(f"[MarketCache] 行情缓存已加载 ({len(data)} 条)")
+                logger.info(f"[MarketCache] 行情缓存已加载 ({MarketCache._summary(data)})")
                 return data
             except Exception as e:
                 logger.warning(f"[MarketCache] 读取失败: {e}")
