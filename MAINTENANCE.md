@@ -106,11 +106,21 @@ git push origin main
 - 剩余时间小于等于 12 小时、或已到期时为红色。
 - “租赁中”但网页未提供可解析的归还时间时为橙色提示。
 
-## 5. C5 手动订单同步
+## 5. 平台订单页与 C5 手动读取
 
 代码位置：`modules/c5_rental_browser.py`、`modules/workers.py`、`modules/db_manager.py`。
 
-流程如下：
+资产页提供三个“打开订单页”按钮，均使用系统默认浏览器，因此能复用你已登录的正常浏览器会话：
+
+| 平台 | 订单页 |
+| --- | --- |
+| C5 | `https://www.c5game.com/user/rent?actag=2` |
+| ECO | `https://www.ecosteam.cn/html/person/rentrecordlist.html` |
+| IGXE | `https://www.igxe.cn/lease/seller-order-list` |
+
+目前这些按钮仅负责打开网页；本程序不会读取默认浏览器的 Cookie 或 DOM，因此不会在后台自动导入订单。若需自动导入，必须额外实现并明确授权一个浏览器扩展或本地 Chrome 调试连接。
+
+C5 现有的隔离读取器流程如下：
 
 1. 点击“C5 登录”，打开隔离的、可见的 Playwright Chromium。
 2. 由用户在窗口内登录并自行完成验证码；关闭窗口即保存该隔离 Profile。
@@ -176,7 +186,7 @@ private-data/schema-source/skins_not_grouped.zh-CN.json
 ### 行情刷新与相对时间
 
 - “刷新行情”在后台 `QThread` 中运行 `MarketRefreshWorker`，避免阻塞 UI。
-- 行情页的“开启自动刷新（10:00）”为循环开关：每 10 分钟运行一次；到点后立即重新开始下一轮倒计时，再次点击可停止。资产页不放行情自动刷新按钮。
+- 行情页的 10 分钟循环刷新在启动时默认开启；到点后立即重新开始下一轮倒计时。点击倒计时按钮可暂停或重新开启。资产页不放行情自动刷新按钮。
 - 一轮手动或自动刷新完成时，所有观察行写入同一个 ISO 成功时间；最右列显示 `N 分钟前更新成功`。
 - 相对时间每分钟仅更新表格文字，不请求 API。`market_cache.json` 持久化该成功时间，重启后仍可计算。
 

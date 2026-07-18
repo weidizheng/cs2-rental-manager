@@ -24,6 +24,13 @@ from modules.image_cache import ImageCache, MarketCache
 from modules.cs2_item_schema import CS2ItemSchema
 
 
+ORDER_PAGE_URLS = {
+    "c5": ("C5", "https://www.c5game.com/user/rent?actag=2"),
+    "eco": ("ECO", "https://www.ecosteam.cn/html/person/rentrecordlist.html"),
+    "igxe": ("IGXE", "https://www.igxe.cn/lease/seller-order-list"),
+}
+
+
 class ItemEditDialog(QDialog):
     """可视化修改与新增饰品弹窗"""
 
@@ -401,24 +408,34 @@ class CS2ManagerApp(QMainWindow):
             card_layout.addWidget(c)
         layout.addLayout(card_layout)
 
-        platform_sync = QGroupBox("平台订单同步（仅手动读取）")
+        platform_sync = QGroupBox("平台订单页与 C5 手动读取")
         platform_layout = QHBoxLayout(platform_sync)
-        self.c5_login_btn = QPushButton("C5 登录")
+        open_c5_btn = QPushButton("🌐 打开 C5 订单页")
+        open_c5_btn.setObjectName("primaryBtn")
+        open_c5_btn.clicked.connect(lambda: self._open_default_browser_order_page("c5"))
+        open_eco_btn = QPushButton("🌐 打开 ECO 订单页")
+        open_eco_btn.setObjectName("primaryBtn")
+        open_eco_btn.clicked.connect(lambda: self._open_default_browser_order_page("eco"))
+        open_igxe_btn = QPushButton("🌐 打开 IGXE 订单页")
+        open_igxe_btn.setObjectName("primaryBtn")
+        open_igxe_btn.clicked.connect(lambda: self._open_default_browser_order_page("igxe"))
+
+        self.c5_login_btn = QPushButton("C5 隔离登录（备用）")
         self.c5_login_btn.setObjectName("primaryBtn")
         self.c5_login_btn.clicked.connect(lambda: self._run_c5_task("login"))
-        self.c5_sync_btn = QPushButton("同步 C5 出租订单")
+        self.c5_login_btn.setToolTip("只供隔离 Playwright 读取器使用；不会复用普通浏览器的登录状态。")
+        self.c5_sync_btn = QPushButton("读取 C5 订单（隔离浏览器）")
         self.c5_sync_btn.setObjectName("successBtn")
         self.c5_sync_btn.clicked.connect(lambda: self._run_c5_task("sync"))
-        eco_login_btn = QPushButton("ECO 登录（待接入）")
-        eco_login_btn.setEnabled(False)
-        igxe_login_btn = QPushButton("IGXE 登录（待接入）")
-        igxe_login_btn.setEnabled(False)
-        self.c5_sync_status = QLabel("C5：尚未同步。登录、验证码与刷新均需你手动触发。")
+        self.c5_sync_status = QLabel(
+            "订单页会在默认浏览器打开；当前程序不会读取该浏览器的登录 Cookie。"
+        )
         self.c5_sync_status.setStyleSheet("color: #a6adc8;")
+        platform_layout.addWidget(open_c5_btn)
+        platform_layout.addWidget(open_eco_btn)
+        platform_layout.addWidget(open_igxe_btn)
         platform_layout.addWidget(self.c5_login_btn)
         platform_layout.addWidget(self.c5_sync_btn)
-        platform_layout.addWidget(eco_login_btn)
-        platform_layout.addWidget(igxe_login_btn)
         platform_layout.addWidget(self.c5_sync_status, 1)
         layout.addWidget(platform_sync)
 
@@ -556,6 +573,17 @@ class CS2ManagerApp(QMainWindow):
     def _set_c5_controls_enabled(self, enabled):
         self.c5_login_btn.setEnabled(enabled)
         self.c5_sync_btn.setEnabled(enabled)
+
+    def _open_default_browser_order_page(self, platform):
+        """Open an order page in the user's default browser and its existing session."""
+        platform_name, url = ORDER_PAGE_URLS.get(platform, ("", ""))
+        if not url:
+            return
+        QDesktopServices.openUrl(QUrl(url))
+        self.c5_sync_status.setText(
+            f"已在默认浏览器打开 {platform_name} 订单页。"
+            "如需实时读取，需为该浏览器单独授权连接。"
+        )
 
     def _run_c5_task(self, task):
         if self._c5_thread and self._c5_thread.isRunning():
