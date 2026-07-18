@@ -496,7 +496,7 @@ class CS2ManagerApp(QMainWindow):
         self.card_cost = self.create_card("💰 买入总资产", "¥ 0.00", "#89b4fa")
         self.card_income = self.create_card("📥 当前每日净收益", "¥ 0.00", "#a6e3a1")
         self.card_rented = self.create_card("📦 在租件数", "0 / 0 件", "#f9e2af")
-        self.card_rate = self.create_card("📈 估算年化率", "0.0%", "#f38ba8")
+        self.card_rate = self.create_card("📈 在租年化（总资产）", "0.0%", "#f38ba8")
         for c in [self.card_cost, self.card_income, self.card_rented, self.card_rate]:
             card_layout.addWidget(c)
         layout.addLayout(card_layout)
@@ -567,7 +567,7 @@ class CS2ManagerApp(QMainWindow):
         self.table.setColumnCount(11)
         self.table.setHorizontalHeaderLabels([
             "ID", "饰品名称", "相位", "磨损度", "成本(元)", "平台",
-            "状态 / 倒计时", "租期天数", "日租（原价）", "本单净收入", "累计净收益",
+            "状态 / 倒计时", "租期天数", "日租（净）", "本单净收入", "累计净收益",
         ])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
@@ -2021,6 +2021,7 @@ class CS2ManagerApp(QMainWindow):
             status_color = None
             rental_days = float(item.get("days", 0.0) or 0.0)
             daily_rent = float(item.get("rent", 0.0) or 0.0)
+            net_daily_rent = daily_rent
             net_income = float(item.get("income", 0.0) or 0.0)
             total_net_income = net_income
 
@@ -2028,6 +2029,8 @@ class CS2ManagerApp(QMainWindow):
                 end = _parse_rental_datetime(latest_order.get("return_time"))
                 rental_days = self._order_rental_days(latest_order)
                 daily_rent = self._order_daily_rent(latest_order)
+                fee_rate = self._order_fee_rate(latest_order, history)
+                net_daily_rent = self._net_amount(daily_rent, fee_rate)
                 net_income = self._order_net_income(latest_order, history)
                 total_net_income = self._total_net_income(history)
                 order_status = latest_order.get("status", "")
@@ -2037,17 +2040,14 @@ class CS2ManagerApp(QMainWindow):
                 if order_status == "租赁中":
                     if end <= datetime.min or end > datetime.now():
                         rented_count += 1
-                        daily_rent_net = self._net_amount(
-                            daily_rent, self._order_fee_rate(latest_order, history)
-                        )
-                        daily_rent_total += daily_rent_net
+                        daily_rent_total += net_daily_rent
 
             self.table.insertRow(row)
             values = [
                 str(item["id"]), item["name"], item.get("phase", "-"), item.get("float_val", ""),
                 f"¥ {float(item.get('cost', 0.0) or 0.0):.2f}", item.get("platform", ""), status_text,
                 f"{rental_days:g} 天" if rental_days > 0 else "—",
-                _money_text(daily_rent) if daily_rent > 0 else "—",
+                _money_text(net_daily_rent) if net_daily_rent > 0 else "—",
                 _money_text(net_income) if net_income > 0 else "—",
                 _money_text(total_net_income) if total_net_income > 0 else "—",
             ]
