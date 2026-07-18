@@ -622,6 +622,8 @@ class CS2ManagerApp(QMainWindow):
             self._market_tracked_items = list(cached.values())
             for entry in self._market_tracked_items:
                 self._apply_schema_mapping(entry)
+            if self._deduplicate_market_tracked_items():
+                self._save_market_cache()
             self._populate_market_table()
             self.lbl_market_update.setText(f"最后更新: {QTime.currentTime().toString('HH:mm:ss')} (缓存)")
         else:
@@ -655,6 +657,7 @@ class CS2ManagerApp(QMainWindow):
             }
             self._market_tracked_items.append(entry)
             self._apply_schema_mapping(entry)
+        self._deduplicate_market_tracked_items()
         self._populate_market_table()
 
     @staticmethod
@@ -665,6 +668,50 @@ class CS2ManagerApp(QMainWindow):
             entry["market_hash_name"] = mapped_item["market_hash_name"]
             entry["image_url"] = mapped_item.get("image", "")
             entry["schema_id"] = mapped_item["id"]
+
+    def _deduplicate_market_tracked_items(self) -> bool:
+        """Merge P1/P3 Doppler rows only in the market watch list.
+
+        Inventory rows remain separate: their float values identify different
+        assets.  ECO supplies one usable rental quote for these two phases,
+        so displaying them twice adds no market information.
+        """
+        merged: list[dict] = []
+        group_index: dict[str, int] = {}
+        changed = False
+
+        for entry in self._market_tracked_items:
+            phase = str(entry.get("phase", "-")).upper().replace(" ", "")
+            market_hash_name = entry.get("market_hash_name", entry.get("name", ""))
+            if phase in {"P1", "P3", "P1/P3"}:
+                group_key = f"{market_hash_name}|P1/P3"
+            else:
+                group_key = entry.get("key", f"{market_hash_name}|{phase}")
+
+            existing_index = group_index.get(group_key)
+            if existing_index is None:
+                if group_key.endswith("|P1/P3"):
+                    entry["key"] = group_key
+                    entry["phase"] = "P1 / P3"
+                    changed = changed or phase != "P1/P3"
+                group_index[group_key] = len(merged)
+                merged.append(entry)
+                continue
+
+            changed = True
+            existing = merged[existing_index]
+            # Preserve an available lowest quote if the first cached entry was
+            # empty, while retaining its image/details where available.
+            for field in ("csqaq_price", "eco_min_rent", "igxe_min_rent"):
+                current = float(existing.get(field, 0.0) or 0.0)
+                incoming = float(entry.get(field, 0.0) or 0.0)
+                if current <= 0 < incoming:
+                    existing[field] = incoming
+
+        if changed:
+            self._market_tracked_items = merged
+            logger.info("[大盘] 已合并 P1/P3 重复行情项，剩余 %s 条", len(merged))
+        return changed
 
     def _build_market_hash_name(self, item: dict) -> str:
         """根据饰品数据构建英文 market_hash_name，优先使用已存储的"""

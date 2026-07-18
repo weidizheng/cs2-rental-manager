@@ -162,10 +162,23 @@ class ECOMarketCache:
         phase: str = "",
     ) -> dict[str, Any]:
         style_key = normalize_style(phase)
-        if style_key:
-            return snapshot.get((hash_name, style_key), {})
-
         base_item = snapshot.get((hash_name, ""))
+        if style_key:
+            phase_item = snapshot.get((hash_name, style_key))
+            if phase_item:
+                # ECO can return phase-specific selling prices while leaving
+                # the phase-specific rental field at zero.  Keep the precise
+                # phase selling price, but use the unphased rental quote when
+                # it is the only available rental value.
+                if _to_float(phase_item.get("eco_rent_price")) <= 0 and base_item:
+                    base_rent = _to_float(base_item.get("eco_rent_price"))
+                    if base_rent > 0:
+                        merged = dict(phase_item)
+                        merged["eco_rent_price"] = base_rent
+                        merged["rent_price_source"] = "base_fallback"
+                        return merged
+                return phase_item
+
         if base_item:
             return base_item
 
