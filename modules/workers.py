@@ -5,6 +5,7 @@ from PySide6.QtCore import QObject, Signal, QThread
 from modules.csqaq_client import CSQAQClient
 from modules.eco_client import ECOClient
 from modules.igxe_client import IGXEClient
+from modules.image_cache import ImageCache
 
 logger = logging.getLogger("CS2Rental")
 
@@ -250,6 +251,12 @@ class MarketRefreshWorker(QObject):
                                 entry.setdefault("detail", {})["igxe_listings"] = lease_result.get("listings", [])
                 except Exception as e:
                     self.error.emit(f"IGXE 查询异常 ({mhn}): {e}")
+
+            # Download the standard schema image once; subsequent refreshes use
+            # the local cache and do not download it again.
+            image_url = entry.get("image_url", "")
+            if image_url and not self._is_canceled:
+                ImageCache.download(mhn, image_url)
 
             # 通知 GUI 线程该行已更新
             if not self._is_canceled:

@@ -17,6 +17,7 @@ from modules.db_manager import DBManager
 from modules.workers import ApiWorker, MarketRefreshWorker
 from modules.logger import logger
 from modules.image_cache import ImageCache, MarketCache
+from modules.cs2_item_schema import CS2ItemSchema
 
 
 class ItemEditDialog(QDialog):
@@ -82,6 +83,11 @@ class ItemEditDialog(QDialog):
         name = self.name_in.text().strip()
         phase = self.phase_in.currentText()
         if not name or self.mhn_in.text().strip():
+            return
+
+        mapped_item = CS2ItemSchema.lookup(name)
+        if mapped_item:
+            self.mhn_in.setText(mapped_item["market_hash_name"])
             return
 
         # 如果用户已手动输入 mhn，不再自动覆盖
@@ -466,6 +472,8 @@ class CS2ManagerApp(QMainWindow):
         if cached:
             logger.info(f"[大盘] 从缓存加载 {len(cached)} 条行情数据")
             self._market_tracked_items = list(cached.values())
+            for entry in self._market_tracked_items:
+                self._apply_schema_mapping(entry)
             self._populate_market_table()
             self.lbl_market_update.setText(f"最后更新: {QTime.currentTime().toString('HH:mm:ss')} (缓存)")
         else:
@@ -498,10 +506,24 @@ class CS2ManagerApp(QMainWindow):
                 "detail": {},
             }
             self._market_tracked_items.append(entry)
+            self._apply_schema_mapping(entry)
         self._populate_market_table()
+
+    @staticmethod
+    def _apply_schema_mapping(entry: dict):
+        """Fill standard Steam market name and image URL from the local schema."""
+        mapped_item = CS2ItemSchema.lookup(entry.get("name", ""))
+        if mapped_item:
+            entry["market_hash_name"] = mapped_item["market_hash_name"]
+            entry["image_url"] = mapped_item.get("image", "")
+            entry["schema_id"] = mapped_item["id"]
 
     def _build_market_hash_name(self, item: dict) -> str:
         """根据饰品数据构建英文 market_hash_name，优先使用已存储的"""
+        mapped_item = CS2ItemSchema.lookup(item.get("name", ""))
+        if mapped_item:
+            return mapped_item["market_hash_name"]
+
         stored_mhn = item.get("market_hash_name", "")
         if stored_mhn and stored_mhn != item.get("name", ""):
             return stored_mhn
@@ -816,6 +838,7 @@ class CS2ManagerApp(QMainWindow):
                 "name": entry["name"],
                 "phase": entry.get("phase", "-"),
                 "market_hash_name": entry.get("market_hash_name", entry["name"]),
+                "image_url": entry.get("image_url", ""),
                 "csqaq_price": entry.get("csqaq_price", 0.0),
                 "eco_min_rent": entry.get("eco_min_rent", 0.0),
                 "igxe_min_rent": entry.get("igxe_min_rent", 0.0),
@@ -883,6 +906,7 @@ class CS2ManagerApp(QMainWindow):
                     "name_zh": prices.get("name_zh", ""),
                 },
             }
+            self._apply_schema_mapping(entry)
             self._market_tracked_items.append(entry)
             added += 1
 
