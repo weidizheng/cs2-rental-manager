@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QComboBox, QHeaderView,
     QTabWidget, QFormLayout, QGroupBox, QMessageBox,
     QAbstractItemView, QDialog, QSplitter, QScrollArea,
-    QCheckBox, QFrame,
+    QCheckBox, QFrame, QPlainTextEdit,
     QMenu, QInputDialog,
 )
 from PySide6.QtCore import Qt, QTimer, QThread, QUrl, QTime
@@ -32,6 +32,54 @@ ORDER_PAGE_URLS = {
     "eco": ("ECO", "https://www.ecosteam.cn/html/person/rentrecordlist.html"),
     "igxe": ("IGXE", "https://www.igxe.cn/lease/seller-order-list"),
 }
+
+
+AI_MARKET_IMPORT_PROMPT = """你是 CS2 饰品数据整理助手。请根据我提供的一张或多张库存截图，提取其中可监测的 CS2 饰品；忽略价格、涨跌、数量、库存标签、磨损、图案模板和购买成本。
+
+严格只返回一个合法 JSON 对象，不要 Markdown、不写解释：
+{
+  "items": [
+    {
+      "name": "中文完整饰品名，例如：折叠刀（★） | 多普勒（崭新出厂）",
+      "phase": "P1、P2、P3、P4、Ruby、Sapphire、Emerald 或 -",
+      "market_hash_name": "英文 Steam Market Hash Name，例如：★ Flip Knife | Doppler (Factory New)"
+    }
+  ]
+}
+
+规则：
+1. 每种“饰品名 + 相位”只输出一条；P1 和 P3 可以分别输出，软件会自动合并为一条行情观察项。
+2. phase 只填写截图明确显示的相位/宝石；没有明确相位时填写 "-"，不要猜测。
+3. market_hash_name 必须是 Steam 英文完整名称；多普勒的相位不写进 market_hash_name。
+4. name 不要附加价格、磨损、库存数量或备注。
+5. 看不清或无法确定的条目不要输出。"""
+
+
+def parse_ai_market_items(text: str) -> tuple[list[dict], list[str]]:
+    """Parse the deliberately small JSON contract used by the AI market helper."""
+    payload_text = (text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", payload_text, flags=re.IGNORECASE)
+    if fenced:
+        payload_text = fenced.group(1).strip()
+    try:
+        payload = json.loads(payload_text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return [], ["AI 返回内容不是合法 JSON。请只粘贴 JSON 对象或数组。"]
+
+    raw_items = payload.get("items") if isinstance(payload, dict) else payload
+    if not isinstance(raw_items, list):
+        return [], ["JSON 顶层必须是 {\"items\": [...]} 或直接的数组。"]
+
+    items: list[dict] = []
+    errors: list[str] = []
+    for index, value in enumerate(raw_items, start=1):
+        if not isinstance(value, dict):
+            errors.append(f"第 {index} 条不是对象，已忽略。")
+            continue
+        items.append(value)
+    if not items and not errors:
+        errors.append("没有读取到任何饰品。")
+    return items, errors
 
 
 class ItemEditDialog(QDialog):
@@ -369,6 +417,113 @@ class RentalImportPreviewDialog(QDialog):
         buttons.addWidget(cancel_button)
         buttons.addWidget(confirm_button)
         layout.addLayout(buttons)
+
+
+class MarketAIImportDialog(QDialog):
+    """A local paste-in workflow for vision-AI assisted market watch imports."""
+
+    def __init__(self, normalize_item, parent=None):
+        super().__init__(parent)
+        self._normalize_item = normalize_item
+        self.validated_items: list[dict] = []
+        self.setWindowTitle("AI 辅助批量添加大盘饰品")
+        self.resize(1060, 720)
+
+        layout = QVBoxLayout(self)
+        instruction = QLabel(
+            "图片不会上传到本软件：复制提示词 → 连同截图发给任意可识图 AI → 将它返回的 JSON 粘贴到下方。"
+        )
+        instruction.setWordWrap(True)
+        instruction.setStyleSheet("color: #a6adc8;")
+        layout.addWidget(instruction)
+
+        prompt_group = QGroupBox("1. 复制给 AI 的提示词")
+        prompt_layout = QVBoxLayout(prompt_group)
+        self.prompt_edit = QPlainTextEdit(AI_MARKET_IMPORT_PROMPT)
+        self.prompt_edit.setReadOnly(True)
+        self.prompt_edit.setMaximumHeight(195)
+        prompt_layout.addWidget(self.prompt_edit)
+        copy_prompt_button = QPushButton("📋 复制提示词")
+        copy_prompt_button.setObjectName("primaryBtn")
+        copy_prompt_button.clicked.connect(self._copy_prompt)
+        prompt_layout.addWidget(copy_prompt_button)
+        layout.addWidget(prompt_group)
+
+        response_group = QGroupBox("2. 粘贴 AI 返回的 JSON")
+        response_layout = QVBoxLayout(response_group)
+        self.response_edit = QPlainTextEdit()
+        self.response_edit.setPlaceholderText('{"items": [{"name": "…", "phase": "P1", "market_hash_name": "…"}]}')
+        self.response_edit.setMinimumHeight(120)
+        response_layout.addWidget(self.response_edit)
+        parse_button = QPushButton("🔎 解析并预览")
+        parse_button.clicked.connect(self._parse_response)
+        response_layout.addWidget(parse_button)
+        layout.addWidget(response_group)
+
+        preview_group = QGroupBox("3. 导入预览（仅“可导入”项会被写入本地行情观察列表）")
+        preview_layout = QVBoxLayout(preview_group)
+        self.status_label = QLabel("尚未解析。")
+        self.status_label.setWordWrap(True)
+        preview_layout.addWidget(self.status_label)
+        self.preview_table = QTableWidget()
+        self.preview_table.setColumnCount(4)
+        self.preview_table.setHorizontalHeaderLabels(["中文名称", "相位", "Steam MarketHashName", "检查结果"])
+        self.preview_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.preview_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.preview_table.setWordWrap(False)
+        self.preview_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.preview_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.preview_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        preview_layout.addWidget(self.preview_table)
+        layout.addWidget(preview_group, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(self.reject)
+        self.confirm_button = QPushButton("✅ 确认批量添加")
+        self.confirm_button.setObjectName("successBtn")
+        self.confirm_button.setEnabled(False)
+        self.confirm_button.clicked.connect(self.accept)
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(self.confirm_button)
+        layout.addLayout(buttons)
+
+    def _copy_prompt(self):
+        QApplication.clipboard().setText(AI_MARKET_IMPORT_PROMPT)
+        self.status_label.setText("提示词已复制；现在可将截图与提示词一起发送给 AI。")
+
+    def _parse_response(self):
+        self.preview_table.setRowCount(0)
+        self.validated_items = []
+        raw_items, errors = parse_ai_market_items(self.response_edit.toPlainText())
+        for index, raw_item in enumerate(raw_items, start=1):
+            entry, message = self._normalize_item(raw_item)
+            row = self.preview_table.rowCount()
+            self.preview_table.insertRow(row)
+            values = [
+                str(raw_item.get("name", "")),
+                str(raw_item.get("phase", "-")),
+                str(raw_item.get("market_hash_name", raw_item.get("mhn", ""))),
+                message,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if entry is None and column == 3:
+                    item.setForeground(QColor("#f38ba8"))
+                self.preview_table.setItem(row, column, item)
+            if entry is not None:
+                self.validated_items.append(entry)
+            else:
+                errors.append(f"第 {index} 条：{message}")
+
+        self.confirm_button.setEnabled(bool(self.validated_items))
+        if self.validated_items:
+            suffix = f"；{len(errors)} 条需要修正" if errors else ""
+            self.status_label.setText(f"已确认 {len(self.validated_items)} 条可导入{suffix}。")
+        else:
+            self.status_label.setText("没有可导入的饰品。" + (" " + "；".join(errors[:3]) if errors else ""))
 
 
 class CS2ManagerApp(QMainWindow):
@@ -724,6 +879,12 @@ class CS2ManagerApp(QMainWindow):
         self.market_search_btn.clicked.connect(self.query_csqaq_market)
         search_layout.addWidget(self.market_input, 1)
         search_layout.addWidget(self.market_search_btn)
+
+        ai_import_btn = QPushButton("🤖 AI 批量添加")
+        ai_import_btn.setObjectName("primaryBtn")
+        ai_import_btn.setToolTip("复制提示词和截图交给 AI，再将 JSON 返回结果粘贴进来批量添加")
+        ai_import_btn.clicked.connect(self._open_ai_market_import)
+        search_layout.addWidget(ai_import_btn)
 
         refresh_market_btn = QPushButton("🔄 刷新行情")
         refresh_market_btn.setObjectName("successBtn")
@@ -1527,6 +1688,106 @@ class CS2ManagerApp(QMainWindow):
                 "detail": entry.get("detail", {}),
             }
         MarketCache.save(cache_data)
+
+    @staticmethod
+    def _normalize_market_phase(value) -> str:
+        text = str(value or "-").strip()
+        compact = text.upper().replace(" ", "")
+        aliases = {
+            "": "-", "-": "-", "NONE": "-", "N/A": "-",
+            "P1": "P1", "P2": "P2", "P3": "P3", "P4": "P4", "P1/P3": "P1 / P3",
+            "RUBY": "Ruby", "红宝石": "Ruby",
+            "SAPPHIRE": "Sapphire", "蓝宝石": "Sapphire",
+            "EMERALD": "Emerald", "绿宝石": "Emerald",
+        }
+        return aliases.get(compact, "")
+
+    @classmethod
+    def _market_watch_identity(cls, market_hash_name, phase) -> str:
+        normalized_phase = cls._normalize_market_phase(phase) or str(phase or "-").strip()
+        phase_key = normalized_phase.upper().replace(" ", "")
+        if phase_key in {"P1", "P3", "P1/P3"}:
+            phase_key = "P1/P3"
+        return f"{str(market_hash_name).strip()}|{phase_key}"
+
+    def _normalize_ai_market_item(self, raw_item: dict) -> tuple[dict | None, str]:
+        """Validate an AI item locally and turn it into a market-watch entry."""
+        name = str(raw_item.get("name", "") or "").strip()
+        market_hash_name = str(raw_item.get("market_hash_name", raw_item.get("mhn", "")) or "").strip()
+        phase = self._normalize_market_phase(raw_item.get("phase", "-"))
+        if not phase:
+            return None, "相位必须是 P1/P2/P3/P4、Ruby/Sapphire/Emerald 或 -。"
+
+        mapped = CS2ItemSchema.lookup(name) if name else None
+        mapped = mapped or (CS2ItemSchema.lookup(market_hash_name) if market_hash_name else None)
+        status = ""
+        if mapped:
+            canonical_mhn = mapped["market_hash_name"]
+            if market_hash_name and market_hash_name != canonical_mhn:
+                status = "已用本地映射校正英文名"
+            else:
+                status = "已通过本地映射校验"
+            market_hash_name = canonical_mhn
+            name = name or mapped.get("name_zh", "")
+            image_url = mapped.get("image", "")
+        else:
+            if not name:
+                return None, "缺少中文名称，且英文名未命中本地映射。"
+            if not market_hash_name or "|" not in market_hash_name:
+                return None, "缺少可用的英文 market_hash_name。"
+            image_url = ""
+            status = "未命中本地映射，将使用 AI 提供的英文名"
+
+        entry = {
+            "key": f"{market_hash_name}|{phase}",
+            "name": name,
+            "phase": phase,
+            "market_hash_name": market_hash_name,
+            "image_url": image_url,
+            "csqaq_price": 0.0,
+            "eco_min_rent": 0.0,
+            "c5_short_rent": 0.0,
+            "c5_long_rent": 0.0,
+            "yyyp_short_rent": 0.0,
+            "yyyp_long_rent": 0.0,
+            "igxe_short_rent": 0.0,
+            "igxe_long_rent": 0.0,
+            "links": {},
+            "updated_at": "",
+            "detail": {},
+        }
+        return entry, status
+
+    def _open_ai_market_import(self):
+        dialog = MarketAIImportDialog(self._normalize_ai_market_item, self)
+        if dialog.exec() != QDialog.Accepted or not dialog.validated_items:
+            return
+
+        existing = {
+            self._market_watch_identity(entry.get("market_hash_name", entry.get("name", "")), entry.get("phase", "-"))
+            for entry in self._market_tracked_items
+        }
+        added = 0
+        skipped = 0
+        for entry in dialog.validated_items:
+            identity = self._market_watch_identity(entry["market_hash_name"], entry["phase"])
+            if identity in existing:
+                skipped += 1
+                continue
+            self._market_tracked_items.append(entry)
+            existing.add(identity)
+            added += 1
+
+        if added:
+            self._deduplicate_market_tracked_items()
+            self._populate_market_table()
+            self._save_market_cache()
+        QMessageBox.information(
+            self,
+            "AI 批量添加完成",
+            f"已添加 {added} 条，跳过 {skipped} 条重复项。\n"
+            "新条目已保存到本地观察列表；点击“刷新行情”后会获取报价。",
+        )
 
     # ── 搜索并添加 ──
 

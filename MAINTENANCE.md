@@ -12,7 +12,7 @@
 | 一览式大盘行情 | CSQAQ 售价/租金聚合、ECO 最低日租、平台跳转、行情观察列表与缓存 | 不直接请求 IGXE 行情接口 |
 | 系统与费率设置 | 保存 CSQAQ Token、ECO Partner ID/RSA 私钥、资产页本地刷新间隔与费率 | 设置只写入私密数据目录 |
 
-目前**没有**自动登录、验证码绕过、AI OCR 录单，也不启用浏览器扩展或隔离浏览器读取。三个平台的固定格式订单文字可通过剪贴板预览后导入；单独的“出租订单”标签页未挂到界面，`main.py` 中相关旧代码不应视为已启用功能。
+目前**没有**自动登录、验证码绕过、直接调用 AI API/OCR 录单，也不启用浏览器扩展或隔离浏览器读取。大盘页的 AI 协作导入仅复制提示词并接收用户粘贴的 JSON，不会上传、保存或处理截图文件。三个平台的固定格式订单文字可通过剪贴板预览后导入；单独的“出租订单”标签页未挂到界面，`main.py` 中相关旧代码不应视为已启用功能。
 
 ## 2. 快速运行与换电脑
 
@@ -89,7 +89,7 @@ git push origin main
 
 ### `rental_orders` 表
 
-主要字段：`platform`、`order_no`、`item_name`、`float_val`、`daily_rent`、`rental_days`、`deposit`、`income`、`start_time`、`return_time`、`status`、`raw_text`、`synced_at`。
+主要字段：`platform`、`order_no`、`item_name`、`float_val`、`daily_rent`、`rental_days`、`deposit`、`income`、`start_time`、`return_time`、`status`、`raw_text`、`transfer_reward`、`reward_status`、`synced_at`。
 
 - 唯一键为 `(platform, order_no)`；同一订单再次同步会更新而不会重复插入。
 - 订单与资产依靠**标准化后的磨损值**匹配；资产页只展示同一磨损的最新订单。
@@ -166,6 +166,7 @@ private-data/schema-source/skins_not_grouped.zh-CN.json
 
 - 冷启动只读取 `market_cache.json`，不会主动发网络请求。
 - 可用 CSQAQ 搜索添加；可 Ctrl/Shift 多选后从观察列表移除，不会删除资产库存。
+- “AI 批量添加”不会上传截图：它只提供固定提示词、接收用户粘贴的 JSON，再以本地 `CS2ItemSchema` 校验中文名/英文 `market_hash_name`。确认后仅写入 `market_cache.json` 的观察列表；需要点击“刷新行情”才请求报价接口。
 - 市场页内仅将多普勒 P1/P3 合并为一行 `P1 / P3`；资产记录本身不会合并，因为磨损不同仍是不同实物。
 - 图片按 `market_hash_name` 缓存在 `private-data/images/`。
 
