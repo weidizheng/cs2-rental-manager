@@ -302,6 +302,9 @@ class CS2ManagerApp(QMainWindow):
         self.update_timer_interval()
 
         self.load_data()
+        # Market refresh is enabled by default for every application start.
+        self._market_auto_refresh_enabled = True
+        self._schedule_next_market_auto_refresh()
 
     def apply_theme(self):
         self.setStyleSheet("""
