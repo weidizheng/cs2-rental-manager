@@ -56,6 +56,65 @@ def _end_from_start_and_days(start_time: str, rental_days: float) -> str:
         return ""
 
 
+def _c5_transfer_reward(text: str) -> tuple[float, str, bool]:
+    """Return only a confirmed C5 transfer-reward amount, never a maximum."""
+    section_match = re.search(r"转租奖励([\s\S]{0,160})", text)
+    if not section_match:
+        return 0.0, "", False
+    section = section_match.group(1)
+    if "已取消" in section:
+        return 0.0, "已取消", True
+    status = next((value for value in ("待发放", "已发放") if value in section), "")
+    if not status or "最高奖励" in section:
+        return 0.0, "", False
+    amount = _float(_first(r"￥\s*([0-9.]+)", section))
+    return amount, status, amount >= 0
+
+
+def parse_c5_detail_clipboard(text: str) -> list[dict[str, Any]]:
+    """Parse one copied C5 order-detail page, including a settled reward."""
+    order_no = _first(r"订单(?:编号|号)\s*[：:]?\s*(\d{8,})", text)
+    if not order_no:
+        return []
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    item_name = next(
+        (line for line in lines if "|" in line and "http" not in line.lower() and len(line) <= 100), ""
+    )
+    start_time = _normal_datetime(_first(
+        r"下单时间\s*[：:]?\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text
+    ))
+    rental_days = _float(_first(r"租期时长[\s\S]{0,80}?([0-9.]+)\s*天", text))
+    price_section = _first(r"租赁价格([\s\S]{0,120})", text)
+    daily_rent = _float(_first(r"￥\s*([0-9.]+)\s*/\s*天", price_section))
+    income = _float(_first(r"=\s*￥\s*([0-9.]+)", price_section))
+    if income <= 0:
+        income = daily_rent * rental_days
+    rental_end = _normal_datetime(_first(
+        r"租赁到期\s*[：:]?\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text
+    ))
+    return_deadline = _normal_datetime(_first(
+        r"归还截止\s*[：:]?\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text
+    ))
+    return_time = rental_end or _end_from_start_and_days(start_time, rental_days) or return_deadline
+    reward, reward_status, reward_known = _c5_transfer_reward(text)
+    return [{
+        "order_no": order_no,
+        "item_name": item_name,
+        "float_val": _first(r"磨损\s*[：:]?\s*([0-9.]+)", text),
+        "daily_rent": daily_rent,
+        "rental_days": rental_days,
+        "deposit": _float(_first(r"饰品押金[\s\S]{0,80}?￥\s*([0-9.]+)", text)),
+        "income": income,
+        "start_time": start_time,
+        "return_time": return_time,
+        "status": _status_from_text(text),
+        "transfer_reward": reward,
+        "reward_status": reward_status,
+        "transfer_reward_known": reward_known,
+        "raw_text": text[:4000],
+    }]
+
+
 def parse_eco_clipboard(text: str) -> list[dict[str, Any]]:
     starts = list(re.finditer(r"(?m)^\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+订单编号：\s*(\d+)", text))
     orders: list[dict[str, Any]] = []
@@ -140,6 +199,8 @@ def detect_clipboard_platform(text: str) -> str:
         return "ECOSteam"
     if "订单号" in text and "查看详情" in text:
         return "C5GAME"
+    if "订单编号" in text and "租赁价格" in text:
+        return "C5GAME"
     return ""
 
 
@@ -147,7 +208,9 @@ def parse_rental_clipboard(text: str) -> tuple[str, list[dict[str, Any]]]:
     """Detect one platform's copied order page and return structured orders."""
     platform = detect_clipboard_platform(text)
     if platform == "C5GAME":
-        return platform, parse_c5_rent_text(text)
+        if "查看详情" in text:
+            return platform, parse_c5_rent_text(text)
+        return platform, parse_c5_detail_clipboard(text)
     if platform == "ECOSteam":
         return platform, parse_eco_clipboard(text)
     if platform == "IGXE":

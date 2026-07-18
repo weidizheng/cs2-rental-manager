@@ -251,9 +251,9 @@ class RentalHistoryDialog(QDialog):
         layout.addWidget(QLabel("双击订单查看完整日期、收入和同步来源。"))
 
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
+        self.table.setColumnCount(9)
         self.table.setHorizontalHeaderLabels([
-            "平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "净收入",
+            "平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "转租奖励（成本）", "净收入",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -271,7 +271,10 @@ class RentalHistoryDialog(QDialog):
                 order.get("start_time", ""), order.get("return_time", ""),
                 f"{rental_days:g} 天" if rental_days > 0 else "—",
                 _money_text(daily) if daily > 0 else "—",
-                _money_text(income), _money_text(order.get("net_income", income) or 0.0),
+                _money_text(income),
+                _money_text(order.get("transfer_reward", 0.0) or 0.0)
+                if order.get("transfer_reward_known") else "—",
+                _money_text(order.get("net_income", income) or 0.0),
             ]
             for column, value in enumerate(values):
                 self.table.setItem(index, column, QTableWidgetItem(str(value)))
@@ -298,6 +301,9 @@ class RentalHistoryDialog(QDialog):
                 f"租期：{float(order.get('rental_days', 0.0) or 0.0):g} 天",
                 f"日租（原价）：{_money_text(order.get('daily_rent', 0.0) or 0.0)}",
                 f"订单金额：{_money_text(order.get('income', 0.0) or 0.0)}",
+                f"转租奖励：{_money_text(order.get('transfer_reward', 0.0) or 0.0)}"
+                f"（{order.get('reward_status', '未读取')}）"
+                if order.get("transfer_reward_known") else "转租奖励：未从 C5 订单详情读取",
                 f"净收入：{_money_text(order.get('net_income', order.get('income', 0.0)) or 0.0)}",
             ]),
         )
@@ -319,10 +325,10 @@ class RentalImportPreviewDialog(QDialog):
         ))
 
         self.table = QTableWidget()
-        self.table.setColumnCount(10)
+        self.table.setColumnCount(11)
         self.table.setHorizontalHeaderLabels([
             "平台", "订单号", "饰品", "磨损", "出租时间", "归还时间",
-            "租期", "日租（原价）", "订单金额", "状态",
+            "租期", "日租（原价）", "订单金额", "转租奖励（成本）", "状态",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -331,7 +337,7 @@ class RentalImportPreviewDialog(QDialog):
         self.table.setStyleSheet("alternate-background-color: #1e1e2e;")
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(2, QHeaderView.Stretch)
-        for column in (0, 1, 3, 4, 5, 6, 7, 8, 9):
+        for column in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
 
         for row, order in enumerate(orders):
@@ -344,7 +350,10 @@ class RentalImportPreviewDialog(QDialog):
                 order.get("float_val", ""), order.get("start_time", ""), order.get("return_time", ""),
                 f"{rental_days:g} 天" if rental_days > 0 else "—",
                 _money_text(daily_rent) if daily_rent > 0 else "—",
-                _money_text(income), order.get("status", "") or "—",
+                _money_text(income),
+                _money_text(order.get("transfer_reward", 0.0) or 0.0)
+                if order.get("transfer_reward_known") else "—",
+                order.get("status", "") or "—",
             ]
             for column, value in enumerate(values):
                 self.table.setItem(row, column, QTableWidgetItem(str(value)))
@@ -1916,6 +1925,12 @@ class CS2ManagerApp(QMainWindow):
             return daily_rent * rental_days * self._order_discount_rate(order)
         return self._order_number(order.get("income"))
 
+    def _order_transfer_reward(self, order) -> float:
+        """C5 reward is a separate landlord cost, not part of its service fee."""
+        if order.get("platform") != "C5GAME" or not order.get("transfer_reward_known"):
+            return 0.0
+        return max(0.0, self._order_number(order.get("transfer_reward")))
+
     def _order_fee_rate(self, order, history) -> float:
         platform_prefix = {
             "C5GAME": "c5",
@@ -1967,6 +1982,7 @@ class CS2ManagerApp(QMainWindow):
         net_income = self._net_amount(
             self._order_gross_income(order), self._order_fee_rate(order, history)
         )
+        net_income -= self._order_transfer_reward(order)
         if order.get("platform") == "IGXE":
             # IGXE settles its displayed order amount by truncating to cents.
             return float(Decimal(str(net_income)).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
@@ -2077,10 +2093,8 @@ class CS2ManagerApp(QMainWindow):
                 rental_days = self._order_rental_days(latest_order)
                 daily_rent = self._order_daily_rent(latest_order)
                 fee_rate = self._order_fee_rate(latest_order, history)
-                net_daily_rent = self._net_amount(
-                    daily_rent * self._order_discount_rate(latest_order), fee_rate
-                )
                 net_income = self._order_net_income(latest_order, history)
+                net_daily_rent = net_income / rental_days if rental_days > 0 else 0.0
                 total_net_income = self._total_net_income(history)
                 order_status = latest_order.get("status", "")
                 status_text, status_color = self._rental_status_display(

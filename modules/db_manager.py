@@ -149,6 +149,9 @@ class DBManager:
             return_time TEXT DEFAULT '',
             status TEXT DEFAULT '',
             raw_text TEXT DEFAULT '',
+            transfer_reward REAL DEFAULT 0.0,
+            reward_status TEXT DEFAULT '',
+            transfer_reward_known INTEGER DEFAULT 0,
             synced_at TEXT NOT NULL,
             UNIQUE(platform, order_no)
         )
@@ -159,6 +162,9 @@ class DBManager:
             ("daily_rent", "REAL DEFAULT 0.0"),
             ("rental_days", "REAL DEFAULT 0.0"),
             ("deposit", "REAL DEFAULT 0.0"),
+            ("transfer_reward", "REAL DEFAULT 0.0"),
+            ("reward_status", "TEXT DEFAULT ''"),
+            ("transfer_reward_known", "INTEGER DEFAULT 0"),
         ):
             try:
                 cursor.execute(f"ALTER TABLE rental_orders ADD COLUMN {column} {definition}")
@@ -370,8 +376,9 @@ class DBManager:
                 """
                 INSERT INTO rental_orders (
                     platform, order_no, item_name, float_val, income, daily_rent, rental_days, deposit,
-                    start_time, return_time, status, raw_text, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    start_time, return_time, status, raw_text, transfer_reward, reward_status,
+                    transfer_reward_known, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(platform, order_no) DO UPDATE SET
                     item_name=excluded.item_name,
                     float_val=excluded.float_val,
@@ -383,6 +390,11 @@ class DBManager:
                     return_time=excluded.return_time,
                     status=excluded.status,
                     raw_text=excluded.raw_text,
+                    transfer_reward=CASE WHEN excluded.transfer_reward_known=1
+                        THEN excluded.transfer_reward ELSE rental_orders.transfer_reward END,
+                    reward_status=CASE WHEN excluded.transfer_reward_known=1
+                        THEN excluded.reward_status ELSE rental_orders.reward_status END,
+                    transfer_reward_known=MAX(rental_orders.transfer_reward_known, excluded.transfer_reward_known),
                     synced_at=excluded.synced_at
                 """,
                 (
@@ -398,6 +410,9 @@ class DBManager:
                     order.get("return_time", ""),
                     order.get("status", ""),
                     order.get("raw_text", ""),
+                    float(order.get("transfer_reward", 0.0) or 0.0),
+                    order.get("reward_status", ""),
+                    1 if order.get("transfer_reward_known", False) else 0,
                     synced_at,
                 ),
             )
@@ -410,7 +425,8 @@ class DBManager:
             cursor.execute(
                 """
                 SELECT platform, order_no, item_name, float_val, income, daily_rent, rental_days, deposit,
-                       start_time, return_time, status, raw_text, synced_at
+                       start_time, return_time, status, raw_text, transfer_reward, reward_status,
+                       transfer_reward_known, synced_at
                 FROM rental_orders WHERE platform=?
                 ORDER BY synced_at DESC, id DESC
                 """,
@@ -419,12 +435,14 @@ class DBManager:
         else:
             cursor.execute("""
                 SELECT platform, order_no, item_name, float_val, income, daily_rent, rental_days, deposit,
-                       start_time, return_time, status, raw_text, synced_at
+                       start_time, return_time, status, raw_text, transfer_reward, reward_status,
+                       transfer_reward_known, synced_at
                 FROM rental_orders ORDER BY synced_at DESC, id DESC
             """)
         columns = (
             "platform", "order_no", "item_name", "float_val", "income", "daily_rent", "rental_days", "deposit",
-            "start_time", "return_time", "status", "raw_text", "synced_at",
+            "start_time", "return_time", "status", "raw_text", "transfer_reward", "reward_status",
+            "transfer_reward_known", "synced_at",
         )
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
