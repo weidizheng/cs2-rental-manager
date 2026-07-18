@@ -443,10 +443,6 @@ class CS2ManagerApp(QMainWindow):
         refresh_btn = QPushButton("🔄 刷新")
         refresh_btn.clicked.connect(self.load_data)
 
-        self.dashboard_auto_refresh_btn = QPushButton("⏱ 开启自动刷新（10:00）")
-        self.dashboard_auto_refresh_btn.setObjectName("primaryBtn")
-        self.dashboard_auto_refresh_btn.clicked.connect(self._toggle_market_auto_refresh)
-
         self.filter_box = QComboBox()
         self.filter_box.addItems(["全部平台", "C5GAME", "ECOSteam", "悠悠有品", "IGXE", "BUFF"])
         self.filter_box.currentTextChanged.connect(self.load_data)
@@ -457,7 +453,6 @@ class CS2ManagerApp(QMainWindow):
         toolbar.addWidget(history_btn)
         toolbar.addWidget(del_btn)
         toolbar.addWidget(refresh_btn)
-        toolbar.addWidget(self.dashboard_auto_refresh_btn)
         toolbar.addStretch()
         toolbar.addWidget(QLabel("筛选:"))
         toolbar.addWidget(self.filter_box)
@@ -1300,13 +1295,9 @@ class CS2ManagerApp(QMainWindow):
     # ── 刷新全部行情（顺序队列） ──
 
     def _set_market_auto_refresh_button_text(self, text):
-        """Keep the dashboard and market-page controls in sync."""
-        for button in (
-            getattr(self, "dashboard_auto_refresh_btn", None),
-            getattr(self, "market_auto_refresh_btn", None),
-        ):
-            if button is not None:
-                button.setText(text)
+        """Update the market-page auto-refresh control."""
+        if getattr(self, "market_auto_refresh_btn", None) is not None:
+            self.market_auto_refresh_btn.setText(text)
 
     def _schedule_next_market_auto_refresh(self):
         """Start one ten-minute interval while keeping recurring mode enabled."""
