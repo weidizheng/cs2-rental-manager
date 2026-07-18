@@ -3,6 +3,7 @@ import os
 import sys
 import logging
 import time
+import secrets
 from datetime import datetime
 from urllib.parse import quote
 from PySide6.QtWidgets import (
@@ -22,6 +23,9 @@ from modules.workers import ApiWorker, MarketRefreshWorker, C5RentalWorker
 from modules.logger import logger
 from modules.image_cache import ImageCache, MarketCache
 from modules.cs2_item_schema import CS2ItemSchema
+from modules.browser_bridge import BrowserBridgeServer
+from modules.c5_rental_browser import parse_c5_rent_text
+from modules.paths import get_private_path
 
 
 ORDER_PAGE_URLS = {
@@ -293,6 +297,15 @@ class CS2ManagerApp(QMainWindow):
         self.apply_theme()
         self.init_ui()
 
+        self.browser_bridge_token = self.db.get_config("browser_bridge_token")
+        if not self.browser_bridge_token:
+            self.browser_bridge_token = secrets.token_urlsafe(32)
+            self.db.save_config("browser_bridge_token", self.browser_bridge_token)
+        self.browser_bridge = BrowserBridgeServer(self.browser_bridge_token)
+        self.browser_bridge.snapshot_received.connect(self._on_browser_bridge_snapshot)
+        self.browser_bridge.server_error.connect(self._on_browser_bridge_error)
+        self.browser_bridge.start()
+
         self.market_countdown_timer = QTimer(self)
         self.market_countdown_timer.timeout.connect(self._update_market_auto_refresh_countdown)
         self.market_auto_refresh_timer = QTimer(self)
@@ -409,7 +422,8 @@ class CS2ManagerApp(QMainWindow):
         layout.addLayout(card_layout)
 
         platform_sync = QGroupBox("平台订单页与 C5 手动读取")
-        platform_layout = QHBoxLayout(platform_sync)
+        platform_layout = QVBoxLayout(platform_sync)
+        browser_layout = QHBoxLayout()
         open_c5_btn = QPushButton("🌐 打开 C5 订单页")
         open_c5_btn.setObjectName("primaryBtn")
         open_c5_btn.clicked.connect(lambda: self._open_default_browser_order_page("c5"))
@@ -419,6 +433,15 @@ class CS2ManagerApp(QMainWindow):
         open_igxe_btn = QPushButton("🌐 打开 IGXE 订单页")
         open_igxe_btn.setObjectName("primaryBtn")
         open_igxe_btn.clicked.connect(lambda: self._open_default_browser_order_page("igxe"))
+
+        self.browser_c5_sync_btn = QPushButton("🔗 通过浏览器同步 C5")
+        self.browser_c5_sync_btn.setObjectName("successBtn")
+        self.browser_c5_sync_btn.setToolTip("请先在默认浏览器打开 C5 订单页，并安装/配对本地扩展。")
+        self.browser_c5_sync_btn.clicked.connect(self._request_default_browser_c5_sync)
+        self.browser_token_btn = QPushButton("🔑 复制扩展配对令牌")
+        self.browser_token_btn.setObjectName("primaryBtn")
+        self.browser_token_btn.setToolTip("首次安装 browser-extension 后，将令牌粘贴到扩展弹窗。")
+        self.browser_token_btn.clicked.connect(self._copy_browser_bridge_token)
 
         self.c5_login_btn = QPushButton("C5 隔离登录（备用）")
         self.c5_login_btn.setObjectName("primaryBtn")
@@ -431,12 +454,18 @@ class CS2ManagerApp(QMainWindow):
             "订单页会在默认浏览器打开；当前程序不会读取该浏览器的登录 Cookie。"
         )
         self.c5_sync_status.setStyleSheet("color: #a6adc8;")
-        platform_layout.addWidget(open_c5_btn)
-        platform_layout.addWidget(open_eco_btn)
-        platform_layout.addWidget(open_igxe_btn)
-        platform_layout.addWidget(self.c5_login_btn)
-        platform_layout.addWidget(self.c5_sync_btn)
-        platform_layout.addWidget(self.c5_sync_status, 1)
+        browser_layout.addWidget(open_c5_btn)
+        browser_layout.addWidget(open_eco_btn)
+        browser_layout.addWidget(open_igxe_btn)
+        browser_layout.addWidget(self.browser_c5_sync_btn)
+        browser_layout.addWidget(self.browser_token_btn)
+        browser_layout.addStretch()
+        fallback_layout = QHBoxLayout()
+        fallback_layout.addWidget(self.c5_login_btn)
+        fallback_layout.addWidget(self.c5_sync_btn)
+        fallback_layout.addWidget(self.c5_sync_status, 1)
+        platform_layout.addLayout(browser_layout)
+        platform_layout.addLayout(fallback_layout)
         layout.addWidget(platform_sync)
 
         # ── 工具栏 ──
@@ -574,6 +603,12 @@ class CS2ManagerApp(QMainWindow):
         self.c5_login_btn.setEnabled(enabled)
         self.c5_sync_btn.setEnabled(enabled)
 
+    def _set_browser_bridge_controls_enabled(self, enabled):
+        if hasattr(self, "browser_c5_sync_btn"):
+            self.browser_c5_sync_btn.setEnabled(enabled)
+        if hasattr(self, "browser_token_btn"):
+            self.browser_token_btn.setEnabled(enabled)
+
     def _open_default_browser_order_page(self, platform):
         """Open an order page in the user's default browser and its existing session."""
         platform_name, url = ORDER_PAGE_URLS.get(platform, ("", ""))
@@ -583,6 +618,61 @@ class CS2ManagerApp(QMainWindow):
         self.c5_sync_status.setText(
             f"已在默认浏览器打开 {platform_name} 订单页。"
             "如需实时读取，需为该浏览器单独授权连接。"
+        )
+
+    def _copy_browser_bridge_token(self):
+        QApplication.clipboard().setText(self.browser_bridge_token)
+        self.c5_sync_status.setText(
+            "扩展配对令牌已复制。在 Chrome 加载 browser-extension 后，粘贴到扩展弹窗并保存。"
+        )
+
+    def _request_default_browser_c5_sync(self):
+        if not self.browser_bridge.is_running:
+            QMessageBox.warning(self, "浏览器同步", "本地浏览器连接服务未启动，请重启程序。")
+            return
+        task = self.browser_bridge.enqueue_task("c5")
+        if not task:
+            QMessageBox.warning(self, "浏览器同步", "无法创建 C5 读取任务。")
+            return
+        self.c5_sync_status.setText(
+            "已请求默认浏览器读取 C5 订单。请保持 C5 订单页打开；扩展最多 30 秒后会同步。"
+        )
+
+    def _on_browser_bridge_error(self, message):
+        logger.warning("[BrowserBridge] %s", message)
+        self._set_browser_bridge_controls_enabled(False)
+        self.c5_sync_status.setText(message)
+
+    def _on_browser_bridge_snapshot(self, payload):
+        """Import an explicitly captured default-browser page on the GUI thread."""
+        if payload.get("platform") != "c5":
+            self.c5_sync_status.setText("已收到订单页。该平台的解析器尚未接入。")
+            return
+        if payload.get("capture_error"):
+            self.c5_sync_status.setText(f"C5 浏览器读取失败：{payload['capture_error']}")
+            return
+        if payload.get("challenge_detected"):
+            self.c5_sync_status.setText(
+                "C5 页面需要安全验证。请在已打开的默认浏览器页面中手动完成验证，然后再点击同步。"
+            )
+            return
+
+        page_text = payload.get("page_text", "")
+        snapshot_dir = get_private_path("browser-snapshots")
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        snapshot_path = snapshot_dir / f"c5-extension-{datetime.now():%Y%m%d-%H%M%S}.txt"
+        snapshot_path.write_text(page_text, encoding="utf-8")
+        orders = parse_c5_rent_text(page_text)
+        if orders:
+            self.db.upsert_rental_orders("C5GAME", orders)
+            self.load_data()
+            self.c5_sync_status.setText(
+                f"已从默认浏览器同步 {len(orders)} 条 C5 订单；已按磨损值关联资产。"
+            )
+            logger.info("[C5 BrowserBridge] 同步 %s 条订单，快照：%s", len(orders), snapshot_path)
+            return
+        self.c5_sync_status.setText(
+            "C5 页面已读取，但未解析到订单。已保存私密文本快照，可用于调整解析规则。"
         )
 
     def _run_c5_task(self, task):
@@ -2052,6 +2142,12 @@ class CS2ManagerApp(QMainWindow):
             self.timer.start(mins * 60 * 1000)
         else:
             self.timer.stop()
+
+    def closeEvent(self, event):  # noqa: N802
+        bridge = getattr(self, "browser_bridge", None)
+        if bridge is not None:
+            bridge.stop()
+        super().closeEvent(event)
 
 
 if __name__ == "__main__":

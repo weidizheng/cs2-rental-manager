@@ -8,7 +8,7 @@
 
 | 标签页 | 已实现的功能 | 说明 |
 | --- | --- | --- |
-| 资产与出租管理 | 饰品增删改、资产统计、C5 手动同步、订单历史、到期倒计时 | C5 是唯一已接入的订单读取平台 |
+| 资产与出租管理 | 饰品增删改、资产统计、C5 默认浏览器同步、订单历史、到期倒计时 | C5 是唯一已接入的订单读取平台 |
 | 一览式大盘行情 | CSQAQ 售价/租金聚合、ECO 最低日租、平台跳转、行情观察列表与缓存 | 不直接请求 IGXE 行情接口 |
 | 系统与费率设置 | 保存 CSQAQ Token、ECO Partner ID/RSA 私钥、资产页本地刷新间隔与费率 | 设置只写入私密数据目录 |
 
@@ -65,7 +65,7 @@ git push origin main
 | --- | --- | --- |
 | `app.db` | SQLite 主数据：资产、设置、出租订单 | 是 |
 | `items.json` | 资产表的 JSON 备份/首次导入来源 | 是 |
-| `configs.json` | Token、ECO 凭据、费率、刷新设置备份 | 是，敏感 |
+| `configs.json` | Token、ECO 凭据、费率、刷新设置、浏览器扩展配对令牌备份 | 是，敏感 |
 | `market_cache.json` | 观察列表、行情、平台 ID、自定义跳转链接、成功更新时间 | 建议复制 |
 | `eco_market_cache.db` | ECO 全量行情快照（约 4 万条） | 建议复制，可省去首次重新下载 |
 | `schema-source/` | ByMykel 英文/中文原始饰品数据 | 是 |
@@ -118,20 +118,30 @@ git push origin main
 | ECO | `https://www.ecosteam.cn/html/person/rentrecordlist.html` |
 | IGXE | `https://www.igxe.cn/lease/seller-order-list` |
 
-目前这些按钮仅负责打开网页；本程序不会读取默认浏览器的 Cookie 或 DOM，因此不会在后台自动导入订单。若需自动导入，必须额外实现并明确授权一个浏览器扩展或本地 Chrome 调试连接。
 
-C5 现有的隔离读取器流程如下：
+### C5 默认浏览器同步（当前推荐方式）
 
-1. 点击“C5 登录”，打开隔离的、可见的 Playwright Chromium。
+代码位置：`modules/browser_bridge.py`、`browser-extension/`、`modules/c5_rental_browser.py`、`modules/db_manager.py`。
+
+1. 在 Chrome/Edge 的扩展页以开发者模式“加载已解压的扩展程序”，选择 `browser-extension/`。
+2. 启动桌面程序，点击“复制扩展配对令牌”，粘贴到扩展弹窗并保存。令牌仅存在扩展本地存储和 `configs.json`。
+3. 在日常浏览器中登录 C5 并打开出租记录页。
+4. 点击桌面端“通过浏览器同步 C5”。扩展最多约 30 秒后读取已打开的标签页文本，通过仅监听本机的 `127.0.0.1:8765` 发送给程序。扩展弹窗的“立即检查同步请求”可以跳过等待。
+5. 程序保存私密文本快照、按订单号 upsert 订单，再以标准化磨损值 `float_val` 匹配资产。同一 float 的最新订单决定资产页的租赁状态、归还时间与倒计时；旧订单保留为历史/转租记录。
+
+扩展不读取、导出或传输 Cookie、密码、浏览历史。若 C5 检测到“安全验证”页，扩展只向桌面端报告状态；用户必须在该浏览器标签页手动完成验证，再次点击同步。
+
+### C5 隔离读取器（备用）
+
+1. 点击“C5 隔离登录（备用）”，打开隔离的、可见的 Playwright Chromium。
 2. 由用户在窗口内登录并自行完成验证码；关闭窗口即保存该隔离 Profile。
-3. 点击“同步 C5 出租订单”。程序访问 `https://www.c5game.com/user/rent?actag=2`，读取当前页文本和 HTML。
+3. 点击“读取 C5 订单（隔离浏览器）”。程序访问 `https://www.c5game.com/user/rent?actag=2`，读取当前页文本和 HTML。
 4. HTML 私密保存至 `browser-snapshots/c5-rent-时间.html`，文本解析后按订单号 upsert 到 `rental_orders`。
-5. 资产页按磨损值关联订单并刷新倒计时/历史。
 
 安全与边界：
 
 - 不读取普通 Chrome Profile，不存储密码，不尝试绕过验证码或反爬限制。
-- 操作仅由按钮手动触发；不存在后台轮询 C5。
+- 桌面端同步仅由按钮手动触发；扩展的 30 秒低频轮询只是为取得本地同步任务，不访问平台网络接口。
 - C5 页面改版后，优先保留同步产生的 HTML 快照，再根据快照调整 `parse_c5_rent_text()` 的解析规则。
 
 ## 6. 本地 CS2 饰品映射
@@ -219,6 +229,8 @@ private-data/schema-source/skins_not_grouped.zh-CN.json
 | `modules/eco_market_cache.py` | ECO 全量快照 SQLite 缓存、相位租金回退 |
 | `modules/cs2_item_schema.py` | ByMykel 本地 JSON 映射及索引重建 |
 | `modules/c5_rental_browser.py` | C5 可见浏览器、页面快照与文本解析 |
+| `modules/browser_bridge.py` | 仅监听本机的扩展配对、同步任务和订单页文本接收 |
+| `browser-extension/` | Chrome/Edge Manifest V3 扩展，仅读取明确授权的订单页文本 |
 | `modules/image_cache.py` | 行情观察列表和图片缓存 |
 | `modules/logger.py` | 私密日志轮转 |
 | `requirements.txt` | Python 依赖 |
