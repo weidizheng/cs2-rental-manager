@@ -33,6 +33,7 @@ class ApiWorker(QObject):
     def __init__(self):
         super().__init__()
         self._is_canceled = False
+        self.eco_status_text = ""
 
     def cancel(self):
         """取消正在进行的操作（需在任务函数中检查）"""
@@ -64,7 +65,7 @@ class ApiWorker(QObject):
 
     # ────────────── ECO ──────────────
 
-    def fetch_eco_hash_price_list(self, partner_id: str, rsa_key: str, market_hash_name: str):
+    def fetch_eco_hash_price_list(self, partner_id: str, rsa_key: str, market_hash_name: str, phase: str = ""):
         """
         ECO 全量行情查询（含起租价），通过 GetHashNameAndPriceList 获取。
         返回 tag="eco_rental"
@@ -80,8 +81,7 @@ class ApiWorker(QObject):
         """
         try:
             client = ECOClient(partner_id=partner_id, private_key_str=rsa_key)
-            mapping = client.get_hash_name_and_price_list()
-            item = mapping.get(market_hash_name, {})
+            item = client.get_price(market_hash_name, phase)
 
             result = {
                 "success": bool(item),
@@ -89,6 +89,7 @@ class ApiWorker(QObject):
                 "listings": [],
                 "eco_sell_price": item.get("eco_sell_price", 0.0),
                 "style_name": item.get("style_name", ""),
+                "cache_source": client.last_price_source,
             }
             if not self._is_canceled:
                 self.finished.emit(("eco_rental", result))
@@ -157,7 +158,7 @@ class MarketRefreshWorker(QObject):
         self._is_canceled = True
 
     def refresh_all(self, token: str, eco_partner: str, eco_rsa: str,
-                    tracked_items: list, build_mhn_fn):
+                    tracked_items: list, build_mhn_fn, force_eco: bool = False):
         """
         顺序刷新所有饰品行情。
 
@@ -167,6 +168,7 @@ class MarketRefreshWorker(QObject):
             eco_rsa: ECO RSA 私钥
             tracked_items: _market_tracked_items 列表
             build_mhn_fn: 用于构建 market_hash_name 的函数
+            force_eco: True 时忽略本地 ECO 缓存并请求完整快照
         """
         total = len(tracked_items)
         if total == 0:
@@ -206,9 +208,18 @@ class MarketRefreshWorker(QObject):
             self.progress.emit(0, total, "正在获取 ECO 全量行情...")
             try:
                 eco_client = ECOClient(partner_id=eco_partner, private_key_str=eco_rsa)
-                eco_price_mapping = eco_client.get_hash_name_and_price_list()
+                eco_price_mapping = eco_client.get_hash_name_and_price_list(force_refresh=force_eco)
+                source_text = {
+                    "cache": "本地缓存",
+                    "network": "ECO 全量更新",
+                    "stale": "过期本地缓存",
+                }.get(eco_client.last_price_source, "无可用数据")
+                cache_status = eco_client.last_cache_status or {}
+                item_count = cache_status.get("item_count", len(eco_price_mapping))
+                self.eco_status_text = f"ECO {source_text} · {item_count:,} 条"
+                self.progress.emit(0, total, f"ECO：{source_text}（{len(eco_price_mapping)} 条）")
                 logger.info(
-                    f"[ECO] 全量行情获取完成，共 {len(eco_price_mapping)} 个饰品"
+                    f"[ECO] 行情来源={eco_client.last_price_source}，共 {len(eco_price_mapping)} 条"
                 )
             except Exception as e:
                 self.error.emit(f"ECO 全量行情异常: {e}")
@@ -223,16 +234,15 @@ class MarketRefreshWorker(QObject):
 
             # 5a. 从 ECO 全量行情缓存中提取起租价
             if eco_price_mapping and not self._is_canceled:
-                eco_item = eco_price_mapping.get(mhn, {})
-                # 调试日志：帮助排查匹配问题
+                eco_item = eco_client.market_cache.find_price(
+                    eco_price_mapping, mhn, entry.get("phase", "")
+                )
                 if not eco_item:
-                    logger.warning(f"[DEBUG] ECO 未匹配: mhn='{mhn}'")
-                    # 尝试模糊匹配：打印前5个可能的key
-                    possible = [k for k in list(eco_price_mapping.keys())[:5] if mhn.split('|')[0].strip() in k]
-                    if possible:
-                        logger.warning(f"[DEBUG] 可能的 ECO key: {possible}")
+                    logger.warning(
+                        f"[ECO] 未匹配: mhn='{mhn}', phase='{entry.get('phase', '-')}'"
+                    )
                 else:
-                    logger.info(f"[DEBUG] ECO 匹配成功: mhn='{mhn}', rent={eco_item.get('eco_rent_price', 0.0)}")
+                    logger.info(f"[ECO] 匹配成功: mhn='{mhn}', rent={eco_item.get('eco_rent_price', 0.0)}")
                     entry["eco_min_rent"] = eco_item.get("eco_rent_price", 0.0)
                     entry.setdefault("detail", {})["eco_sell_price"] = eco_item.get("eco_sell_price", 0.0)
                     entry.setdefault("detail", {})["eco_style_name"] = eco_item.get("style_name", "")

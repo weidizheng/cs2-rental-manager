@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+import threading
 import time
 from typing import Dict, Any, List, Optional
 
@@ -10,8 +11,10 @@ from Crypto.PublicKey import RSA
 from Crypto.Signature import pkcs1_15
 
 from modules.base_client import BaseAPIClient
+from modules.eco_market_cache import CACHE_TTL_SECONDS, ECOMarketCache
 
 logger = logging.getLogger("CS2Rental")
+_snapshot_refresh_lock = threading.Lock()
 
 
 class ECOClient(BaseAPIClient):
@@ -41,9 +44,9 @@ class ECOClient(BaseAPIClient):
         self.private_key_str = private_key_str
         self.base_url = "https://openapi.ecosteam.cn"
 
-        # ── GetHashNameAndPriceList 60 秒内存缓存 ──
-        self._hash_price_cache: dict = {}
-        self._last_hash_price_time: float = 0
+        self.market_cache = ECOMarketCache(partner_id)
+        self.last_price_source = "none"
+        self.last_cache_status: dict | None = None
 
     def _ensure_pem_format(self, key_str: str) -> str:
         """如果密钥是原始 base64 格式，自动包装为 PEM 格式"""
@@ -113,89 +116,68 @@ class ECOClient(BaseAPIClient):
     # 接口 1: 获取全量在售价格与起租价（60 秒缓存）
     # ──────────────────────────────────────────────
 
-    def get_hash_name_and_price_list(self) -> dict:
+    def get_hash_name_and_price_list(self, force_refresh: bool = False) -> dict:
+        """Get a phase-aware snapshot, preferring the local SQLite cache.
+
+        ECO only offers a full-list endpoint here. A fresh cache (15 minutes by
+        default) prevents repeated 39k-item downloads; a force refresh is the
+        only normal path that bypasses it.
         """
-        获取 ECO 全量在售价格与起租价。
+        cached_status = self.market_cache.status()
+        if not force_refresh and self.market_cache.is_fresh(CACHE_TTL_SECONDS):
+            self.last_price_source = "cache"
+            self.last_cache_status = cached_status
+            snapshot = self.market_cache.load_snapshot()
+            logger.info(f"[ECO] 使用本地行情缓存，共 {len(snapshot)} 条")
+            return snapshot
 
-        接口: POST /Api/Market/GetHashNameAndPriceList
-        频控: 60 秒内重复调用直接返回内存缓存，严格禁止 60 秒内重复发包。
+        with _snapshot_refresh_lock:
+            # Another worker may have refreshed the SQLite cache while this one
+            # was waiting for the process-wide refresh lock.
+            if not force_refresh and self.market_cache.is_fresh(CACHE_TTL_SECONDS):
+                self.last_price_source = "cache"
+                self.last_cache_status = self.market_cache.status()
+                return self.market_cache.load_snapshot()
 
-        Body:
-            GameID: "730"
-            NeedStyleInfo: True
-            PartnerId: ...
-            Timestamp: ...
+            stale_snapshot = self.market_cache.load_snapshot()
+            if not self.partner_id or not self.private_key_str:
+                self.last_price_source = "stale" if stale_snapshot else "none"
+                self.last_cache_status = cached_status
+                logger.warning("[ECO] PartnerId 或私钥未配置，跳过全量更新")
+                return stale_snapshot
 
-        核心提取字段:
-            - Price: ECO 在售最低价
-            - RentGoodsBottomPrice: ECO 起租价（直接填入 UI 的 ECO 最低日租列）
-            - StyleName: 多普勒款式（Phase1 / Phase2 / Ruby / Sapphire 等）
+            endpoint = "/Api/Market/GetHashNameAndPriceList"
+            resp_data = self._make_signed_request(endpoint, {"GameID": "730", "NeedStyleInfo": True})
+            if not resp_data:
+                self.last_price_source = "stale" if stale_snapshot else "none"
+                logger.warning("[ECO] 全量行情更新失败，保留旧缓存")
+                return stale_snapshot
 
-        Returns:
-            {
-                "market_hash_name_1": {
-                    "eco_sell_price": 100.0,
-                    "eco_rent_price": 5.0,
-                    "style_name": "Phase1",
-                },
-                ...
-            }
-        """
-        now = time.time()
+            code = resp_data.get("ResultCode", resp_data.get("code", resp_data.get("Code")))
+            if isinstance(code, str):
+                code = int(code) if code.isdigit() else None
+            if code not in (0, 200):
+                msg = resp_data.get("ResultMsg", resp_data.get("msg", resp_data.get("Msg", "未知错误")))
+                self.last_price_source = "stale" if stale_snapshot else "none"
+                logger.warning(f"[ECO] 全量行情业务错误: code={code}, msg={msg}")
+                return stale_snapshot
 
-        # 60 秒缓存命中
-        if self._hash_price_cache and (now - self._last_hash_price_time < 60):
-            logger.debug(
-                f"[ECO] GetHashNameAndPriceList 缓存命中 "
-                f"({int(now - self._last_hash_price_time)}s < 60s)，直接返回"
-            )
-            return self._hash_price_cache
+            result_list = resp_data.get("ResultData") or []
+            if not isinstance(result_list, list):
+                self.last_price_source = "stale" if stale_snapshot else "none"
+                logger.warning("[ECO] 全量行情 ResultData 格式异常，保留旧缓存")
+                return stale_snapshot
 
-        if not self.partner_id or not self.private_key_str:
-            logger.warning("[ECO] PartnerId 或私钥未配置，跳过 GetHashNameAndPriceList")
-            return self._hash_price_cache
+            snapshot = self.market_cache.replace_snapshot(result_list)
+            self.last_price_source = "network"
+            self.last_cache_status = self.market_cache.status()
+            logger.info(f"[ECO] 全量行情已更新并写入本地缓存，共 {len(snapshot)} 条")
+            return snapshot
 
-        endpoint = "/Api/Market/GetHashNameAndPriceList"
-        payload = {
-            "GameID": "730",
-            "NeedStyleInfo": True,
-        }
-
-        resp_data = self._make_signed_request(endpoint, payload)
-        if not resp_data:
-            logger.warning("[ECO] GetHashNameAndPriceList 请求无响应或解析失败")
-            return self._hash_price_cache
-
-        # 解析返回结构（兼容 ResultCode/ResultMsg 与 code/msg）
-        code = resp_data.get("ResultCode", resp_data.get("code", resp_data.get("Code", 0)))
-        # ResultCode 可能是字符串
-        if isinstance(code, str):
-            code = int(code) if code.isdigit() else 0
-        # ECO 接口 ResultCode: 0 或 200 均表示成功
-        if code not in (0, 200):
-            msg = resp_data.get("ResultMsg", resp_data.get("msg", resp_data.get("Msg", "未知错误")))
-            logger.warning(f"[ECO] GetHashNameAndPriceList 业务错误: code={code}, msg={msg}, resp={resp_data}")
-            return self._hash_price_cache
-
-        result_list = resp_data.get("ResultData") or []
-        mapping: dict = {}
-        for item in result_list:
-            h_name = item.get("HashName")
-            if h_name:
-                mapping[h_name] = {
-                    "eco_sell_price": item.get("Price", 0.0),
-                    "eco_rent_price": item.get("RentGoodsBottomPrice", 0.0),
-                    "style_name": item.get("StyleName", ""),
-                }
-
-        self._hash_price_cache = mapping
-        self._last_hash_price_time = now
-
-        logger.info(
-            f"[ECO] GetHashNameAndPriceList 成功, "
-            f"获取 {len(mapping)} 个饰品价格/起租信息"
-        )
-        return mapping
+    def get_price(self, market_hash_name: str, phase: str = "", force_refresh: bool = False) -> dict:
+        """Return the exact cached ECO quote for one market name and phase."""
+        snapshot = self.get_hash_name_and_price_list(force_refresh=force_refresh)
+        return self.market_cache.find_price(snapshot, market_hash_name, phase)
 
     # ──────────────────────────────────────────────
     # 接口 2: 批量获取饰品详情（图片 + PaintIndexLabel）

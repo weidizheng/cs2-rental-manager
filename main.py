@@ -398,10 +398,16 @@ class CS2ManagerApp(QMainWindow):
         search_layout.addWidget(self.market_input, 1)
         search_layout.addWidget(self.market_search_btn)
 
-        refresh_market_btn = QPushButton("🔄 刷新全部行情")
+        refresh_market_btn = QPushButton("🔄 刷新行情（用缓存）")
         refresh_market_btn.setObjectName("successBtn")
         refresh_market_btn.clicked.connect(self._refresh_all_market_data)
         search_layout.addWidget(refresh_market_btn)
+
+        force_eco_btn = QPushButton("☁️ 强制更新 ECO")
+        force_eco_btn.setObjectName("primaryBtn")
+        force_eco_btn.setToolTip("忽略本地 ECO 缓存并重新下载完整行情快照")
+        force_eco_btn.clicked.connect(lambda: self._refresh_all_market_data(force_eco=True))
+        search_layout.addWidget(force_eco_btn)
 
         layout.addLayout(search_layout)
 
@@ -760,8 +766,8 @@ class CS2ManagerApp(QMainWindow):
 
     # ── 刷新全部行情（顺序队列） ──
 
-    def _refresh_all_market_data(self):
-        """使用 MarketRefreshWorker 顺序队列刷新大盘中所有饰品的行情"""
+    def _refresh_all_market_data(self, force_eco: bool = False):
+        """刷新大盘；普通模式优先使用本地 ECO 快照。"""
         if not self._market_tracked_items:
             QMessageBox.warning(self, "提示", "大盘中没有饰品，请先搜索添加！")
             return
@@ -775,7 +781,7 @@ class CS2ManagerApp(QMainWindow):
         eco_partner = self.db.get_config("eco_partner_id")
         eco_rsa = self.db.get_config("eco_rsa_key")
 
-        self.lbl_market_update.setText("正在刷新行情...")
+        self.lbl_market_update.setText("正在强制更新 ECO..." if force_eco else "正在刷新行情...")
 
         self._market_refresh_thread = QThread()
         self._market_refresh_worker = MarketRefreshWorker()
@@ -797,7 +803,7 @@ class CS2ManagerApp(QMainWindow):
         items_copy = list(self._market_tracked_items)
         self._market_refresh_thread.started.connect(
             lambda: self._market_refresh_worker.refresh_all(
-                token, eco_partner, eco_rsa, items_copy, self._build_market_hash_name_for_entry
+                token, eco_partner, eco_rsa, items_copy, self._build_market_hash_name_for_entry, force_eco
             )
         )
         self._market_refresh_thread.start()
@@ -819,7 +825,9 @@ class CS2ManagerApp(QMainWindow):
         """全部刷新完成"""
         self._populate_market_table()
         self._save_market_cache()
-        self.lbl_market_update.setText(f"最后更新: {QTime.currentTime().toString('HH:mm:ss')}")
+        eco_status = getattr(self._market_refresh_worker, "eco_status_text", "")
+        suffix = f" · {eco_status}" if eco_status else ""
+        self.lbl_market_update.setText(f"最后更新: {QTime.currentTime().toString('HH:mm:ss')}{suffix}")
 
     def _cleanup_market_refresh_thread(self):
         """清理市场刷新线程引用"""
@@ -1042,7 +1050,9 @@ class CS2ManagerApp(QMainWindow):
         # 2. ECO 全量行情查询（含起租价）
         if eco_partner and eco_rsa:
             self._start_worker(
-                worker_fn=lambda w: w.fetch_eco_hash_price_list(eco_partner, eco_rsa, mhn),
+                worker_fn=lambda w: w.fetch_eco_hash_price_list(
+                    eco_partner, eco_rsa, mhn, entry.get("phase", "")
+                ),
                 on_finished=lambda result: self._on_single_row_eco_rental_result(row, result),
                 on_error=lambda msg: logger.warning(f"ECO 单行行情查询失败 ({mhn}): {msg}"),
             )
@@ -1086,7 +1096,12 @@ class CS2ManagerApp(QMainWindow):
             return
         entry = self._market_tracked_items[row]
         entry["eco_min_rent"] = data.get("min_rent", 0.0)
-        entry.setdefault("detail", {})["eco_listings"] = data.get("listings", [])
+        entry.setdefault("detail", {}).update({
+            "eco_listings": data.get("listings", []),
+            "eco_sell_price": data.get("eco_sell_price", 0.0),
+            "eco_style_name": data.get("style_name", ""),
+            "eco_cache_source": data.get("cache_source", ""),
+        })
         self._populate_market_table()
         self._save_market_cache()
 
