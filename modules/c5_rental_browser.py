@@ -75,7 +75,10 @@ def parse_c5_rent_text(page_text: str) -> list[dict[str, Any]]:
         end = order_starts[index + 1].start() if index + 1 < len(order_starts) else len(page_text)
         block = page_text[start.start():end]
         order_no = start.group(1)
-        datetimes = re.findall(r"20\d{2}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2}", block)
+        datetimes = [
+            re.sub(r"\s+", " ", value)
+            for value in re.findall(r"20\d{2}-\d{2}-\d{2}\s*\d{2}:\d{2}:\d{2}", block)
+        ]
         status = next((item for item in statuses if item in block), "")
         float_val = _first_match(r"(?:磨损|磨损度)\s*[：:]?\s*([0-9.]+)", block)
 

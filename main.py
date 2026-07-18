@@ -4,7 +4,7 @@ import sys
 import logging
 import time
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import quote
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -199,9 +199,31 @@ def _rental_float_key(value) -> str:
         return ""
 
 
+def _rental_float_matches(asset_value, order_value) -> bool:
+    """Match a full platform float to an asset float that may have been truncated."""
+    try:
+        asset_text = str(asset_value).strip()
+        asset_float = Decimal(asset_text)
+        order_float = Decimal(str(order_value).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+    if asset_float == order_float:
+        return True
+    # Early versions of the app stored user-entered floats such as 0.02082699
+    # while platform order pages expose the complete value.  Use half of the
+    # last entered decimal place as the maximum matching tolerance.
+    decimal_places = len(asset_text.partition(".")[2])
+    if decimal_places <= 0:
+        return False
+    tolerance = Decimal("0.5") * (Decimal(10) ** -decimal_places)
+    return abs(asset_float - order_float) < tolerance
+
+
 def _parse_rental_datetime(value) -> datetime:
     try:
-        return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+        normalized = " ".join(str(value).split())
+        return datetime.strptime(normalized, "%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
         return datetime.min
 
@@ -233,6 +255,7 @@ class RentalHistoryDialog(QDialog):
             "平台", "状态", "出租时间", "归还时间", "租期", "日租（原价）", "订单金额", "净收入",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setWordWrap(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         for index, order in enumerate(self.orders):
@@ -301,6 +324,7 @@ class RentalImportPreviewDialog(QDialog):
             "租期", "日租（原价）", "订单金额", "状态",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setWordWrap(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet("alternate-background-color: #1e1e2e;")
@@ -1805,7 +1829,7 @@ class CS2ManagerApp(QMainWindow):
             return []
         orders = [
             order for order in self.db.get_rental_orders()
-            if _rental_float_key(order.get("float_val")) == float_key
+            if _rental_float_matches(item.get("float_val"), order.get("float_val"))
         ]
         return sorted(orders, key=lambda order: _parse_rental_datetime(order.get("start_time")))
 
@@ -1860,15 +1884,34 @@ class CS2ManagerApp(QMainWindow):
         }.get(order.get("platform", ""), "")
         if not platform_prefix:
             return 0.0
-        order_key = (order.get("platform", ""), order.get("order_no", ""))
-        first_key = (
-            history[0].get("platform", ""), history[0].get("order_no", "")
-        ) if history else ("", "")
-        fee_kind = "first" if order_key == first_key else "relet"
+        fee_kind = "relet" if self._is_relet_order(order, history) else "first"
         try:
             return min(0.999, max(0.0, float(self.db.get_config(f"{platform_prefix}_{fee_kind}_fee") or 0.0)))
         except ValueError:
             return 0.0
+
+    @staticmethod
+    def _order_key(order):
+        return str(order.get("platform", "")), str(order.get("order_no", ""))
+
+    def _is_relet_order(self, order, history) -> bool:
+        """A new order is a relet only when it follows the prior one within CD."""
+        order_key = self._order_key(order)
+        order_index = next(
+            (index for index, candidate in enumerate(history)
+             if self._order_key(candidate) == order_key),
+            -1,
+        )
+        if order_index <= 0:
+            return False
+        previous_order = history[order_index - 1]
+        previous_end = _parse_rental_datetime(previous_order.get("return_time"))
+        current_start = _parse_rental_datetime(order.get("start_time"))
+        if previous_end <= datetime.min or current_start <= datetime.min:
+            return False
+        # A non-transfer rental goes through a seven-day cooldown.  Direct
+        # handover can overlap slightly in the two platform timestamps.
+        return current_start - previous_end < timedelta(days=7)
 
     @staticmethod
     def _net_amount(gross_amount, fee_rate) -> float:
@@ -1896,15 +1939,15 @@ class CS2ManagerApp(QMainWindow):
         total_seconds = int(remaining.total_seconds())
         days, remainder = divmod(total_seconds, 24 * 60 * 60)
         hours, remainder = divmod(remainder, 60 * 60)
-        minutes, seconds = divmod(remainder, 60)
+        minutes, _seconds = divmod(remainder, 60)
         if days:
-            return f"剩 {days}天 {hours:02d}:{minutes:02d}:{seconds:02d}"
-        return f"剩 {hours:02d}:{minutes:02d}:{seconds:02d}"
+            return f"剩 {days}天{hours}小时{minutes}分"
+        return f"剩 {hours}小时{minutes}分"
 
     def _rental_status_display(self, latest_order, history, fallback_status):
         """Build a live status cell for the latest order of one physical item."""
         order_status = str(latest_order.get("status", "") or "").strip()
-        rental_label = "已转租" if len(history) > 1 else "已出租"
+        rental_label = "已转租" if self._is_relet_order(latest_order, history) else "已出租"
         if order_status != "租赁中":
             if order_status in {"已转交", "已完成"}:
                 return f"{rental_label} · {order_status}", None
