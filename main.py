@@ -11,13 +11,14 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QTableWidget, QTableWidgetItem, QComboBox, QHeaderView,
-    QTabWidget, QFormLayout, QGroupBox, QMessageBox,
+    QFormLayout, QGroupBox, QMessageBox,
     QAbstractItemView, QDialog, QSplitter, QScrollArea,
     QCheckBox, QFrame, QPlainTextEdit,
-    QMenu, QInputDialog,
+    QMenu, QInputDialog, QStackedWidget, QToolButton, QSizePolicy,
 )
-from PySide6.QtCore import Qt, QTimer, QThread, QUrl, QTime
+from PySide6.QtCore import Qt, QTimer, QThread, QUrl, QTime, QSize, QByteArray, QEvent
 from PySide6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QLinearGradient, QBrush, QDesktopServices
+from PySide6.QtSvg import QSvgRenderer
 
 from modules.db_manager import DBManager
 from modules.workers import ApiWorker, MarketRefreshWorker
@@ -526,12 +527,149 @@ class MarketAIImportDialog(QDialog):
             self.status_label.setText("没有可导入的饰品。" + (" " + "；".join(errors[:3]) if errors else ""))
 
 
+_LINE_ICON_PATHS = {
+    "app": "M4 4h16v16H4z M7 15l3-3 2 2 4-5 M7 8h.01 M11 8h.01 M15 8h.01",
+    "dashboard": "M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z",
+    "market": "M4 18l5-6 4 3 7-9 M15 6h5v5",
+    "settings": "M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z M19 12h1 M4 12h1 M12 4V3 M12 21v-1 M17 7l1-1 M6 18l1-1 M17 17l1 1 M6 6l1 1",
+    "external": "M14 4h6v6 M20 4l-9 9 M18 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h5",
+    "clipboard": "M9 5h6 M9 3h6a2 2 0 0 1 2 2v15H7V5a2 2 0 0 1 2-2z M9 10h6 M9 14h4",
+    "add": "M12 5v14 M5 12h14",
+    "edit": "M4 20h4l10-10-4-4L4 16v4z M13 7l4 4 M15 5l1-1a2 2 0 0 1 3 3l-1 1",
+    "history": "M4 12a8 8 0 1 0 2-5.4 M4 5v5h5 M12 8v5l3 2",
+    "delete": "M4 7h16 M10 11v5 M14 11v5 M9 7V4h6v3 M6 7l1 14h10l1-14",
+    "refresh": "M20 11a8 8 0 0 0-14-5L4 8 M4 4v4h4 M4 13a8 8 0 0 0 14 5l2-2 M20 20v-4h-4",
+    "search": "M11 4a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M16 16l4 4",
+    "minimize": "M5 12h14",
+    "maximize": "M5 5h14v14H5z",
+    "restore": "M8 8h11v11H8z M5 16H4V5h11v1",
+    "close": "M6 6l12 12 M18 6L6 18",
+}
+
+
+def make_line_icon(name: str, color: str = "#cdd6f4", size: int = 18) -> QIcon:
+    """Render the small, consistent SVG line-icon set used by the application."""
+    path = _LINE_ICON_PATHS.get(name, _LINE_ICON_PATHS["app"])
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+        f'<path d="{path}" fill="none" stroke="{color}" stroke-width="1.8" '
+        'stroke-linecap="round" stroke-linejoin="round"/></svg>'
+    )
+    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.transparent)
+    painter = QPainter(pixmap)
+    renderer.render(painter)
+    painter.end()
+    return QIcon(pixmap)
+
+
+class CustomTitleBar(QFrame):
+    """Frameless-window header with native window actions and a drag surface."""
+
+    def __init__(self, window, parent=None):
+        super().__init__(parent)
+        self._window = window
+        self._drag_offset = None
+        self.setObjectName("customTitleBar")
+        self.setFixedHeight(40)
+        self.setCursor(Qt.ArrowCursor)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 0, 0)
+        layout.setSpacing(8)
+
+        app_icon = QLabel()
+        app_icon.setPixmap(make_line_icon("app", "#89b4fa", 20).pixmap(20, 20))
+        app_icon.setFixedSize(24, 24)
+        layout.addWidget(app_icon)
+
+        title = QLabel("CS2 出租管理")
+        title.setObjectName("windowTitle")
+        layout.addWidget(title)
+
+        self.sync_label = QLabel("● 本地数据已加载")
+        self.sync_label.setObjectName("syncStatus")
+        layout.addWidget(self.sync_label)
+        layout.addStretch()
+
+        self.min_button = self._control_button("minimize", "最小化")
+        self.max_button = self._control_button("maximize", "最大化")
+        self.close_button = self._control_button("close", "关闭", close=True)
+        self.min_button.clicked.connect(self._window.showMinimized)
+        self.max_button.clicked.connect(self.toggle_maximize)
+        self.close_button.clicked.connect(self._window.close)
+        layout.addWidget(self.min_button)
+        layout.addWidget(self.max_button)
+        layout.addWidget(self.close_button)
+
+    def _control_button(self, icon_name, tooltip, close=False):
+        button = QToolButton()
+        button.setObjectName("closeControl" if close else "windowControl")
+        button.setIcon(make_line_icon(icon_name, "#f5e0dc" if close else "#bac2de", 16))
+        button.setIconSize(QSize(16, 16))
+        button.setFixedSize(40, 40)
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        return button
+
+    def set_sync_status(self, text, tone="#a6e3a1"):
+        self.sync_label.setText(f"● {text}")
+        self.sync_label.setStyleSheet(f"color: {tone};")
+
+    def toggle_maximize(self):
+        if self._window.isMaximized():
+            self._window.showNormal()
+        else:
+            self._window.showMaximized()
+        self.update_window_state()
+
+    def update_window_state(self):
+        icon_name = "restore" if self._window.isMaximized() else "maximize"
+        tooltip = "还原窗口" if self._window.isMaximized() else "最大化"
+        self.max_button.setIcon(make_line_icon(icon_name, "#bac2de", 16))
+        self.max_button.setToolTip(tooltip)
+        self.max_button.setAccessibleName(tooltip)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.toggle_maximize()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            handle = self._window.windowHandle()
+            if handle is not None and handle.startSystemMove():
+                event.accept()
+                return
+            self._drag_offset = event.globalPosition().toPoint() - self._window.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_offset is not None and event.buttons() & Qt.LeftButton and not self._window.isMaximized():
+            self._window.move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+
 class CS2ManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.db = DBManager()
-        self.setWindowTitle("CS2 饰品出租管理终端 v3.0 (多平台聚合)")
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
+        self.setWindowTitle("CS2 出租管理")
         self.resize(1400, 800)
+        self.setMinimumSize(1080, 650)
+        self._resize_margin = 6
 
         # 保存活跃线程引用，防止被 GC
         self._active_threads = []
@@ -578,13 +716,25 @@ class CS2ManagerApp(QMainWindow):
 
     def apply_theme(self):
         self.setStyleSheet("""
-            QMainWindow { background-color: #1e1e2e; }
+            QMainWindow { background-color: #181825; }
             QLabel { color: #cdd6f4; font-size: 13px; }
             QLabel#titleLabel { font-size: 18px; font-weight: bold; color: #89b4fa; }
             QLabel#cardTitle { color: #a6adc8; font-size: 11px; }
-            QLabel#cardValue { font-size: 20px; font-weight: bold; }
+            QLabel#cardValue { font-size: 21px; font-weight: bold; }
             QLabel#sectionTitle { font-size: 15px; font-weight: bold; color: #89b4fa; padding: 4px 0; }
-            QPushButton { background-color: #313244; color: #cdd6f4; border-radius: 6px; padding: 7px 16px; font-weight: bold; border: none; }
+            QFrame#customTitleBar { background: #11111b; border-bottom: 1px solid #313244; }
+            QLabel#windowTitle { color: #f5e0dc; font-size: 14px; font-weight: 700; }
+            QLabel#syncStatus { color: #a6e3a1; font-size: 11px; padding-left: 4px; }
+            QToolButton#windowControl, QToolButton#closeControl { background: transparent; border: none; border-radius: 0px; padding: 0; }
+            QToolButton#windowControl:hover { background: #313244; }
+            QToolButton#closeControl:hover { background: #f38ba8; }
+            QFrame#navPanel { background: #11111b; border-right: 1px solid #313244; }
+            QLabel#navCaption { color: #6c7086; font-size: 10px; font-weight: 700; padding: 6px 12px 2px 12px; }
+            QLabel#navFooter { color: #6c7086; font-size: 10px; padding: 8px 12px 12px 12px; }
+            QPushButton#navButton { background: transparent; color: #a6adc8; border: none; border-radius: 7px; padding: 10px 12px; text-align: left; font-weight: 600; }
+            QPushButton#navButton:hover { background: #1e1e2e; color: #cdd6f4; }
+            QPushButton#navButton:checked { background: #313b5c; color: #b4d0ff; }
+            QPushButton { background-color: #313244; color: #cdd6f4; border-radius: 6px; padding: 7px 14px; font-weight: bold; border: none; }
             QPushButton:hover { background-color: #45475a; }
             QPushButton:pressed { background-color: #585b70; }
             QPushButton#primaryBtn { background-color: #89b4fa; color: #11111b; }
@@ -599,41 +749,133 @@ class CS2ManagerApp(QMainWindow):
             QComboBox:hover, QLineEdit:hover { border: 1px solid #89b4fa; }
             QComboBox::drop-down { border: none; }
             QComboBox::down-arrow { image: none; }
-            QTabWidget::pane { border: 1px solid #313244; border-radius: 8px; background: #1e1e2e; }
-            QTabBar::tab { background: #313244; color: #cdd6f4; padding: 10px 24px; font-weight: bold; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; }
-            QTabBar::tab:selected { background: #89b4fa; color: #11111b; }
-            QTabBar::tab:hover:!selected { background: #45475a; }
             QGroupBox { color: #89b4fa; font-weight: bold; border: 1px solid #45475a; border-radius: 8px; margin-top: 12px; padding-top: 16px; font-size: 13px; }
             QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 6px; }
             QScrollArea { border: none; background: transparent; }
             QCheckBox { color: #cdd6f4; spacing: 6px; }
             QCheckBox::indicator { width: 18px; height: 18px; border-radius: 4px; border: 2px solid #585b70; }
             QCheckBox::indicator:checked { background-color: #89b4fa; border-color: #89b4fa; }
-            QFrame#cardFrame { background-color: #313244; border-radius: 10px; padding: 16px; }
+            QFrame#cardFrame { background-color: #252638; border: 1px solid #36384d; border-radius: 10px; }
+            QFrame#emphasisCard { background-color: #2c2744; border: 1px solid #6d5c9d; border-radius: 10px; }
             QFrame#detailFrame { background-color: #181825; border-radius: 8px; border: 1px solid #313244; padding: 12px; }
         """)
 
     def init_ui(self):
         central_widget = QWidget()
+        central_widget.setObjectName("appRoot")
+        central_widget.setMouseTracking(True)
+        central_widget.installEventFilter(self)
+        QApplication.instance().installEventFilter(self)
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        self.title_bar = CustomTitleBar(self, central_widget)
+        layout.addWidget(self.title_bar)
+
+        workspace = QHBoxLayout()
+        workspace.setContentsMargins(0, 0, 0, 0)
+        workspace.setSpacing(0)
+
+        nav = QFrame()
+        nav.setObjectName("navPanel")
+        nav.setFixedWidth(170)
+        nav_layout = QVBoxLayout(nav)
+        nav_layout.setContentsMargins(8, 12, 8, 0)
+        nav_layout.setSpacing(4)
+        caption = QLabel("工作区")
+        caption.setObjectName("navCaption")
+        nav_layout.addWidget(caption)
+        self.navigation_buttons = []
+        for index, label, icon_name in (
+            (0, "资产总览", "dashboard"),
+            (1, "大盘行情", "market"),
+            (2, "系统设置", "settings"),
+        ):
+            button = QPushButton(label)
+            button.setObjectName("navButton")
+            button.setCheckable(True)
+            button.setIcon(make_line_icon(icon_name, "#a6adc8", 17))
+            button.setIconSize(QSize(17, 17))
+            button.setMinimumHeight(40)
+            button.clicked.connect(lambda checked=False, page=index: self.switch_page(page))
+            nav_layout.addWidget(button)
+            self.navigation_buttons.append(button)
+        nav_layout.addStretch()
+        footer = QLabel("CS2 Rental Manager\nv3.0 · 本地优先")
+        footer.setObjectName("navFooter")
+        nav_layout.addWidget(footer)
+        workspace.addWidget(nav)
+
+        self.tabs = QStackedWidget()
+        self.tabs.setObjectName("pageStack")
+        workspace.addWidget(self.tabs, 1)
+        layout.addLayout(workspace, 1)
 
         self.tab_dashboard = QWidget()
         self.init_dashboard_tab()
-        self.tabs.addTab(self.tab_dashboard, "📊 资产与出租管理")
+        self.tabs.addWidget(self.tab_dashboard)
 
         self.tab_market = QWidget()
         self.init_market_tab()
-        self.tabs.addTab(self.tab_market, "🔍 一览式大盘行情")
+        self.tabs.addWidget(self.tab_market)
 
         self.tab_settings = QWidget()
         self.init_settings_tab()
-        self.tabs.addTab(self.tab_settings, "⚙️ 系统与费率设置")
+        self.tabs.addWidget(self.tab_settings)
+        self.switch_page(0)
+
+    def switch_page(self, index):
+        """Switch a left-navigation page without recreating existing page widgets."""
+        self.tabs.setCurrentIndex(index)
+        for button_index, button in enumerate(self.navigation_buttons):
+            button.setChecked(button_index == index)
+
+    def _resize_edges_at(self, position):
+        if self.isMaximized():
+            return Qt.Edges()
+        edges = Qt.Edges()
+        if position.x() <= self._resize_margin:
+            edges |= Qt.LeftEdge
+        elif position.x() >= self.width() - self._resize_margin:
+            edges |= Qt.RightEdge
+        if position.y() <= self._resize_margin:
+            edges |= Qt.TopEdge
+        elif position.y() >= self.height() - self._resize_margin:
+            edges |= Qt.BottomEdge
+        return edges
+
+    @staticmethod
+    def _resize_cursor(edges):
+        if edges in (Qt.LeftEdge, Qt.RightEdge):
+            return Qt.SizeHorCursor
+        if edges in (Qt.TopEdge, Qt.BottomEdge):
+            return Qt.SizeVerCursor
+        if edges in (Qt.TopEdge | Qt.LeftEdge, Qt.BottomEdge | Qt.RightEdge):
+            return Qt.SizeFDiagCursor
+        if edges:
+            return Qt.SizeBDiagCursor
+        return Qt.ArrowCursor
+
+    def eventFilter(self, watched, event):
+        """Keep standard edge resizing available on the frameless top-level window."""
+        if isinstance(watched, QWidget) and watched.window() is self:
+            if event.type() in (QEvent.MouseMove, QEvent.MouseButtonPress):
+                position = self.mapFromGlobal(event.globalPosition().toPoint())
+                edges = self._resize_edges_at(position)
+                if event.type() == QEvent.MouseMove:
+                    self.setCursor(self._resize_cursor(edges))
+                elif event.button() == Qt.LeftButton and edges:
+                    handle = self.windowHandle()
+                    if handle is not None and handle.startSystemResize(edges):
+                        return True
+        return super().eventFilter(watched, event)
+
+    def changeEvent(self, event):
+        if event.type() == QEvent.WindowStateChange and hasattr(self, "title_bar"):
+            self.title_bar.update_window_state()
+        super().changeEvent(event)
 
     # ═══════════════════════════════════════════
     # Tab 1: 资产仪表盘 (Beautified)
@@ -646,7 +888,7 @@ class CS2ManagerApp(QMainWindow):
 
         # ── 顶部标题栏 ──
         header = QHBoxLayout()
-        title = QLabel("📈 资产总览")
+        title = QLabel("资产总览")
         title.setObjectName("titleLabel")
         header.addWidget(title)
         header.addStretch()
@@ -658,30 +900,34 @@ class CS2ManagerApp(QMainWindow):
         # ── 统计卡片 ──
         card_layout = QHBoxLayout()
         card_layout.setSpacing(12)
-        self.card_cost = self.create_card("💰 买入总资产", "¥ 0.00", "#89b4fa")
-        self.card_income = self.create_card("📥 当前每日净收益", "¥ 0.00", "#a6e3a1")
-        self.card_total_income = self.create_card("💵 累计净收益", "¥ 0.00", "#cba6f7")
-        self.card_rented = self.create_card("📦 在租件数", "0 / 0 件", "#f9e2af")
-        self.card_rate = self.create_card("📈 在租年化（总资产）", "0.0%", "#f38ba8")
-        for c in [self.card_cost, self.card_income, self.card_total_income, self.card_rented, self.card_rate]:
+        self.card_cost = self.create_card("买入总资产", "¥ 0.00", "#89b4fa")
+        self.card_total_income = self.create_card("累计净收益", "¥ 0.00", "#cba6f7", emphasis=True)
+        self.card_income = self.create_card("当前每日净收益", "¥ 0.00", "#a6e3a1")
+        self.card_rented = self.create_card("在租件数", "0 / 0 件", "#f9e2af")
+        self.card_rate = self.create_card("在租年化（总资产）", "0.0%", "#f38ba8")
+        for c in [self.card_cost, self.card_total_income, self.card_income, self.card_rented, self.card_rate]:
             card_layout.addWidget(c)
         layout.addLayout(card_layout)
 
         platform_sync = QGroupBox("平台订单获取方法")
         platform_layout = QVBoxLayout(platform_sync)
         browser_layout = QHBoxLayout()
-        open_c5_btn = QPushButton("🌐 打开 C5 订单页")
+        open_c5_btn = QPushButton("打开 C5 订单页")
         open_c5_btn.setObjectName("primaryBtn")
+        self._set_button_icon(open_c5_btn, "external", "#11111b")
         open_c5_btn.clicked.connect(lambda: self._open_default_browser_order_page("c5"))
-        open_eco_btn = QPushButton("🌐 打开 ECO 订单页")
+        open_eco_btn = QPushButton("打开 ECO 订单页")
         open_eco_btn.setObjectName("primaryBtn")
+        self._set_button_icon(open_eco_btn, "external", "#11111b")
         open_eco_btn.clicked.connect(lambda: self._open_default_browser_order_page("eco"))
-        open_igxe_btn = QPushButton("🌐 打开 IGXE 订单页")
+        open_igxe_btn = QPushButton("打开 IGXE 订单页")
         open_igxe_btn.setObjectName("primaryBtn")
+        self._set_button_icon(open_igxe_btn, "external", "#11111b")
         open_igxe_btn.clicked.connect(lambda: self._open_default_browser_order_page("igxe"))
 
-        self.clipboard_import_btn = QPushButton("📋 从剪贴板导入订单")
+        self.clipboard_import_btn = QPushButton("从剪贴板导入订单")
         self.clipboard_import_btn.setObjectName("successBtn")
+        self._set_button_icon(self.clipboard_import_btn, "clipboard", "#11111b")
         self.clipboard_import_btn.setToolTip("复制 C5、ECO 或 IGXE 订单页文本后点击，程序会自动识别平台。")
         self.clipboard_import_btn.clicked.connect(self._import_rental_orders_from_clipboard)
         browser_layout.addWidget(open_c5_btn)
@@ -696,21 +942,26 @@ class CS2ManagerApp(QMainWindow):
         toolbar = QHBoxLayout()
         toolbar.setSpacing(8)
 
-        add_btn = QPushButton("➕ 新增饰品")
+        add_btn = QPushButton("新增饰品")
+        self._set_button_icon(add_btn, "add")
         add_btn.clicked.connect(self.add_item)
 
-        edit_btn = QPushButton("✏️ 修改选中")
+        edit_btn = QPushButton("修改选中")
         edit_btn.setObjectName("primaryBtn")
+        self._set_button_icon(edit_btn, "edit", "#11111b")
         edit_btn.clicked.connect(self.edit_selected_item)
 
-        history_btn = QPushButton("📜 订单历史")
+        history_btn = QPushButton("订单历史")
+        self._set_button_icon(history_btn, "history")
         history_btn.clicked.connect(self.show_selected_rental_history)
 
-        del_btn = QPushButton("🗑️ 删除")
+        del_btn = QPushButton("删除")
         del_btn.setObjectName("dangerBtn")
+        self._set_button_icon(del_btn, "delete", "#11111b")
         del_btn.clicked.connect(self.delete_selected_item)
 
-        refresh_btn = QPushButton("🔄 刷新")
+        refresh_btn = QPushButton("刷新")
+        self._set_button_icon(refresh_btn, "refresh")
         refresh_btn.clicked.connect(self.load_data)
 
         self.filter_box = QComboBox()
@@ -733,7 +984,7 @@ class CS2ManagerApp(QMainWindow):
         self.table.setColumnCount(11)
         self.table.setHorizontalHeaderLabels([
             "ID", "饰品名称", "相位", "磨损度", "成本(元)", "平台",
-            "状态 / 倒计时", "租期天数", "日租（净）", "本单净收入", "累计净收益",
+            "状态", "租期天数", "日租（净）", "本单净收入", "累计净收益",
         ])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.Fixed)
@@ -749,15 +1000,17 @@ class CS2ManagerApp(QMainWindow):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
         self.table.setStyleSheet("alternate-background-color: #1e1e2e;")
+        self.table.verticalHeader().setDefaultSectionSize(34)
         self.table.doubleClicked.connect(self.show_selected_rental_history)
 
         layout.addWidget(self.table)
 
-    def create_card(self, title, val, color):
+    def create_card(self, title, val, color, emphasis=False):
         """创建美化后的统计卡片"""
-        w = QWidget()
-        w.setObjectName("cardFrame")
+        w = QFrame()
+        w.setObjectName("emphasisCard" if emphasis else "cardFrame")
         w.setMinimumHeight(100)
+        w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 12, 16, 12)
         lay.setSpacing(4)
@@ -771,6 +1024,11 @@ class CS2ManagerApp(QMainWindow):
         lay.addWidget(t)
         lay.addWidget(v)
         return w
+
+    @staticmethod
+    def _set_button_icon(button, icon_name, color="#cdd6f4"):
+        button.setIcon(make_line_icon(icon_name, color, 16))
+        button.setIconSize(QSize(16, 16))
 
     # ═══════════════════════════════════════════
     # Tab 2: 一览式大盘行情 (Refactored)
@@ -862,7 +1120,7 @@ class CS2ManagerApp(QMainWindow):
 
         # ── 顶部标题栏 ──
         header = QHBoxLayout()
-        title = QLabel("📊 一览式大盘行情")
+        title = QLabel("大盘行情")
         title.setObjectName("titleLabel")
         header.addWidget(title)
         header.addStretch()
@@ -875,32 +1133,37 @@ class CS2ManagerApp(QMainWindow):
         search_layout = QHBoxLayout()
         self.market_input = QLineEdit()
         self.market_input.setPlaceholderText("输入饰品名称搜索并添加到大盘 (例如: 折叠刀 | 多普勒)")
-        self.market_search_btn = QPushButton("🔍 搜索并添加")
+        self.market_search_btn = QPushButton("搜索并添加")
         self.market_search_btn.setObjectName("primaryBtn")
+        self._set_button_icon(self.market_search_btn, "search", "#11111b")
         self.market_search_btn.clicked.connect(self.query_csqaq_market)
         search_layout.addWidget(self.market_input, 1)
         search_layout.addWidget(self.market_search_btn)
 
-        ai_import_btn = QPushButton("🤖 AI 批量添加")
+        ai_import_btn = QPushButton("AI 批量添加")
         ai_import_btn.setObjectName("primaryBtn")
+        self._set_button_icon(ai_import_btn, "clipboard", "#11111b")
         ai_import_btn.setToolTip("复制提示词和截图交给 AI，再将 JSON 返回结果粘贴进来批量添加")
         ai_import_btn.clicked.connect(self._open_ai_market_import)
         search_layout.addWidget(ai_import_btn)
 
-        refresh_market_btn = QPushButton("🔄 刷新行情")
+        refresh_market_btn = QPushButton("刷新行情")
         refresh_market_btn.setObjectName("successBtn")
+        self._set_button_icon(refresh_market_btn, "refresh", "#11111b")
         refresh_market_btn.clicked.connect(self._refresh_all_market_data)
         search_layout.addWidget(refresh_market_btn)
 
-        force_eco_btn = QPushButton("⏱ 开启自动刷新（10:00）")
+        force_eco_btn = QPushButton("开启自动刷新（10:00）")
         force_eco_btn.setObjectName("primaryBtn")
+        self._set_button_icon(force_eco_btn, "history", "#11111b")
         force_eco_btn.setToolTip("每 10 分钟自动刷新 CSQAQ 与 ECO 行情；再次点击可停止")
         force_eco_btn.clicked.connect(self._toggle_market_auto_refresh)
         self.market_auto_refresh_btn = force_eco_btn
         search_layout.addWidget(force_eco_btn)
 
-        self.market_remove_btn = QPushButton("🗑 删除选中")
+        self.market_remove_btn = QPushButton("删除选中")
         self.market_remove_btn.setObjectName("dangerBtn")
+        self._set_button_icon(self.market_remove_btn, "delete", "#11111b")
         self.market_remove_btn.clicked.connect(self._remove_selected_market_items)
         search_layout.addWidget(self.market_remove_btn)
 
@@ -1553,7 +1816,7 @@ class CS2ManagerApp(QMainWindow):
             self.market_auto_refresh_timer.stop()
             self.market_countdown_timer.stop()
             self._market_auto_refresh_deadline = 0.0
-            self._set_market_auto_refresh_button_text("⏱ 开启自动刷新（10:00）")
+            self._set_market_auto_refresh_button_text("开启自动刷新（10:00）")
             self.lbl_market_update.setText("已取消自动刷新倒计时")
             return
 
@@ -1566,7 +1829,7 @@ class CS2ManagerApp(QMainWindow):
         remaining = max(0, int(self._market_auto_refresh_deadline - time.monotonic() + 0.999))
         minutes, seconds = divmod(remaining, 60)
         self._set_market_auto_refresh_button_text(
-            f"⏱ 自动刷新 {minutes:02d}:{seconds:02d}"
+            f"自动刷新 {minutes:02d}:{seconds:02d}"
         )
 
     def _run_scheduled_market_refresh(self):
@@ -1598,6 +1861,7 @@ class CS2ManagerApp(QMainWindow):
         eco_rsa = self.db.get_config("eco_rsa_key")
 
         self.lbl_market_update.setText("正在强制更新 ECO..." if force_eco else "正在刷新行情...")
+        self.title_bar.set_sync_status("行情刷新中", "#89b4fa")
 
         self._market_refresh_thread = QThread()
         self._market_refresh_worker = MarketRefreshWorker()
@@ -1649,6 +1913,7 @@ class CS2ManagerApp(QMainWindow):
         eco_status = getattr(self._market_refresh_worker, "eco_status_text", "")
         suffix = f" · {eco_status}" if eco_status else ""
         self.lbl_market_update.setText(f"最后更新: {QTime.currentTime().toString('HH:mm:ss')}{suffix}")
+        self.title_bar.set_sync_status("行情已更新", "#a6e3a1")
 
     def _cleanup_market_refresh_thread(self):
         """清理市场刷新线程引用"""
@@ -1817,7 +2082,7 @@ class CS2ManagerApp(QMainWindow):
     def _on_search_add_result(self, result):
         """CSQAQ 搜索回调：自动将结果添加到大盘"""
         self.market_search_btn.setEnabled(True)
-        self.market_search_btn.setText("🔍 搜索并添加")
+        self.market_search_btn.setText("搜索并添加")
 
         tag, data = result
         if tag != "batch_price" or not data.get("success"):
@@ -1889,19 +2154,20 @@ class CS2ManagerApp(QMainWindow):
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
 
-        group_csqaq = QGroupBox("📊 CSQAQ 数据开放 API 配置")
+        group_csqaq = QGroupBox("CSQAQ 数据开放 API 配置")
         form_csqaq = QFormLayout(group_csqaq)
         self.cfg_csqaq = QLineEdit(self.db.get_config("csqaq_token"))
         self.cfg_csqaq.setPlaceholderText("粘贴登录 CSQAQ 个人中心获取的 ApiToken")
         form_csqaq.addRow("CSQAQ ApiToken:", self.cfg_csqaq)
 
-        bind_ip_btn = QPushButton("🌐 一键绑定当前公网 IP")
+        bind_ip_btn = QPushButton("一键绑定当前公网 IP")
         bind_ip_btn.setObjectName("primaryBtn")
+        self._set_button_icon(bind_ip_btn, "external", "#11111b")
         bind_ip_btn.clicked.connect(self._on_bind_csqaq_ip)
         form_csqaq.addRow(bind_ip_btn)
         layout.addWidget(group_csqaq)
 
-        group_api = QGroupBox("🔑 ECO 开放平台 API 配置")
+        group_api = QGroupBox("ECO 开放平台 API 配置")
         form_api = QFormLayout(group_api)
         self.cfg_partner = QLineEdit(self.db.get_config("eco_partner_id"))
         self.cfg_rsa = QLineEdit(self.db.get_config("eco_rsa_key"))
@@ -1909,7 +2175,7 @@ class CS2ManagerApp(QMainWindow):
         form_api.addRow("RSA 私钥路径/文本:", self.cfg_rsa)
         layout.addWidget(group_api)
 
-        group_time = QGroupBox("⏰ 自动化与刷新设置")
+        group_time = QGroupBox("自动化与刷新设置")
         form_time = QFormLayout(group_time)
         self.cfg_interval = QComboBox()
         self.cfg_interval.addItems(["禁用自动刷新", "5 分钟", "15 分钟", "30 分钟", "60 分钟"])
@@ -1919,7 +2185,7 @@ class CS2ManagerApp(QMainWindow):
         form_time.addRow("自动刷新频率:", self.cfg_interval)
         layout.addWidget(group_time)
 
-        group_fee = QGroupBox("🧾 出租手续费率（用于订单净收益与年化计算）")
+        group_fee = QGroupBox("出租手续费率（用于订单净收益与年化计算）")
         form_fee = QFormLayout(group_fee)
         self.cfg_fee_inputs = {}
         fee_fields = (
@@ -1937,8 +2203,9 @@ class CS2ManagerApp(QMainWindow):
             form_fee.addRow(label, field)
         layout.addWidget(group_fee)
 
-        save_btn = QPushButton("💾 保存全部设置")
+        save_btn = QPushButton("保存全部设置")
         save_btn.setObjectName("primaryBtn")
+        self._set_button_icon(save_btn, "clipboard", "#11111b")
         save_btn.clicked.connect(self.save_settings)
         layout.addWidget(save_btn)
         layout.addStretch()
@@ -2283,18 +2550,51 @@ class CS2ManagerApp(QMainWindow):
         color = QColor("#f38ba8") if remaining_seconds <= 12 * 60 * 60 else QColor("#a6e3a1")
         return f"{rental_label} · {self._countdown_text(end_time)}", color
 
+    @staticmethod
+    def _status_pill_style(text, color=None):
+        """Translate status meaning into one compact, high-contrast table label."""
+        tone = color.name().lower() if isinstance(color, QColor) else ""
+        if tone == "#f38ba8" or "已到期" in text:
+            background, foreground, border = "#4a2733", "#f5b8c5", "#824354"
+        elif tone == "#a6e3a1":
+            background, foreground, border = "#1e4034", "#b8ecb4", "#39715b"
+        elif tone == "#fab387" or "未导入" in text or "未知" in text:
+            background, foreground, border = "#493829", "#f9c99e", "#7e6045"
+        elif "已转租" in text:
+            background, foreground, border = "#372d4e", "#d2b7fa", "#655087"
+        elif "已出租" in text:
+            background, foreground, border = "#243854", "#a9cdfc", "#426995"
+        else:
+            background, foreground, border = "#313244", "#bac2de", "#585b70"
+        return (
+            f"background: {background}; color: {foreground}; border: 1px solid {border}; "
+            "border-radius: 10px; padding: 3px 8px; font-weight: 700;"
+        )
+
+    def _create_status_pill(self, text, color=None):
+        pill = QLabel(text)
+        pill.setObjectName("statusPill")
+        pill.setAlignment(Qt.AlignCenter)
+        pill.setMinimumHeight(25)
+        pill.setContentsMargins(3, 1, 3, 1)
+        pill.setStyleSheet(self._status_pill_style(text, color))
+        pill.setAttribute(Qt.WA_TransparentForMouseEvents)
+        return pill
+
+    def _update_status_pill(self, pill, text, color=None):
+        pill.setText(text)
+        pill.setStyleSheet(self._status_pill_style(text, color))
+
     def _update_dashboard_rental_countdowns(self):
         """Update only visible rental countdown cells once a second."""
         for state in self._dashboard_rental_rows.values():
-            status_item = self.table.item(state["row"], 6)
-            if status_item is None:
+            pill = self.table.cellWidget(state["row"], 6)
+            if pill is None:
                 continue
             status_text, status_color = self._rental_status_display(
                 state["latest_order"], state["history"], state["fallback_status"]
             )
-            status_item.setText(status_text)
-            if status_color is not None:
-                status_item.setForeground(status_color)
+            self._update_status_pill(pill, status_text, status_color)
 
     def show_selected_rental_history(self):
         selected_row = self.table.currentRow()
@@ -2388,9 +2688,10 @@ class CS2ManagerApp(QMainWindow):
                 _money_text(total_net_income) if total_net_income > 0 else "—",
             ]
             for column, value in enumerate(values):
+                if column == 6:
+                    self.table.setCellWidget(row, column, self._create_status_pill(status_text, status_color))
+                    continue
                 table_item = QTableWidgetItem(str(value))
-                if column == 6 and status_color:
-                    table_item.setForeground(status_color)
                 self.table.setItem(row, column, table_item)
             if latest_order and str(latest_order.get("status", "") or "").strip() == "租赁中":
                 self._dashboard_rental_rows[item["id"]] = {
@@ -2408,6 +2709,8 @@ class CS2ManagerApp(QMainWindow):
         self.card_rented.findChildren(QLabel)[1].setText(f"{rented_count} / {len(self.current_items)} 件")
         self.card_rate.findChildren(QLabel)[1].setText(f"{annual_rate:.2f}%")
         self.lbl_last_update.setText(f"最后更新：{QTime.currentTime().toString('HH:mm:ss')}")
+        if hasattr(self, "title_bar"):
+            self.title_bar.set_sync_status("本地数据已同步", "#a6e3a1")
         return
 
         self.current_items = self.db.get_all_items()
