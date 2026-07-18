@@ -14,7 +14,7 @@ from PySide6.QtCore import Qt, QTimer, QThread, QUrl, QTime
 from PySide6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QLinearGradient, QBrush
 
 from modules.db_manager import DBManager
-from modules.workers import ApiWorker, MarketRefreshWorker
+from modules.workers import ApiWorker, MarketRefreshWorker, C5RentalWorker
 from modules.logger import logger
 from modules.image_cache import ImageCache, MarketCache
 from modules.cs2_item_schema import CS2ItemSchema
@@ -192,6 +192,8 @@ class CS2ManagerApp(QMainWindow):
         # 市场行情刷新专用线程/Worker（单线程顺序队列）
         self._market_refresh_thread = None
         self._market_refresh_worker = None
+        self._c5_thread = None
+        self._c5_worker = None
 
         # 当前市场详情页选中的物品标识 (name|phase)
         self._current_market_item_key = ""
@@ -258,6 +260,10 @@ class CS2ManagerApp(QMainWindow):
         self.init_dashboard_tab()
         self.tabs.addTab(self.tab_dashboard, "📊 资产与出租管理")
 
+        self.tab_orders = QWidget()
+        self.init_orders_tab()
+        self.tabs.addTab(self.tab_orders, "📋 出租订单")
+
         self.tab_market = QWidget()
         self.init_market_tab()
         self.tabs.addTab(self.tab_market, "🔍 一览式大盘行情")
@@ -296,6 +302,27 @@ class CS2ManagerApp(QMainWindow):
         for c in [self.card_cost, self.card_income, self.card_rented, self.card_rate]:
             card_layout.addWidget(c)
         layout.addLayout(card_layout)
+
+        platform_sync = QGroupBox("平台订单同步（仅手动读取）")
+        platform_layout = QHBoxLayout(platform_sync)
+        self.c5_login_btn = QPushButton("C5 登录")
+        self.c5_login_btn.setObjectName("primaryBtn")
+        self.c5_login_btn.clicked.connect(lambda: self._run_c5_task("login"))
+        self.c5_sync_btn = QPushButton("同步 C5 出租订单")
+        self.c5_sync_btn.setObjectName("successBtn")
+        self.c5_sync_btn.clicked.connect(lambda: self._run_c5_task("sync"))
+        eco_login_btn = QPushButton("ECO 登录（待接入）")
+        eco_login_btn.setEnabled(False)
+        igxe_login_btn = QPushButton("IGXE 登录（待接入）")
+        igxe_login_btn.setEnabled(False)
+        self.c5_sync_status = QLabel("C5：尚未同步。登录、验证码与刷新均需你手动触发。")
+        self.c5_sync_status.setStyleSheet("color: #a6adc8;")
+        platform_layout.addWidget(self.c5_login_btn)
+        platform_layout.addWidget(self.c5_sync_btn)
+        platform_layout.addWidget(eco_login_btn)
+        platform_layout.addWidget(igxe_login_btn)
+        platform_layout.addWidget(self.c5_sync_status, 1)
+        layout.addWidget(platform_sync)
 
         # ── 工具栏 ──
         toolbar = QHBoxLayout()
@@ -371,6 +398,121 @@ class CS2ManagerApp(QMainWindow):
     # ═══════════════════════════════════════════
     # Tab 2: 一览式大盘行情 (Refactored)
     # ═══════════════════════════════════════════
+
+    def init_orders_tab(self):
+        layout = QVBoxLayout(self.tab_orders)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("📋 平台出租订单")
+        title.setObjectName("titleLabel")
+        layout.addWidget(title)
+
+        description = QLabel(
+            "订单由你手动点击同步；C5 当前已接入。同步结果不会自动改写库存饰品状态。"
+        )
+        description.setStyleSheet("color: #a6adc8;")
+        layout.addWidget(description)
+
+        self.order_table = QTableWidget()
+        self.order_table.setColumnCount(9)
+        self.order_table.setHorizontalHeaderLabels([
+            "平台", "订单号", "饰品", "磨损", "实际收入", "起租时间",
+            "归还时间", "状态", "最后同步",
+        ])
+        self.order_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.order_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.order_table.setAlternatingRowColors(True)
+        self.order_table.setStyleSheet("alternate-background-color: #1e1e2e;")
+        header = self.order_table.horizontalHeader()
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        for column in (0, 1, 3, 4, 5, 6, 7, 8):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        layout.addWidget(self.order_table)
+        self._refresh_orders_table()
+
+    def _refresh_orders_table(self):
+        if not hasattr(self, "order_table"):
+            return
+        orders = self.db.get_rental_orders()
+        self.order_table.setRowCount(0)
+        for row_index, order in enumerate(orders):
+            self.order_table.insertRow(row_index)
+            values = [
+                order["platform"], order["order_no"], order["item_name"],
+                order["float_val"], f"¥ {order['income']:.2f}",
+                order["start_time"], order["return_time"], order["status"],
+                order["synced_at"],
+            ]
+            for column, value in enumerate(values):
+                self.order_table.setItem(row_index, column, QTableWidgetItem(str(value)))
+
+    def _set_c5_controls_enabled(self, enabled):
+        self.c5_login_btn.setEnabled(enabled)
+        self.c5_sync_btn.setEnabled(enabled)
+
+    def _run_c5_task(self, task):
+        if self._c5_thread and self._c5_thread.isRunning():
+            QMessageBox.information(self, "C5", "C5 浏览器任务正在运行，请先完成或关闭浏览器窗口。")
+            return
+
+        self._set_c5_controls_enabled(False)
+        if task == "login":
+            self.c5_sync_status.setText("C5 浏览器已打开：请手动登录、完成验证码，然后关闭浏览器窗口。")
+        else:
+            self.c5_sync_status.setText("正在读取 C5 出租订单（本次手动请求）…")
+
+        self._c5_thread = QThread()
+        self._c5_worker = C5RentalWorker()
+        self._c5_worker.moveToThread(self._c5_thread)
+        self._c5_thread.started.connect(
+            self._c5_worker.open_login if task == "login" else self._c5_worker.sync_orders
+        )
+        self._c5_worker.finished.connect(self._on_c5_task_finished)
+        self._c5_worker.error.connect(self._on_c5_task_error)
+        self._c5_worker.finished.connect(self._c5_thread.quit)
+        self._c5_worker.error.connect(self._c5_thread.quit)
+        self._c5_worker.finished.connect(self._c5_worker.deleteLater)
+        self._c5_worker.error.connect(self._c5_worker.deleteLater)
+        self._c5_thread.finished.connect(self._c5_thread.deleteLater)
+        self._c5_thread.finished.connect(self._cleanup_c5_task)
+        self._c5_thread.start()
+
+    def _on_c5_task_finished(self, payload):
+        task, result = payload
+        if task == "login":
+            self.c5_sync_status.setText("C5 登录窗口已关闭；现在可以点击“同步 C5 出租订单”。")
+            return
+
+        if not result.get("success"):
+            self.c5_sync_status.setText(f"C5 同步失败：{result.get('error', '未知错误')}")
+            return
+        if result.get("needs_login"):
+            self.c5_sync_status.setText("C5 登录状态无效：请先点击“C5 登录”并在窗口中完成登录。")
+            return
+
+        orders = result.get("orders", [])
+        self.db.upsert_rental_orders("C5GAME", orders)
+        self._refresh_orders_table()
+        snapshot_path = result.get("snapshot_path", "")
+        self.c5_sync_status.setText(f"C5 已同步 {len(orders)} 条订单；原始页面快照已私有保存。")
+        logger.info("[C5] 手动同步 %s 条订单，页面快照：%s", len(orders), snapshot_path)
+        if not orders:
+            QMessageBox.information(
+                self,
+                "C5 同步完成",
+                "页面已读取，但未解析到订单。请保留登录状态，并把日志中的私有页面快照告知我以校准解析规则。",
+            )
+
+    def _on_c5_task_error(self, message):
+        logger.warning("[C5] %s", message)
+        self.c5_sync_status.setText(message)
+        QMessageBox.warning(self, "C5", message)
+
+    def _cleanup_c5_task(self):
+        self._c5_thread = None
+        self._c5_worker = None
+        self._set_c5_controls_enabled(True)
 
     def init_market_tab(self):
         layout = QVBoxLayout(self.tab_market)

@@ -124,6 +124,25 @@ class DBManager:
                 (k, str(v)),
             )
 
+        # Platform rental orders are stored separately from inventory.  A web
+        # sync must not change an asset's status until matching is reviewed.
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS rental_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            order_no TEXT NOT NULL,
+            item_name TEXT DEFAULT '',
+            float_val TEXT DEFAULT '',
+            income REAL DEFAULT 0.0,
+            start_time TEXT DEFAULT '',
+            return_time TEXT DEFAULT '',
+            status TEXT DEFAULT '',
+            raw_text TEXT DEFAULT '',
+            synced_at TEXT NOT NULL,
+            UNIQUE(platform, order_no)
+        )
+        """)
+
         # 3. 饰品初始化
         cursor.execute("SELECT COUNT(*) FROM items")
         if cursor.fetchone()[0] == 0:
@@ -313,6 +332,73 @@ class DBManager:
         cursor.execute("DELETE FROM items WHERE id=?", (item_id,))
         conn.commit()
         self.export_items_to_json()
+
+    def upsert_rental_orders(self, platform, orders):
+        """Store manually read rental orders without changing inventory rows."""
+        from datetime import datetime
+
+        synced_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        for order in orders:
+            order_no = str(order.get("order_no", "")).strip()
+            if not order_no:
+                continue
+            cursor.execute(
+                """
+                INSERT INTO rental_orders (
+                    platform, order_no, item_name, float_val, income,
+                    start_time, return_time, status, raw_text, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(platform, order_no) DO UPDATE SET
+                    item_name=excluded.item_name,
+                    float_val=excluded.float_val,
+                    income=excluded.income,
+                    start_time=excluded.start_time,
+                    return_time=excluded.return_time,
+                    status=excluded.status,
+                    raw_text=excluded.raw_text,
+                    synced_at=excluded.synced_at
+                """,
+                (
+                    platform,
+                    order_no,
+                    order.get("item_name", ""),
+                    order.get("float_val", ""),
+                    float(order.get("income", 0.0) or 0.0),
+                    order.get("start_time", ""),
+                    order.get("return_time", ""),
+                    order.get("status", ""),
+                    order.get("raw_text", ""),
+                    synced_at,
+                ),
+            )
+        conn.commit()
+
+    def get_rental_orders(self, platform=None):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        if platform:
+            cursor.execute(
+                """
+                SELECT platform, order_no, item_name, float_val, income,
+                       start_time, return_time, status, synced_at
+                FROM rental_orders WHERE platform=?
+                ORDER BY synced_at DESC, id DESC
+                """,
+                (platform,),
+            )
+        else:
+            cursor.execute("""
+                SELECT platform, order_no, item_name, float_val, income,
+                       start_time, return_time, status, synced_at
+                FROM rental_orders ORDER BY synced_at DESC, id DESC
+            """)
+        columns = (
+            "platform", "order_no", "item_name", "float_val", "income",
+            "start_time", "return_time", "status", "synced_at",
+        )
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
     def get_config(self, key):
         conn = self.get_connection()

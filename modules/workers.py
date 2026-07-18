@@ -6,6 +6,7 @@ from modules.csqaq_client import CSQAQClient
 from modules.eco_client import ECOClient
 from modules.igxe_client import IGXEClient
 from modules.image_cache import ImageCache
+from modules.c5_rental_browser import C5RentalBrowser
 
 logger = logging.getLogger("CS2Rental")
 
@@ -131,6 +132,25 @@ class ApiWorker(QObject):
                 self.finished.emit(("igxe_lease", result))
         except Exception as e:
             self.error.emit(f"IGXE 行情失败: {e}")
+
+
+class C5RentalWorker(QObject):
+    """Runs one visible, user-triggered C5 browser task in a QThread."""
+
+    finished = Signal(object)
+    error = Signal(str)
+
+    def open_login(self):
+        try:
+            self.finished.emit(("login", C5RentalBrowser().open_login()))
+        except Exception as exc:
+            self.error.emit(f"C5 登录窗口启动失败: {exc}")
+
+    def sync_orders(self):
+        try:
+            self.finished.emit(("sync", C5RentalBrowser().sync_orders()))
+        except Exception as exc:
+            self.error.emit(f"C5 出租订单读取失败: {exc}")
 
 
 class MarketRefreshWorker(QObject):
