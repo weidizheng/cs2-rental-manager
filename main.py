@@ -958,7 +958,13 @@ class CS2ManagerApp(QMainWindow):
             item_id = entry.get("eco_id") or detail.get("eco_id")
             if item_id:
                 return f"https://www.ecosteam.cn/goods/730-{item_id}-1-laypageRent-0-1.html"
-        # 悠悠当前没有由 CSQAQ 返回的稳定网页详情 URL；用户可在右键菜单中保存自己的链接。
+        if platform == "yyyp":
+            item_id = entry.get("yyyp_id") or detail.get("yyyp_id")
+            if item_id:
+                return (
+                    "https://www.youpin898.com/market/goods-list"
+                    f"?listType=30&templateId={item_id}&gameId=730"
+                )
         return ""
 
     def _market_link(self, entry, platform):
