@@ -655,14 +655,15 @@ class CS2ManagerApp(QMainWindow):
         header.addWidget(self.lbl_last_update)
         layout.addLayout(header)
 
-        # ── 四张统计卡片 ──
+        # ── 统计卡片 ──
         card_layout = QHBoxLayout()
         card_layout.setSpacing(12)
         self.card_cost = self.create_card("💰 买入总资产", "¥ 0.00", "#89b4fa")
         self.card_income = self.create_card("📥 当前每日净收益", "¥ 0.00", "#a6e3a1")
+        self.card_total_income = self.create_card("💵 累计净收益", "¥ 0.00", "#cba6f7")
         self.card_rented = self.create_card("📦 在租件数", "0 / 0 件", "#f9e2af")
         self.card_rate = self.create_card("📈 在租年化（总资产）", "0.0%", "#f38ba8")
-        for c in [self.card_cost, self.card_income, self.card_rented, self.card_rate]:
+        for c in [self.card_cost, self.card_income, self.card_total_income, self.card_rented, self.card_rate]:
             card_layout.addWidget(c)
         layout.addLayout(card_layout)
 
@@ -2333,6 +2334,7 @@ class CS2ManagerApp(QMainWindow):
         self._dashboard_rental_rows = {}
         total_cost = 0.0
         daily_rent_total = 0.0
+        total_net_income_all = 0.0
         rented_count = 0
 
         row = 0
@@ -2365,6 +2367,16 @@ class CS2ManagerApp(QMainWindow):
                     if end <= datetime.min or end > datetime.now():
                         rented_count += 1
                         daily_rent_total += net_daily_rent
+            elif str(item.get("status", "") or "").strip() == "已出租":
+                # Older manual inventory rows can be marked as rented before
+                # their platform order has been imported.  Keep them visible
+                # in portfolio totals, but never fabricate an end-time.
+                status_text = "已出租 · 未导入订单"
+                status_color = QColor("#fab387")
+                rented_count += 1
+                daily_rent_total += net_daily_rent
+
+            total_net_income_all += total_net_income
 
             self.table.insertRow(row)
             values = [
@@ -2392,6 +2404,7 @@ class CS2ManagerApp(QMainWindow):
         annual_rate = (daily_rent_total * 365 / total_cost * 100) if total_cost > 0 else 0.0
         self.card_cost.findChildren(QLabel)[1].setText(f"¥ {total_cost:,.2f}")
         self.card_income.findChildren(QLabel)[1].setText(_money_text(daily_rent_total))
+        self.card_total_income.findChildren(QLabel)[1].setText(_money_text(total_net_income_all))
         self.card_rented.findChildren(QLabel)[1].setText(f"{rented_count} / {len(self.current_items)} 件")
         self.card_rate.findChildren(QLabel)[1].setText(f"{annual_rate:.2f}%")
         self.lbl_last_update.setText(f"最后更新：{QTime.currentTime().toString('HH:mm:ss')}")
