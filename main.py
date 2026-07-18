@@ -297,6 +297,11 @@ class CS2ManagerApp(QMainWindow):
         self.rental_countdown_timer.timeout.connect(self._update_dashboard_rental_countdowns)
         self.rental_countdown_timer.start(1000)
 
+        # Relative market-update labels are local UI state and never trigger API calls.
+        self.market_relative_time_timer = QTimer(self)
+        self.market_relative_time_timer.timeout.connect(self._update_market_relative_times)
+        self.market_relative_time_timer.start(60 * 1000)
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.on_auto_refresh)
         self.update_timer_interval()
@@ -943,6 +948,37 @@ class CS2ManagerApp(QMainWindow):
         return f"{short_text}\n{long_text}/天"
 
     @staticmethod
+    def _market_updated_datetime(value):
+        """Read current ISO timestamps and the legacy HH:MM:SS cache format."""
+        if not value:
+            return None
+        text = str(value).strip()
+        try:
+            return datetime.fromisoformat(text)
+        except ValueError:
+            pass
+        try:
+            clock = datetime.strptime(text, "%H:%M:%S").time()
+            return datetime.combine(datetime.now().date(), clock)
+        except ValueError:
+            return None
+
+    def _market_updated_text(self, entry):
+        updated_at = self._market_updated_datetime(entry.get("updated_at"))
+        if updated_at is None:
+            return "暂无更新记录"
+        elapsed_seconds = max(0, (datetime.now() - updated_at).total_seconds())
+        elapsed_minutes = int(elapsed_seconds // 60)
+        return f"{elapsed_minutes} 分钟前更新成功"
+
+    def _update_market_relative_times(self):
+        """Refresh the display-only rightmost market column every minute."""
+        for row, entry in enumerate(self._market_tracked_items):
+            updated_item = self.market_table.item(row, 7)
+            if updated_item is not None:
+                updated_item.setText(self._market_updated_text(entry))
+
+    @staticmethod
     def _market_link_platform(column):
         return {
             1: "csqaq",
@@ -1103,8 +1139,9 @@ class CS2ManagerApp(QMainWindow):
                 rent_item.setForeground(QColor(color) if available else QColor("#6c7086"))
                 self.market_table.setItem(i, column, rent_item)
 
-            updated = entry.get("updated_at") or "--"
-            self.market_table.setItem(i, 7, QTableWidgetItem(updated))
+            self.market_table.setItem(
+                i, 7, QTableWidgetItem(self._market_updated_text(entry))
+            )
         return
         """填充一览式大盘表格"""
         self.market_table.setRowCount(0)
@@ -1371,6 +1408,11 @@ class CS2ManagerApp(QMainWindow):
 
     def _on_market_refresh_finished(self):
         """全部刷新完成"""
+        # A completed manual or scheduled refresh represents one consistent market
+        # snapshot, so all rows receive the same persisted success timestamp.
+        completed_at = datetime.now().isoformat(timespec="seconds")
+        for entry in self._market_tracked_items:
+            entry["updated_at"] = completed_at
         self._populate_market_table()
         self._save_market_cache()
         eco_status = getattr(self._market_refresh_worker, "eco_status_text", "")
@@ -1412,7 +1454,7 @@ class CS2ManagerApp(QMainWindow):
                 "igxe_short_rent": entry.get("igxe_short_rent", 0.0),
                 "igxe_long_rent": entry.get("igxe_long_rent", 0.0),
                 "links": entry.get("links", {}),
-                "updated_at": QTime.currentTime().toString("HH:mm:ss"),
+                "updated_at": entry.get("updated_at", ""),
                 "detail": entry.get("detail", {}),
             }
         MarketCache.save(cache_data)
@@ -1469,7 +1511,7 @@ class CS2ManagerApp(QMainWindow):
                 "csqaq_min_sell_price": float(prices.get("min_sell_price", prices.get("buff_price", 0.0))),
                 "eco_min_rent": 0.0,
                 "links": {},
-                "updated_at": QTime.currentTime().toString("HH:mm:ss"),
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
                 "detail": {
                     "buff_price": prices.get("buff_price", 0.0),
                     "yy_price": prices.get("yy_price", 0.0),
