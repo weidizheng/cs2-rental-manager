@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import logging
+import time
 from datetime import datetime
 from urllib.parse import quote
 from PySide6.QtWidgets import (
@@ -273,6 +274,7 @@ class CS2ManagerApp(QMainWindow):
         self._market_refresh_worker = None
         self._c5_thread = None
         self._c5_worker = None
+        self._market_auto_refresh_deadline = 0.0
 
         # 当前市场详情页选中的物品标识 (name|phase)
         self._current_market_item_key = ""
@@ -281,6 +283,12 @@ class CS2ManagerApp(QMainWindow):
 
         self.apply_theme()
         self.init_ui()
+
+        self.market_countdown_timer = QTimer(self)
+        self.market_countdown_timer.timeout.connect(self._update_market_auto_refresh_countdown)
+        self.market_auto_refresh_timer = QTimer(self)
+        self.market_auto_refresh_timer.setSingleShot(True)
+        self.market_auto_refresh_timer.timeout.connect(self._run_scheduled_market_refresh)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.on_auto_refresh)
@@ -624,15 +632,16 @@ class CS2ManagerApp(QMainWindow):
         search_layout.addWidget(self.market_input, 1)
         search_layout.addWidget(self.market_search_btn)
 
-        refresh_market_btn = QPushButton("🔄 刷新行情（用缓存）")
+        refresh_market_btn = QPushButton("🔄 刷新行情")
         refresh_market_btn.setObjectName("successBtn")
         refresh_market_btn.clicked.connect(self._refresh_all_market_data)
         search_layout.addWidget(refresh_market_btn)
 
-        force_eco_btn = QPushButton("☁️ 强制更新 ECO")
+        force_eco_btn = QPushButton("⏱ 10分钟后自动刷新")
         force_eco_btn.setObjectName("primaryBtn")
-        force_eco_btn.setToolTip("忽略本地 ECO 缓存并重新下载完整行情快照")
-        force_eco_btn.clicked.connect(lambda: self._refresh_all_market_data(force_eco=True))
+        force_eco_btn.setToolTip("倒计时结束后自动刷新一次 CSQAQ 与 ECO 行情")
+        force_eco_btn.clicked.connect(self._toggle_market_auto_refresh)
+        self.market_auto_refresh_btn = force_eco_btn
         search_layout.addWidget(force_eco_btn)
 
         self.market_remove_btn = QPushButton("🗑 删除选中")
@@ -945,7 +954,11 @@ class CS2ManagerApp(QMainWindow):
             if item_id:
                 return f"https://www.igxe.cn/product/trade/730/{item_id}"
             return f"https://www.igxe.cn/market/csgo?keyword={quote(name)}" if name else ""
-        # 悠悠和 ECO 当前没有由 CSQAQ 返回的稳定网页详情 URL；用户可在右键菜单中保存自己的链接。
+        if platform == "eco":
+            item_id = entry.get("eco_id") or detail.get("eco_id")
+            if item_id:
+                return f"https://www.ecosteam.cn/goods/730-{item_id}-1-laypageRent-0-1.html"
+        # 悠悠当前没有由 CSQAQ 返回的稳定网页详情 URL；用户可在右键菜单中保存自己的链接。
         return ""
 
     def _market_link(self, entry, platform):
@@ -1228,6 +1241,35 @@ class CS2ManagerApp(QMainWindow):
 
     # ── 刷新全部行情（顺序队列） ──
 
+    def _toggle_market_auto_refresh(self):
+        if self.market_auto_refresh_timer.isActive():
+            self.market_auto_refresh_timer.stop()
+            self.market_countdown_timer.stop()
+            self._market_auto_refresh_deadline = 0.0
+            self.market_auto_refresh_btn.setText("⏱ 10分钟后自动刷新")
+            self.lbl_market_update.setText("已取消自动刷新倒计时")
+            return
+
+        self._market_auto_refresh_deadline = time.monotonic() + 10 * 60
+        self.market_auto_refresh_timer.start(10 * 60 * 1000)
+        self.market_countdown_timer.start(1000)
+        self._update_market_auto_refresh_countdown()
+
+    def _update_market_auto_refresh_countdown(self):
+        remaining = max(0, int(self._market_auto_refresh_deadline - time.monotonic()))
+        minutes, seconds = divmod(remaining, 60)
+        self.market_auto_refresh_btn.setText(f"⏱ 自动刷新 {minutes:02d}:{seconds:02d}")
+
+    def _run_scheduled_market_refresh(self):
+        self.market_countdown_timer.stop()
+        self._market_auto_refresh_deadline = 0.0
+        self.market_auto_refresh_btn.setText("⏱ 自动刷新已执行")
+        if self._market_refresh_thread and self._market_refresh_thread.isRunning():
+            self.lbl_market_update.setText("自动刷新已跳过：当前已有刷新任务")
+            return
+        self.lbl_market_update.setText("10 分钟倒计时结束，正在自动刷新行情…")
+        self._refresh_all_market_data()
+
     def _refresh_all_market_data(self, force_eco: bool = False):
         """刷新大盘；普通模式优先使用本地 ECO 快照。"""
         if not self._market_tracked_items:
@@ -1318,6 +1360,7 @@ class CS2ManagerApp(QMainWindow):
                 "c5_id": entry.get("c5_id", ""),
                 "yyyp_id": entry.get("yyyp_id", ""),
                 "igxe_id": entry.get("igxe_id", ""),
+                "eco_id": entry.get("eco_id", ""),
                 "c5_short_rent": entry.get("c5_short_rent", 0.0),
                 "c5_long_rent": entry.get("c5_long_rent", 0.0),
                 "yyyp_short_rent": entry.get("yyyp_short_rent", 0.0),

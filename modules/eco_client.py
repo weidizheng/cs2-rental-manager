@@ -119,7 +119,7 @@ class ECOClient(BaseAPIClient):
     def get_hash_name_and_price_list(self, force_refresh: bool = False) -> dict:
         """Get a phase-aware snapshot, preferring the local SQLite cache.
 
-        ECO only offers a full-list endpoint here. A fresh cache (15 minutes by
+        ECO only offers a full-list endpoint here. A fresh cache (10 minutes by
         default) prevents repeated 39k-item downloads; a force refresh is the
         only normal path that bypasses it.
         """

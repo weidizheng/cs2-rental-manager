@@ -9,7 +9,7 @@ from modules.image_cache import ImageCache
 from modules.c5_rental_browser import C5RentalBrowser
 
 logger = logging.getLogger("CS2Rental")
-CSQAQ_DETAIL_CACHE_TTL_SECONDS = 15 * 60
+CSQAQ_DETAIL_CACHE_TTL_SECONDS = 10 * 60
 
 
 def _number(value):
@@ -41,6 +41,7 @@ def build_csqaq_market_detail(info: dict) -> dict:
         "c5_id": str(info.get("c5_id") or ""),
         "yyyp_id": str(info.get("yyyp_id") or ""),
         "igxe_id": str(info.get("igxe_id") or ""),
+        "eco_id": str(info.get("eco_id") or ""),
         "c5_short_rent": _number(info.get("c5_lease_price")),
         "c5_long_rent": _number(info.get("c5_long_lease_price")),
         "yyyp_short_rent": _number(info.get("yyyp_lease_price")),
@@ -264,6 +265,7 @@ class MarketRefreshWorker(QObject):
                             detail_is_fresh = (
                                 time.time() - float(entry.get("csqaq_detail_fetched_at", 0) or 0)
                                 <= CSQAQ_DETAIL_CACHE_TTL_SECONDS
+                                and bool(entry.get("eco_id"))
                             )
                             if good_id and not detail_is_fresh:
                                 detail_info = csqaq_client.get_good_detail(good_id)

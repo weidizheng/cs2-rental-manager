@@ -12,7 +12,7 @@ from typing import Any
 from modules.paths import get_private_path
 
 
-CACHE_TTL_SECONDS = 15 * 60
+CACHE_TTL_SECONDS = 10 * 60
 DB_PATH = get_private_path("eco_market_cache.db")
 
 
