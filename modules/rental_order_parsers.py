@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from modules.c5_rental_browser import parse_c5_rent_text
@@ -46,6 +46,16 @@ def _status_from_text(text: str, default: str = "") -> str:
     return default
 
 
+def _end_from_start_and_days(start_time: str, rental_days: float) -> str:
+    if not start_time or rental_days <= 0:
+        return ""
+    try:
+        start = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
+        return (start + timedelta(days=rental_days)).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ""
+
+
 def parse_eco_clipboard(text: str) -> list[dict[str, Any]]:
     starts = list(re.finditer(r"(?m)^\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+订单编号：\s*(\d+)", text))
     orders: list[dict[str, Any]] = []
@@ -57,7 +67,10 @@ def parse_eco_clipboard(text: str) -> list[dict[str, Any]]:
         daily_rent = _float(_first(r"￥\s*([0-9.]+)\s*/\s*天", block))
         rental_days = _float(_first(r"×\s*([0-9.]+)\s*[（(]\s*(?:长租|短租)", block))
         deposit = _float(_first(r"含押金\s*￥\s*([0-9.]+)", block))
-        return_time = _normal_datetime(_first(r"(20\d{2}年\d{2}月\d{2}日\s+\d{2}:\d{2}:\d{2})\s*前归还", block))
+        return_deadline = _normal_datetime(_first(r"(20\d{2}年\d{2}月\d{2}日\s+\d{2}:\d{2}:\d{2})\s*前归还", block))
+        # ECO exposes a return deadline.  Rental availability ends at the
+        # explicitly ordered duration, normally about twelve hours earlier.
+        return_time = _end_from_start_and_days(start_time, rental_days) or return_deadline
         orders.append({
             "order_no": order_no,
             "item_name": item_name,
@@ -82,7 +95,9 @@ def parse_igxe_clipboard(text: str) -> list[dict[str, Any]]:
         if not trade_id:
             continue
         start_time = _normal_datetime(_first(r"创建时间\s*[：:]\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", block))
-        return_time = _normal_datetime(_first(r"归还截止时间\s*[：:]\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", block))
+        rental_end_time = _normal_datetime(_first(r"租赁到期时间\s*[：:]\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", block))
+        return_deadline = _normal_datetime(_first(r"归还截止时间\s*[：:]\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", block))
+        return_time = rental_end_time or return_deadline
         item_name = _first(r"\[([^\]]+)\]\(https?://www\.igxe\.cn/lease/trade/730/", block)
         float_val = _first(r"磨损\s*([0-9.]+)", block)
         daily_rent = _float(_first(r"租赁价格[\s\S]{0,80}?￥\s*([0-9.]+)\s*/\s*天", block))

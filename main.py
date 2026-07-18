@@ -3,7 +3,8 @@ import os
 import sys
 import logging
 import time
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import re
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from PySide6.QtWidgets import (
@@ -252,7 +253,7 @@ class RentalHistoryDialog(QDialog):
         self.table = QTableWidget()
         self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels([
-            "平台", "状态", "出租时间", "归还时间", "租期", "日租（原价）", "订单金额", "净收入",
+            "平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "净收入",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -293,7 +294,7 @@ class RentalHistoryDialog(QDialog):
                 f"订单号：{order.get('order_no', '')}",
                 f"状态：{order.get('status', '')}",
                 f"出租：{order.get('start_time', '')}",
-                f"归还：{order.get('return_time', '')}",
+                f"租赁到期：{order.get('return_time', '')}",
                 f"租期：{float(order.get('rental_days', 0.0) or 0.0):g} 天",
                 f"日租（原价）：{_money_text(order.get('daily_rent', 0.0) or 0.0)}",
                 f"订单金额：{_money_text(order.get('income', 0.0) or 0.0)}",
@@ -1870,11 +1871,50 @@ class CS2ManagerApp(QMainWindow):
         gross_income = self._order_number(order.get("income"))
         return gross_income / days if gross_income > 0 and days > 0 else 0.0
 
+    @staticmethod
+    def _order_discount_rate(order) -> float:
+        """Return an IGXE continuous-rental discount multiplier, if present."""
+        if order.get("platform") != "IGXE":
+            return 1.0
+        raw_text = str(order.get("raw_text", "") or "")
+        match = re.search(
+            r"(?:连续出租折扣|转租折扣)\s*[：:]?\s*(\d+(?:\.\d+)?)\s*折",
+            raw_text,
+            flags=re.DOTALL,
+        )
+        if not match:
+            return 1.0
+        try:
+            return min(1.0, max(0.0, float(match.group(1)) / 10))
+        except ValueError:
+            return 1.0
+
+    def _rental_end_datetime(self, order) -> datetime:
+        """Use rental end, not the later item-return deadline, for alerts/CD."""
+        raw_text = str(order.get("raw_text", "") or "")
+        if order.get("platform") == "IGXE":
+            match = re.search(
+                r"租赁到期时间\s*[：:]?\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+                raw_text,
+                flags=re.DOTALL,
+            )
+            if match:
+                parsed = _parse_rental_datetime(match.group(1))
+                if parsed > datetime.min:
+                    return parsed
+        if order.get("platform") == "ECOSteam":
+            start = _parse_rental_datetime(order.get("start_time"))
+            rental_days = self._order_rental_days(order)
+            if start > datetime.min and rental_days > 0:
+                return start + timedelta(days=rental_days)
+        return _parse_rental_datetime(order.get("return_time"))
+
     def _order_gross_income(self, order) -> float:
-        gross_income = self._order_number(order.get("income"))
-        if gross_income > 0:
-            return gross_income
-        return self._order_daily_rent(order) * self._order_rental_days(order)
+        daily_rent = self._order_daily_rent(order)
+        rental_days = self._order_rental_days(order)
+        if daily_rent > 0 and rental_days > 0:
+            return daily_rent * rental_days * self._order_discount_rate(order)
+        return self._order_number(order.get("income"))
 
     def _order_fee_rate(self, order, history) -> float:
         platform_prefix = {
@@ -1905,7 +1945,7 @@ class CS2ManagerApp(QMainWindow):
         if order_index <= 0:
             return False
         previous_order = history[order_index - 1]
-        previous_end = _parse_rental_datetime(previous_order.get("return_time"))
+        previous_end = self._rental_end_datetime(previous_order)
         current_start = _parse_rental_datetime(order.get("start_time"))
         if previous_end <= datetime.min or current_start <= datetime.min:
             return False
@@ -1924,9 +1964,13 @@ class CS2ManagerApp(QMainWindow):
             return 0.0
 
     def _order_net_income(self, order, history) -> float:
-        return self._net_amount(
+        net_income = self._net_amount(
             self._order_gross_income(order), self._order_fee_rate(order, history)
         )
+        if order.get("platform") == "IGXE":
+            # IGXE settles its displayed order amount by truncating to cents.
+            return float(Decimal(str(net_income)).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+        return net_income
 
     def _total_net_income(self, history) -> float:
         return sum(self._order_net_income(order, history) for order in history)
@@ -1953,9 +1997,9 @@ class CS2ManagerApp(QMainWindow):
                 return f"{rental_label} · {order_status}", None
             return order_status or fallback_status, None
 
-        end_time = _parse_rental_datetime(latest_order.get("return_time"))
+        end_time = self._rental_end_datetime(latest_order)
         if end_time <= datetime.min:
-            return f"{rental_label} · 归还时间未知", QColor("#fab387")
+            return f"{rental_label} · 租赁到期未知", QColor("#fab387")
 
         remaining_seconds = (end_time - datetime.now()).total_seconds()
         color = QColor("#f38ba8") if remaining_seconds <= 12 * 60 * 60 else QColor("#a6e3a1")
@@ -1998,6 +2042,9 @@ class CS2ManagerApp(QMainWindow):
             display_order["rental_days"] = self._order_rental_days(order)
             display_order["daily_rent"] = self._order_daily_rent(order)
             display_order["net_income"] = self._order_net_income(order, history)
+            rental_end = self._rental_end_datetime(order)
+            if rental_end > datetime.min:
+                display_order["return_time"] = rental_end.strftime("%Y-%m-%d %H:%M:%S")
             display_history.append(display_order)
         RentalHistoryDialog(item["name"], item.get("float_val", ""), display_history, self).exec()
 
@@ -2026,11 +2073,13 @@ class CS2ManagerApp(QMainWindow):
             total_net_income = net_income
 
             if latest_order:
-                end = _parse_rental_datetime(latest_order.get("return_time"))
+                end = self._rental_end_datetime(latest_order)
                 rental_days = self._order_rental_days(latest_order)
                 daily_rent = self._order_daily_rent(latest_order)
                 fee_rate = self._order_fee_rate(latest_order, history)
-                net_daily_rent = self._net_amount(daily_rent, fee_rate)
+                net_daily_rent = self._net_amount(
+                    daily_rent * self._order_discount_rate(latest_order), fee_rate
+                )
                 net_income = self._order_net_income(latest_order, history)
                 total_net_income = self._total_net_income(history)
                 order_status = latest_order.get("status", "")

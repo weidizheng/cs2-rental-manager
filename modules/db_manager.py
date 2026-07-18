@@ -103,7 +103,7 @@ class DBManager:
                 "c5_first_fee",
                 saved_configs.get("c5_first_fee", "0.15"),
             ),
-            ("c5_relet_fee", saved_configs.get("c5_relet_fee", "0.05")),
+            ("c5_relet_fee", saved_configs.get("c5_relet_fee", "0.15")),
             (
                 "uu_first_fee",
                 saved_configs.get("uu_first_fee", "0.10"),
@@ -111,7 +111,7 @@ class DBManager:
             ("uu_relet_fee", saved_configs.get("uu_relet_fee", "0.05")),
             (
                 "igxe_first_fee",
-                saved_configs.get("igxe_first_fee", "0.10"),
+                saved_configs.get("igxe_first_fee", "0.05"),
             ),
             (
                 "igxe_relet_fee",
@@ -410,7 +410,7 @@ class DBManager:
             cursor.execute(
                 """
                 SELECT platform, order_no, item_name, float_val, income, daily_rent, rental_days, deposit,
-                       start_time, return_time, status, synced_at
+                       start_time, return_time, status, raw_text, synced_at
                 FROM rental_orders WHERE platform=?
                 ORDER BY synced_at DESC, id DESC
                 """,
@@ -419,12 +419,12 @@ class DBManager:
         else:
             cursor.execute("""
                 SELECT platform, order_no, item_name, float_val, income, daily_rent, rental_days, deposit,
-                       start_time, return_time, status, synced_at
+                       start_time, return_time, status, raw_text, synced_at
                 FROM rental_orders ORDER BY synced_at DESC, id DESC
             """)
         columns = (
             "platform", "order_no", "item_name", "float_val", "income", "daily_rent", "rental_days", "deposit",
-            "start_time", "return_time", "status", "synced_at",
+            "start_time", "return_time", "status", "raw_text", "synced_at",
         )
         return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
