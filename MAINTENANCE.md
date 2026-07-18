@@ -8,11 +8,11 @@
 
 | 标签页 | 已实现的功能 | 说明 |
 | --- | --- | --- |
-| 资产与出租管理 | 饰品增删改、资产统计、C5 默认浏览器同步、C5/ECO/IGXE 剪贴板导入、订单历史、到期倒计时 | 三个平台都可手动复制订单文本导入；浏览器扩展自动读取仅支持 C5 |
+| 资产与出租管理 | 饰品增删改、资产统计、C5/ECO/IGXE 剪贴板导入预览、订单历史、到期倒计时 | 三个平台都通过“打开订单页 + 复制 + 预览确认导入”操作 |
 | 一览式大盘行情 | CSQAQ 售价/租金聚合、ECO 最低日租、平台跳转、行情观察列表与缓存 | 不直接请求 IGXE 行情接口 |
 | 系统与费率设置 | 保存 CSQAQ Token、ECO Partner ID/RSA 私钥、资产页本地刷新间隔与费率 | 设置只写入私密数据目录 |
 
-目前**没有**自动登录、验证码绕过、AI OCR 录单，也没有 ECO/IGXE 的浏览器扩展自动读取。ECO、IGXE 固定格式的订单文字可通过剪贴板导入；单独的“出租订单”标签页未挂到界面，`main.py` 中相关旧代码不应视为已启用功能。
+目前**没有**自动登录、验证码绕过、AI OCR 录单，也不启用浏览器扩展或隔离浏览器读取。三个平台的固定格式订单文字可通过剪贴板预览后导入；单独的“出租订单”标签页未挂到界面，`main.py` 中相关旧代码不应视为已启用功能。
 
 ## 2. 快速运行与换电脑
 
@@ -65,14 +65,14 @@ git push origin main
 | --- | --- | --- |
 | `app.db` | SQLite 主数据：资产、设置、出租订单 | 是 |
 | `items.json` | 资产表的 JSON 备份/首次导入来源 | 是 |
-| `configs.json` | Token、ECO 凭据、费率、刷新设置、浏览器扩展配对令牌备份 | 是，敏感 |
+| `configs.json` | Token、ECO 凭据、费率、刷新设置备份 | 是，敏感 |
 | `market_cache.json` | 观察列表、行情、平台 ID、自定义跳转链接、成功更新时间 | 建议复制 |
 | `eco_market_cache.db` | ECO 全量行情快照（约 4 万条） | 建议复制，可省去首次重新下载 |
 | `schema-source/` | ByMykel 英文/中文原始饰品数据 | 是 |
 | `cs2_items_schema.json` | 从上述两个源文件生成的本地索引 | 可复制，也可自动重建 |
 | `images/` | 饰品图片缓存 | 可选 |
-| `browser-profiles/c5game/` | 隔离的 C5 Playwright 登录状态 | 可选但敏感；复制后通常无需重新登录 |
-| `browser-snapshots/` | C5 手动同步时保存的原始 HTML | 建议私密留存，供解析规则排障 |
+| `browser-profiles/c5game/` | 历史隔离 C5 读取器的登录状态 | 可选，当前界面不使用 |
+| `browser-snapshots/` | 历史浏览器读取时保存的原始页面 | 可选，当前界面不使用 |
 | `logs/` | 轮转日志 `app.log` | 可选，排障时有用 |
 
 `app.db` 是运行时主库。`items.json` 仅在数据库为空时导入，并在资产新增、修改、删除后作为备份写回；不要在日常使用时手改 JSON 期待覆盖一个已有数据库。
@@ -123,7 +123,7 @@ git push origin main
 
 代码位置：`modules/rental_order_parsers.py`、`modules/c5_rental_browser.py`、`modules/db_manager.py`。
 
-这是三个平台目前共同、最稳定的录入方式：在订单页全选并复制文本，回到“资产与出租管理”，点击“从剪贴板导入订单”。导入器按照文字特征识别平台，一次导入一个平台，保存逻辑如下：
+这是三个平台目前共同、最稳定的录入方式：在订单页全选并复制文本，回到“资产与出租管理”，点击“从剪贴板导入订单”。导入器先按照文字特征识别平台并显示预览；只有用户点击“确认导入”后才会写入数据库。一次导入一个平台，保存逻辑如下：
 
 | 平台 | 识别特征 | 导入字段 |
 | --- | --- | --- |
@@ -131,33 +131,14 @@ git push origin main
 | ECO | `订单编号`、`前归还` 或 `ECO_` | 订单号、磨损、原始日租、长/短租天数、押金、归还时间、状态 |
 | IGXE | `归还截止时间`、`igxe.cn/lease/trade` | 交易 ID、磨损、原始日租、出租天数、押金、订单金额、归还时间 |
 
-`rental_orders` 使用 `(platform, order_no)` 唯一键，因此再次复制同一页面只更新订单而不会重复计算。资产与订单以浮点数标准化到 12 位小数后的磨损值关联；同一磨损就是同一实物的连续出租链。任何解析失败的订单都不会写入数据库，保留复制文本即可据此调整规则。
+`rental_orders` 使用 `(platform, order_no)` 唯一键，因此再次复制同一页面只更新订单而不会重复计算。资产与订单以浮点数标准化到 12 位小数后的磨损值关联；同一磨损就是同一实物的连续出租链。时间最早的一笔显示为“已出租”，其后的订单显示为“已转租”；若只导入一笔且平台没有直接提供连续出租标记，则不能凭空判断它是否曾在导入前转租。任何解析失败或被用户在预览中取消的订单都不会写入数据库。
 
 
-### C5 默认浏览器同步（当前推荐方式）
+### 历史浏览器读取器（当前停用）
 
-代码位置：`modules/browser_bridge.py`、`browser-extension/`、`modules/c5_rental_browser.py`、`modules/db_manager.py`。
+`modules/browser_bridge.py`、`browser-extension/` 和 `modules/c5_rental_browser.py` 保留在项目中以便后续恢复或维护，但当前界面不显示相关按钮，也不会启动本地连接服务或 Playwright 浏览器。日常操作统一使用默认浏览器打开订单页，再复制页面文字到剪贴板导入。
 
-1. 在 Chrome/Edge 的扩展页以开发者模式“加载已解压的扩展程序”，选择 `browser-extension/`。
-2. 启动桌面程序，点击“复制扩展配对令牌”，粘贴到扩展弹窗并保存。令牌仅存在扩展本地存储和 `configs.json`。
-3. 在日常浏览器中登录 C5 并打开出租记录页。
-4. 点击桌面端“通过浏览器同步 C5”。扩展最多约 30 秒后读取已打开的标签页文本，通过仅监听本机的 `127.0.0.1:8765` 发送给程序。扩展弹窗的“立即检查同步请求”可以跳过等待。
-5. 程序保存私密文本快照、按订单号 upsert 订单，再以标准化磨损值 `float_val` 匹配资产。同一 float 的最新订单决定资产页的租赁状态、归还时间与倒计时；旧订单保留为历史/转租记录。
-
-扩展不读取、导出或传输 Cookie、密码、浏览历史。若 C5 检测到“安全验证”页，扩展只向桌面端报告状态；用户必须在该浏览器标签页手动完成验证，再次点击同步。
-
-### C5 隔离读取器（备用）
-
-1. 点击“C5 隔离登录（备用）”，打开隔离的、可见的 Playwright Chromium。
-2. 由用户在窗口内登录并自行完成验证码；关闭窗口即保存该隔离 Profile。
-3. 点击“读取 C5 订单（隔离浏览器）”。程序访问 `https://www.c5game.com/user/rent?actag=2`，读取当前页文本和 HTML。
-4. HTML 私密保存至 `browser-snapshots/c5-rent-时间.html`，文本解析后按订单号 upsert 到 `rental_orders`。
-
-安全与边界：
-
-- 不读取普通 Chrome Profile，不存储密码，不尝试绕过验证码或反爬限制。
-- 桌面端同步仅由按钮手动触发；扩展的 30 秒低频轮询只是为取得本地同步任务，不访问平台网络接口。
-- C5 页面改版后，优先保留同步产生的 HTML 快照，再根据快照调整 `parse_c5_rent_text()` 的解析规则。
+无论将来是否重新启用，程序都不应读取普通 Chrome Profile、存储密码或尝试绕过验证码/反爬限制。
 
 ## 6. 本地 CS2 饰品映射
 
@@ -245,8 +226,7 @@ private-data/schema-source/skins_not_grouped.zh-CN.json
 | `modules/cs2_item_schema.py` | ByMykel 本地 JSON 映射及索引重建 |
 | `modules/c5_rental_browser.py` | C5 可见浏览器、页面快照与 C5 文本解析 |
 | `modules/rental_order_parsers.py` | C5/ECO/IGXE 剪贴板格式识别与结构化解析 |
-| `modules/browser_bridge.py` | 仅监听本机的扩展配对、同步任务和订单页文本接收 |
-| `browser-extension/` | Chrome/Edge Manifest V3 扩展，仅读取明确授权的订单页文本 |
+| `modules/browser_bridge.py`、`browser-extension/` | 保留的浏览器扩展读取方案（当前界面未启用） |
 | `modules/image_cache.py` | 行情观察列表和图片缓存 |
 | `modules/logger.py` | 私密日志轮转 |
 | `requirements.txt` | Python 依赖 |

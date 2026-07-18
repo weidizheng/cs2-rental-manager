@@ -3,7 +3,6 @@ import os
 import sys
 import logging
 import time
-import secrets
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime
 from urllib.parse import quote
@@ -20,13 +19,10 @@ from PySide6.QtCore import Qt, QTimer, QThread, QUrl, QTime
 from PySide6.QtGui import QFont, QColor, QPixmap, QIcon, QPainter, QLinearGradient, QBrush, QDesktopServices
 
 from modules.db_manager import DBManager
-from modules.workers import ApiWorker, MarketRefreshWorker, C5RentalWorker
+from modules.workers import ApiWorker, MarketRefreshWorker
 from modules.logger import logger
 from modules.image_cache import ImageCache, MarketCache
 from modules.cs2_item_schema import CS2ItemSchema
-from modules.browser_bridge import BrowserBridgeServer
-from modules.c5_rental_browser import parse_c5_rent_text
-from modules.paths import get_private_path
 from modules.rental_order_parsers import parse_rental_clipboard
 
 
@@ -283,6 +279,64 @@ class RentalHistoryDialog(QDialog):
         )
 
 
+class RentalImportPreviewDialog(QDialog):
+    """Show parsed clipboard orders before the user allows a database write."""
+
+    def __init__(self, platform, orders, parent=None):
+        super().__init__(parent)
+        self.platform = platform
+        self.orders = orders
+        self.setWindowTitle("确认导入出租订单")
+        self.resize(1240, 500)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"已识别为 {platform}，共解析到 {len(orders)} 条订单。请核对后再确认写入本地记录。"
+        ))
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(10)
+        self.table.setHorizontalHeaderLabels([
+            "平台", "订单号", "饰品", "磨损", "出租时间", "归还时间",
+            "租期", "日租（原价）", "订单金额", "状态",
+        ])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.setStyleSheet("alternate-background-color: #1e1e2e;")
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        for column in (0, 1, 3, 4, 5, 6, 7, 8, 9):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+
+        for row, order in enumerate(orders):
+            self.table.insertRow(row)
+            income = float(order.get("income", 0.0) or 0.0)
+            daily_rent = float(order.get("daily_rent", 0.0) or 0.0)
+            rental_days = float(order.get("rental_days", 0.0) or 0.0)
+            values = [
+                platform, order.get("order_no", ""), order.get("item_name", ""),
+                order.get("float_val", ""), order.get("start_time", ""), order.get("return_time", ""),
+                f"{rental_days:g} 天" if rental_days > 0 else "—",
+                _money_text(daily_rent) if daily_rent > 0 else "—",
+                _money_text(income), order.get("status", "") or "—",
+            ]
+            for column, value in enumerate(values):
+                self.table.setItem(row, column, QTableWidgetItem(str(value)))
+        layout.addWidget(self.table)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(self.reject)
+        confirm_button = QPushButton("确认导入")
+        confirm_button.setObjectName("successBtn")
+        confirm_button.clicked.connect(self.accept)
+        buttons.addWidget(cancel_button)
+        buttons.addWidget(confirm_button)
+        layout.addLayout(buttons)
+
+
 class CS2ManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -296,8 +350,6 @@ class CS2ManagerApp(QMainWindow):
         # 市场行情刷新专用线程/Worker（单线程顺序队列）
         self._market_refresh_thread = None
         self._market_refresh_worker = None
-        self._c5_thread = None
-        self._c5_worker = None
         self._market_auto_refresh_deadline = 0.0
         self._market_auto_refresh_enabled = False
         self._dashboard_rental_rows = {}
@@ -309,15 +361,6 @@ class CS2ManagerApp(QMainWindow):
 
         self.apply_theme()
         self.init_ui()
-
-        self.browser_bridge_token = self.db.get_config("browser_bridge_token")
-        if not self.browser_bridge_token:
-            self.browser_bridge_token = secrets.token_urlsafe(32)
-            self.db.save_config("browser_bridge_token", self.browser_bridge_token)
-        self.browser_bridge = BrowserBridgeServer(self.browser_bridge_token)
-        self.browser_bridge.snapshot_received.connect(self._on_browser_bridge_snapshot)
-        self.browser_bridge.server_error.connect(self._on_browser_bridge_error)
-        self.browser_bridge.start()
 
         self.market_countdown_timer = QTimer(self)
         self.market_countdown_timer.timeout.connect(self._update_market_auto_refresh_countdown)
@@ -434,7 +477,7 @@ class CS2ManagerApp(QMainWindow):
             card_layout.addWidget(c)
         layout.addLayout(card_layout)
 
-        platform_sync = QGroupBox("平台订单页与 C5 手动读取")
+        platform_sync = QGroupBox("平台订单获取方法")
         platform_layout = QVBoxLayout(platform_sync)
         browser_layout = QHBoxLayout()
         open_c5_btn = QPushButton("🌐 打开 C5 订单页")
@@ -447,43 +490,16 @@ class CS2ManagerApp(QMainWindow):
         open_igxe_btn.setObjectName("primaryBtn")
         open_igxe_btn.clicked.connect(lambda: self._open_default_browser_order_page("igxe"))
 
-        self.browser_c5_sync_btn = QPushButton("🔗 通过浏览器同步 C5")
-        self.browser_c5_sync_btn.setObjectName("successBtn")
-        self.browser_c5_sync_btn.setToolTip("请先在默认浏览器打开 C5 订单页，并安装/配对本地扩展。")
-        self.browser_c5_sync_btn.clicked.connect(self._request_default_browser_c5_sync)
-        self.browser_token_btn = QPushButton("🔑 复制扩展配对令牌")
-        self.browser_token_btn.setObjectName("primaryBtn")
-        self.browser_token_btn.setToolTip("首次安装 browser-extension 后，将令牌粘贴到扩展弹窗。")
-        self.browser_token_btn.clicked.connect(self._copy_browser_bridge_token)
         self.clipboard_import_btn = QPushButton("📋 从剪贴板导入订单")
         self.clipboard_import_btn.setObjectName("successBtn")
         self.clipboard_import_btn.setToolTip("复制 C5、ECO 或 IGXE 订单页文本后点击，程序会自动识别平台。")
         self.clipboard_import_btn.clicked.connect(self._import_rental_orders_from_clipboard)
-
-        self.c5_login_btn = QPushButton("C5 隔离登录（备用）")
-        self.c5_login_btn.setObjectName("primaryBtn")
-        self.c5_login_btn.clicked.connect(lambda: self._run_c5_task("login"))
-        self.c5_login_btn.setToolTip("只供隔离 Playwright 读取器使用；不会复用普通浏览器的登录状态。")
-        self.c5_sync_btn = QPushButton("读取 C5 订单（隔离浏览器）")
-        self.c5_sync_btn.setObjectName("successBtn")
-        self.c5_sync_btn.clicked.connect(lambda: self._run_c5_task("sync"))
-        self.c5_sync_status = QLabel(
-            "订单页会在默认浏览器打开；当前程序不会读取该浏览器的登录 Cookie。"
-        )
-        self.c5_sync_status.setStyleSheet("color: #a6adc8;")
         browser_layout.addWidget(open_c5_btn)
         browser_layout.addWidget(open_eco_btn)
         browser_layout.addWidget(open_igxe_btn)
-        browser_layout.addWidget(self.browser_c5_sync_btn)
-        browser_layout.addWidget(self.browser_token_btn)
         browser_layout.addWidget(self.clipboard_import_btn)
         browser_layout.addStretch()
-        fallback_layout = QHBoxLayout()
-        fallback_layout.addWidget(self.c5_login_btn)
-        fallback_layout.addWidget(self.c5_sync_btn)
-        fallback_layout.addWidget(self.c5_sync_status, 1)
         platform_layout.addLayout(browser_layout)
-        platform_layout.addLayout(fallback_layout)
         layout.addWidget(platform_sync)
 
         # ── 工具栏 ──
@@ -524,16 +540,21 @@ class CS2ManagerApp(QMainWindow):
 
         # ── 饰品表格 ──
         self.table = QTableWidget()
-        self.table.setColumnCount(13)
+        self.table.setColumnCount(11)
         self.table.setHorizontalHeaderLabels([
-            "ID", "饰品名称", "相位", "模板", "磨损度", "成本(元)", "平台",
-            "状态 / 倒计时", "租期天数", "日租（原价）", "最新出租日期", "本单净收入", "累计净收益",
+            "ID", "饰品名称", "相位", "磨损度", "成本(元)", "平台",
+            "状态 / 倒计时", "租期天数", "日租（原价）", "本单净收入", "累计净收益",
         ])
         header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 44)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        for column in range(8, 13):
+        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        for column in range(2, 11):
+            if column == 1:
+                continue
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
@@ -613,32 +634,12 @@ class CS2ManagerApp(QMainWindow):
             for column, value in enumerate(values):
                 self.order_table.setItem(row_index, column, QTableWidgetItem(str(value)))
 
-    def _set_c5_controls_enabled(self, enabled):
-        self.c5_login_btn.setEnabled(enabled)
-        self.c5_sync_btn.setEnabled(enabled)
-
-    def _set_browser_bridge_controls_enabled(self, enabled):
-        if hasattr(self, "browser_c5_sync_btn"):
-            self.browser_c5_sync_btn.setEnabled(enabled)
-        if hasattr(self, "browser_token_btn"):
-            self.browser_token_btn.setEnabled(enabled)
-
     def _open_default_browser_order_page(self, platform):
         """Open an order page in the user's default browser and its existing session."""
-        platform_name, url = ORDER_PAGE_URLS.get(platform, ("", ""))
+        _platform_name, url = ORDER_PAGE_URLS.get(platform, ("", ""))
         if not url:
             return
         QDesktopServices.openUrl(QUrl(url))
-        self.c5_sync_status.setText(
-            f"已在默认浏览器打开 {platform_name} 订单页。"
-            "如需实时读取，需为该浏览器单独授权连接。"
-        )
-
-    def _copy_browser_bridge_token(self):
-        QApplication.clipboard().setText(self.browser_bridge_token)
-        self.c5_sync_status.setText(
-            "扩展配对令牌已复制。在 Chrome 加载 browser-extension 后，粘贴到扩展弹窗并保存。"
-        )
 
     def _import_rental_orders_from_clipboard(self):
         text = QApplication.clipboard().text().strip()
@@ -653,129 +654,16 @@ class CS2ManagerApp(QMainWindow):
         if not orders:
             QMessageBox.warning(self, "剪贴板导入", f"已识别 {platform}，但未解析到有效订单。")
             return
+        preview = RentalImportPreviewDialog(platform, orders, self)
+        if preview.exec() != QDialog.Accepted:
+            return
         self.db.upsert_rental_orders(platform, orders)
         self.load_data()
-        self.c5_sync_status.setText(
-            f"已从剪贴板导入 {len(orders)} 条 {platform} 订单；已按唯一磨损值关联资产。"
-        )
         QMessageBox.information(
             self,
             "剪贴板导入完成",
             f"已导入 {len(orders)} 条 {platform} 订单。\n重复订单会按订单号更新，不会重复累计收益。",
         )
-
-    def _request_default_browser_c5_sync(self):
-        if not self.browser_bridge.is_running:
-            QMessageBox.warning(self, "浏览器同步", "本地浏览器连接服务未启动，请重启程序。")
-            return
-        task = self.browser_bridge.enqueue_task("c5")
-        if not task:
-            QMessageBox.warning(self, "浏览器同步", "无法创建 C5 读取任务。")
-            return
-        self.c5_sync_status.setText(
-            "已请求默认浏览器读取 C5 订单。请保持 C5 订单页打开；扩展最多 30 秒后会同步。"
-        )
-
-    def _on_browser_bridge_error(self, message):
-        logger.warning("[BrowserBridge] %s", message)
-        self._set_browser_bridge_controls_enabled(False)
-        self.c5_sync_status.setText(message)
-
-    def _on_browser_bridge_snapshot(self, payload):
-        """Import an explicitly captured default-browser page on the GUI thread."""
-        if payload.get("platform") != "c5":
-            self.c5_sync_status.setText("已收到订单页。该平台的解析器尚未接入。")
-            return
-        if payload.get("capture_error"):
-            self.c5_sync_status.setText(f"C5 浏览器读取失败：{payload['capture_error']}")
-            return
-        if payload.get("challenge_detected"):
-            self.c5_sync_status.setText(
-                "C5 页面需要安全验证。请在已打开的默认浏览器页面中手动完成验证，然后再点击同步。"
-            )
-            return
-
-        page_text = payload.get("page_text", "")
-        snapshot_dir = get_private_path("browser-snapshots")
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
-        snapshot_path = snapshot_dir / f"c5-extension-{datetime.now():%Y%m%d-%H%M%S}.txt"
-        snapshot_path.write_text(page_text, encoding="utf-8")
-        orders = parse_c5_rent_text(page_text)
-        if orders:
-            self.db.upsert_rental_orders("C5GAME", orders)
-            self.load_data()
-            self.c5_sync_status.setText(
-                f"已从默认浏览器同步 {len(orders)} 条 C5 订单；已按磨损值关联资产。"
-            )
-            logger.info("[C5 BrowserBridge] 同步 %s 条订单，快照：%s", len(orders), snapshot_path)
-            return
-        self.c5_sync_status.setText(
-            "C5 页面已读取，但未解析到订单。已保存私密文本快照，可用于调整解析规则。"
-        )
-
-    def _run_c5_task(self, task):
-        if self._c5_thread and self._c5_thread.isRunning():
-            QMessageBox.information(self, "C5", "C5 浏览器任务正在运行，请先完成或关闭浏览器窗口。")
-            return
-
-        self._set_c5_controls_enabled(False)
-        if task == "login":
-            self.c5_sync_status.setText("C5 浏览器已打开：请手动登录、完成验证码，然后关闭浏览器窗口。")
-        else:
-            self.c5_sync_status.setText("正在读取 C5 出租订单（本次手动请求）…")
-
-        self._c5_thread = QThread()
-        self._c5_worker = C5RentalWorker()
-        self._c5_worker.moveToThread(self._c5_thread)
-        self._c5_thread.started.connect(
-            self._c5_worker.open_login if task == "login" else self._c5_worker.sync_orders
-        )
-        self._c5_worker.finished.connect(self._on_c5_task_finished)
-        self._c5_worker.error.connect(self._on_c5_task_error)
-        self._c5_worker.finished.connect(self._c5_thread.quit)
-        self._c5_worker.error.connect(self._c5_thread.quit)
-        self._c5_worker.finished.connect(self._c5_worker.deleteLater)
-        self._c5_worker.error.connect(self._c5_worker.deleteLater)
-        self._c5_thread.finished.connect(self._c5_thread.deleteLater)
-        self._c5_thread.finished.connect(self._cleanup_c5_task)
-        self._c5_thread.start()
-
-    def _on_c5_task_finished(self, payload):
-        task, result = payload
-        if task == "login":
-            self.c5_sync_status.setText("C5 登录窗口已关闭；现在可以点击“同步 C5 出租订单”。")
-            return
-
-        if not result.get("success"):
-            self.c5_sync_status.setText(f"C5 同步失败：{result.get('error', '未知错误')}")
-            return
-        if result.get("needs_login"):
-            self.c5_sync_status.setText("C5 登录状态无效：请先点击“C5 登录”并在窗口中完成登录。")
-            return
-
-        orders = result.get("orders", [])
-        self.db.upsert_rental_orders("C5GAME", orders)
-        self._refresh_orders_table()
-        self.load_data()
-        snapshot_path = result.get("snapshot_path", "")
-        self.c5_sync_status.setText(f"C5 已同步 {len(orders)} 条订单；原始页面快照已私有保存。")
-        logger.info("[C5] 手动同步 %s 条订单，页面快照：%s", len(orders), snapshot_path)
-        if not orders:
-            QMessageBox.information(
-                self,
-                "C5 同步完成",
-                "页面已读取，但未解析到订单。请保留登录状态，并把日志中的私有页面快照告知我以校准解析规则。",
-            )
-
-    def _on_c5_task_error(self, message):
-        logger.warning("[C5] %s", message)
-        self.c5_sync_status.setText(message)
-        QMessageBox.warning(self, "C5", message)
-
-    def _cleanup_c5_task(self):
-        self._c5_thread = None
-        self._c5_worker = None
-        self._set_c5_controls_enabled(True)
 
     def init_market_tab(self):
         layout = QVBoxLayout(self.tab_market)
@@ -1982,8 +1870,20 @@ class CS2ManagerApp(QMainWindow):
         except ValueError:
             return 0.0
 
+    @staticmethod
+    def _net_amount(gross_amount, fee_rate) -> float:
+        """Multiply currency values in decimal form before rendering/summing them."""
+        try:
+            gross = Decimal(str(gross_amount))
+            fee = Decimal(str(fee_rate))
+            return float(gross * (Decimal("1") - fee))
+        except (InvalidOperation, TypeError, ValueError):
+            return 0.0
+
     def _order_net_income(self, order, history) -> float:
-        return self._order_gross_income(order) * (1 - self._order_fee_rate(order, history))
+        return self._net_amount(
+            self._order_gross_income(order), self._order_fee_rate(order, history)
+        )
 
     def _total_net_income(self, history) -> float:
         return sum(self._order_net_income(order, history) for order in history)
@@ -2001,28 +1901,31 @@ class CS2ManagerApp(QMainWindow):
             return f"剩 {days}天 {hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"剩 {hours:02d}:{minutes:02d}:{seconds:02d}"
 
-    def _rental_status_display(self, latest_order, fallback_status):
-        """Build a live status cell for the most recent rental order."""
+    def _rental_status_display(self, latest_order, history, fallback_status):
+        """Build a live status cell for the latest order of one physical item."""
         order_status = str(latest_order.get("status", "") or "").strip()
+        rental_label = "已转租" if len(history) > 1 else "已出租"
         if order_status != "租赁中":
+            if order_status in {"已转交", "已完成"}:
+                return f"{rental_label} · {order_status}", None
             return order_status or fallback_status, None
 
         end_time = _parse_rental_datetime(latest_order.get("return_time"))
         if end_time <= datetime.min:
-            return "租赁中 · 归还时间未知", QColor("#fab387")
+            return f"{rental_label} · 归还时间未知", QColor("#fab387")
 
         remaining_seconds = (end_time - datetime.now()).total_seconds()
         color = QColor("#f38ba8") if remaining_seconds <= 12 * 60 * 60 else QColor("#a6e3a1")
-        return f"租赁中 · {self._countdown_text(end_time)}", color
+        return f"{rental_label} · {self._countdown_text(end_time)}", color
 
     def _update_dashboard_rental_countdowns(self):
         """Update only visible rental countdown cells once a second."""
         for state in self._dashboard_rental_rows.values():
-            status_item = self.table.item(state["row"], 7)
+            status_item = self.table.item(state["row"], 6)
             if status_item is None:
                 continue
             status_text, status_color = self._rental_status_display(
-                state["latest_order"], state["fallback_status"]
+                state["latest_order"], state["history"], state["fallback_status"]
             )
             status_item.setText(status_text)
             if status_color is not None:
@@ -2075,49 +1978,46 @@ class CS2ManagerApp(QMainWindow):
             status_color = None
             rental_days = float(item.get("days", 0.0) or 0.0)
             daily_rent = float(item.get("rent", 0.0) or 0.0)
-            start_text = "—"
             net_income = float(item.get("income", 0.0) or 0.0)
             total_net_income = net_income
 
             if latest_order:
-                start = _parse_rental_datetime(latest_order.get("start_time"))
                 end = _parse_rental_datetime(latest_order.get("return_time"))
                 rental_days = self._order_rental_days(latest_order)
                 daily_rent = self._order_daily_rent(latest_order)
                 net_income = self._order_net_income(latest_order, history)
                 total_net_income = self._total_net_income(history)
-                start_text = latest_order.get("start_time") or "—"
                 order_status = latest_order.get("status", "")
+                status_text, status_color = self._rental_status_display(
+                    latest_order, history, status_text
+                )
                 if order_status == "租赁中":
-                    status_text, status_color = self._rental_status_display(
-                        latest_order, status_text
-                    )
                     if end <= datetime.min or end > datetime.now():
                         rented_count += 1
-                        daily_rent_net = daily_rent * (1 - self._order_fee_rate(latest_order, history))
+                        daily_rent_net = self._net_amount(
+                            daily_rent, self._order_fee_rate(latest_order, history)
+                        )
                         daily_rent_total += daily_rent_net
-                else:
-                    status_text = order_status or status_text
 
             self.table.insertRow(row)
             values = [
-                str(item["id"]), item["name"], item.get("phase", "-"), item.get("pattern", "-"),
-                item.get("float_val", ""), f"¥ {float(item.get('cost', 0.0) or 0.0):.2f}",
-                item.get("platform", ""), status_text,
+                str(item["id"]), item["name"], item.get("phase", "-"), item.get("float_val", ""),
+                f"¥ {float(item.get('cost', 0.0) or 0.0):.2f}", item.get("platform", ""), status_text,
                 f"{rental_days:g} 天" if rental_days > 0 else "—",
                 _money_text(daily_rent) if daily_rent > 0 else "—",
-                start_text, _money_text(net_income) if net_income > 0 else "—",
+                _money_text(net_income) if net_income > 0 else "—",
                 _money_text(total_net_income) if total_net_income > 0 else "—",
             ]
             for column, value in enumerate(values):
                 table_item = QTableWidgetItem(str(value))
-                if column == 7 and status_color:
+                if column == 6 and status_color:
                     table_item.setForeground(status_color)
                 self.table.setItem(row, column, table_item)
             if latest_order and str(latest_order.get("status", "") or "").strip() == "租赁中":
                 self._dashboard_rental_rows[item["id"]] = {
                     "row": row,
                     "latest_order": latest_order,
+                    "history": history,
                     "fallback_status": item.get("status", "在库"),
                 }
             row += 1
@@ -2284,13 +2184,6 @@ class CS2ManagerApp(QMainWindow):
             self.timer.start(mins * 60 * 1000)
         else:
             self.timer.stop()
-
-    def closeEvent(self, event):  # noqa: N802
-        bridge = getattr(self, "browser_bridge", None)
-        if bridge is not None:
-            bridge.stop()
-        super().closeEvent(event)
-
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
