@@ -8,11 +8,11 @@
 
 | 标签页 | 已实现的功能 | 说明 |
 | --- | --- | --- |
-| 资产与出租管理 | 饰品增删改、资产统计、C5 默认浏览器同步、订单历史、到期倒计时 | C5 是唯一已接入的订单读取平台 |
+| 资产与出租管理 | 饰品增删改、资产统计、C5 默认浏览器同步、C5/ECO/IGXE 剪贴板导入、订单历史、到期倒计时 | 三个平台都可手动复制订单文本导入；浏览器扩展自动读取仅支持 C5 |
 | 一览式大盘行情 | CSQAQ 售价/租金聚合、ECO 最低日租、平台跳转、行情观察列表与缓存 | 不直接请求 IGXE 行情接口 |
 | 系统与费率设置 | 保存 CSQAQ Token、ECO Partner ID/RSA 私钥、资产页本地刷新间隔与费率 | 设置只写入私密数据目录 |
 
-目前**没有**自动登录、验证码绕过、AI OCR 录单、ECO/IGXE 订单网页读取，也没有启用单独的“出租订单”标签页。`main.py` 中保留的旧订单页代码未挂到界面，不应视为已启用功能。
+目前**没有**自动登录、验证码绕过、AI OCR 录单，也没有 ECO/IGXE 的浏览器扩展自动读取。ECO、IGXE 固定格式的订单文字可通过剪贴板导入；单独的“出租订单”标签页未挂到界面，`main.py` 中相关旧代码不应视为已启用功能。
 
 ## 2. 快速运行与换电脑
 
@@ -89,11 +89,12 @@ git push origin main
 
 ### `rental_orders` 表
 
-主要字段：`platform`、`order_no`、`item_name`、`float_val`、`income`、`start_time`、`return_time`、`status`、`raw_text`、`synced_at`。
+主要字段：`platform`、`order_no`、`item_name`、`float_val`、`daily_rent`、`rental_days`、`deposit`、`income`、`start_time`、`return_time`、`status`、`raw_text`、`synced_at`。
 
 - 唯一键为 `(platform, order_no)`；同一订单再次同步会更新而不会重复插入。
 - 订单与资产依靠**标准化后的磨损值**匹配；资产页只展示同一磨损的最新订单。
-- 同一磨损的旧订单在“订单历史”中显示，并按起租时间标记为“首次出租”或“转租”。
+- 同一磨损的旧订单一直保存在“订单历史”中；资产页只取起租时间最新的一笔订单。
+- 资产页的“日租（原价）”不扣费；“本单净收入”和“累计净收益”按该订单在同一磨损历史中的首次/后续顺序，使用对应平台的首次出租/转租费率计算。
 - 双击资产行可以打开订单历史与单条详情。
 - 订单同步不会自动修改库存资产的 `status`，避免因为网页解析变化错误改动资产。
 
@@ -117,6 +118,20 @@ git push origin main
 | C5 | `https://www.c5game.com/user/rent?actag=2` |
 | ECO | `https://www.ecosteam.cn/html/person/rentrecordlist.html` |
 | IGXE | `https://www.igxe.cn/lease/seller-order-list` |
+
+### 剪贴板订单导入（C5、ECO、IGXE）
+
+代码位置：`modules/rental_order_parsers.py`、`modules/c5_rental_browser.py`、`modules/db_manager.py`。
+
+这是三个平台目前共同、最稳定的录入方式：在订单页全选并复制文本，回到“资产与出租管理”，点击“从剪贴板导入订单”。导入器按照文字特征识别平台，一次导入一个平台，保存逻辑如下：
+
+| 平台 | 识别特征 | 导入字段 |
+| --- | --- | --- |
+| C5 | `订单号`、`查看详情` | 订单号、起止时间、饰品名、磨损、订单收入、状态；列表未给出原始日租时按整天租期反算 |
+| ECO | `订单编号`、`前归还` 或 `ECO_` | 订单号、磨损、原始日租、长/短租天数、押金、归还时间、状态 |
+| IGXE | `归还截止时间`、`igxe.cn/lease/trade` | 交易 ID、磨损、原始日租、出租天数、押金、订单金额、归还时间 |
+
+`rental_orders` 使用 `(platform, order_no)` 唯一键，因此再次复制同一页面只更新订单而不会重复计算。资产与订单以浮点数标准化到 12 位小数后的磨损值关联；同一磨损就是同一实物的连续出租链。任何解析失败的订单都不会写入数据库，保留复制文本即可据此调整规则。
 
 
 ### C5 默认浏览器同步（当前推荐方式）
@@ -228,7 +243,8 @@ private-data/schema-source/skins_not_grouped.zh-CN.json
 | `modules/eco_client.py` | ECO 签名请求与快照获取 |
 | `modules/eco_market_cache.py` | ECO 全量快照 SQLite 缓存、相位租金回退 |
 | `modules/cs2_item_schema.py` | ByMykel 本地 JSON 映射及索引重建 |
-| `modules/c5_rental_browser.py` | C5 可见浏览器、页面快照与文本解析 |
+| `modules/c5_rental_browser.py` | C5 可见浏览器、页面快照与 C5 文本解析 |
+| `modules/rental_order_parsers.py` | C5/ECO/IGXE 剪贴板格式识别与结构化解析 |
 | `modules/browser_bridge.py` | 仅监听本机的扩展配对、同步任务和订单页文本接收 |
 | `browser-extension/` | Chrome/Edge Manifest V3 扩展，仅读取明确授权的订单页文本 |
 | `modules/image_cache.py` | 行情观察列表和图片缓存 |
@@ -255,6 +271,10 @@ private-data/schema-source/skins_not_grouped.zh-CN.json
 ### C5 同步为空或提示未登录
 
 先点击“C5 登录”，在打开的独立窗口完成登录/验证码并关闭。再手动同步。若页面已读到但解析订单数为 0，保留最新 `browser-snapshots/c5-rent-*.html`，根据其可见文本更新解析器。
+
+### 剪贴板导入后没有关联资产或日租为 0
+
+先确认资产记录的磨损值与订单页的磨损一致；程序按数值标准化后的 12 位小数比较，不按中文名称猜测。C5 列表通常只给订单实际收入而不单列日租，因此程序按订单起止时间的整天数反算；ECO、IGXE 会优先保存订单页写明的原始日租。若平台改版导致“未解析到有效订单”，不要反复粘贴，先保存原始文本并据此更新 `rental_order_parsers.py`。
 
 ### 市场页没有刷新或显示旧数据
 

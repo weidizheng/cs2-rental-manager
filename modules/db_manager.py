@@ -117,6 +117,14 @@ class DBManager:
                 "igxe_relet_fee",
                 saved_configs.get("igxe_relet_fee", "0.05"),
             ),
+            (
+                "eco_first_fee",
+                saved_configs.get("eco_first_fee", "0.10"),
+            ),
+            (
+                "eco_relet_fee",
+                saved_configs.get("eco_relet_fee", "0.05"),
+            ),
         ]
         for k, v in default_configs:
             cursor.execute(
@@ -134,6 +142,9 @@ class DBManager:
             item_name TEXT DEFAULT '',
             float_val TEXT DEFAULT '',
             income REAL DEFAULT 0.0,
+            daily_rent REAL DEFAULT 0.0,
+            rental_days REAL DEFAULT 0.0,
+            deposit REAL DEFAULT 0.0,
             start_time TEXT DEFAULT '',
             return_time TEXT DEFAULT '',
             status TEXT DEFAULT '',
@@ -142,6 +153,17 @@ class DBManager:
             UNIQUE(platform, order_no)
         )
         """)
+
+        # Migrate databases created before structured clipboard imports.
+        for column, definition in (
+            ("daily_rent", "REAL DEFAULT 0.0"),
+            ("rental_days", "REAL DEFAULT 0.0"),
+            ("deposit", "REAL DEFAULT 0.0"),
+        ):
+            try:
+                cursor.execute(f"ALTER TABLE rental_orders ADD COLUMN {column} {definition}")
+            except sqlite3.OperationalError:
+                pass
 
         # 3. 饰品初始化
         cursor.execute("SELECT COUNT(*) FROM items")
@@ -347,13 +369,16 @@ class DBManager:
             cursor.execute(
                 """
                 INSERT INTO rental_orders (
-                    platform, order_no, item_name, float_val, income,
+                    platform, order_no, item_name, float_val, income, daily_rent, rental_days, deposit,
                     start_time, return_time, status, raw_text, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(platform, order_no) DO UPDATE SET
                     item_name=excluded.item_name,
                     float_val=excluded.float_val,
                     income=excluded.income,
+                    daily_rent=excluded.daily_rent,
+                    rental_days=excluded.rental_days,
+                    deposit=excluded.deposit,
                     start_time=excluded.start_time,
                     return_time=excluded.return_time,
                     status=excluded.status,
@@ -366,6 +391,9 @@ class DBManager:
                     order.get("item_name", ""),
                     order.get("float_val", ""),
                     float(order.get("income", 0.0) or 0.0),
+                    float(order.get("daily_rent", 0.0) or 0.0),
+                    float(order.get("rental_days", 0.0) or 0.0),
+                    float(order.get("deposit", 0.0) or 0.0),
                     order.get("start_time", ""),
                     order.get("return_time", ""),
                     order.get("status", ""),
@@ -381,7 +409,7 @@ class DBManager:
         if platform:
             cursor.execute(
                 """
-                SELECT platform, order_no, item_name, float_val, income,
+                SELECT platform, order_no, item_name, float_val, income, daily_rent, rental_days, deposit,
                        start_time, return_time, status, synced_at
                 FROM rental_orders WHERE platform=?
                 ORDER BY synced_at DESC, id DESC
@@ -390,12 +418,12 @@ class DBManager:
             )
         else:
             cursor.execute("""
-                SELECT platform, order_no, item_name, float_val, income,
+                SELECT platform, order_no, item_name, float_val, income, daily_rent, rental_days, deposit,
                        start_time, return_time, status, synced_at
                 FROM rental_orders ORDER BY synced_at DESC, id DESC
             """)
         columns = (
-            "platform", "order_no", "item_name", "float_val", "income",
+            "platform", "order_no", "item_name", "float_val", "income", "daily_rent", "rental_days", "deposit",
             "start_time", "return_time", "status", "synced_at",
         )
         return [dict(zip(columns, row)) for row in cursor.fetchall()]

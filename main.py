@@ -4,6 +4,7 @@ import sys
 import logging
 import time
 import secrets
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from datetime import datetime
 from urllib.parse import quote
 from PySide6.QtWidgets import (
@@ -26,6 +27,7 @@ from modules.cs2_item_schema import CS2ItemSchema
 from modules.browser_bridge import BrowserBridgeServer
 from modules.c5_rental_browser import parse_c5_rent_text
 from modules.paths import get_private_path
+from modules.rental_order_parsers import parse_rental_clipboard
 
 
 ORDER_PAGE_URLS = {
@@ -72,7 +74,6 @@ class ItemEditDialog(QDialog):
         self.days_in = QLineEdit(str(self.item_data.get("days", "0")))
         self.expire_in = QLineEdit(str(self.item_data.get("expire_hours", "999.0")))
         self.income_in = QLineEdit(str(self.item_data.get("income", "0.00")))
-        self.note_in = QLineEdit(self.item_data.get("note", ""))
 
         layout.addRow("饰品完整名称:", self.name_in)
         layout.addRow("英文 MarketHashName:", self.mhn_in)
@@ -86,7 +87,6 @@ class ItemEditDialog(QDialog):
         layout.addRow("累计出租天数:", self.days_in)
         layout.addRow("到期剩余小时数:", self.expire_in)
         layout.addRow("累计已收收益 (元):", self.income_in)
-        layout.addRow("备注信息:", self.note_in)
 
         save_btn = QPushButton("💾 保存并自动同步至 JSON")
         save_btn.setStyleSheet("background-color: #89b4fa; color: #11111b; font-weight: bold; padding: 8px; border-radius: 6px;")
@@ -190,7 +190,9 @@ class ItemEditDialog(QDialog):
             "days": int(self.days_in.text() or 0),
             "expire_hours": float(self.expire_in.text() or 999.0),
             "income": float(self.income_in.text() or 0.0),
-            "note": self.note_in.text().strip()
+            # Notes are no longer edited in the UI, but legacy data remains
+            # intact so an ordinary asset edit never discards user records.
+            "note": self.item_data.get("note", "")
         }
 
 
@@ -208,6 +210,15 @@ def _parse_rental_datetime(value) -> datetime:
         return datetime.min
 
 
+def _money_text(value) -> str:
+    """Format money with financial half-up rounding instead of float bankers rounding."""
+    try:
+        amount = Decimal(str(value)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal("0.00")
+    return f"¥ {amount:.2f}"
+
+
 class RentalHistoryDialog(QDialog):
     """Shows all manually imported orders for one physical float value."""
 
@@ -221,25 +232,26 @@ class RentalHistoryDialog(QDialog):
         layout.addWidget(QLabel("双击订单查看完整日期、收入和同步来源。"))
 
         self.table = QTableWidget()
-        self.table.setColumnCount(7)
+        self.table.setColumnCount(8)
         self.table.setHorizontalHeaderLabels([
-            "类型", "平台", "状态", "出租时间", "归还时间", "实际收入", "日租估算",
+            "平台", "状态", "出租时间", "归还时间", "租期", "日租（原价）", "订单金额", "净收入",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         for index, order in enumerate(self.orders):
             self.table.insertRow(index)
-            start = _parse_rental_datetime(order.get("start_time"))
-            end = _parse_rental_datetime(order.get("return_time"))
             income = float(order.get("income", 0.0) or 0.0)
-            duration = (end - start).total_seconds() / 86400 if end > start else 0.0
-            daily = income / duration if duration > 0 else 0.0
+            rental_days = float(order.get("rental_days", 0.0) or 0.0)
+            daily = float(order.get("daily_rent", 0.0) or 0.0)
+            if daily <= 0 and rental_days > 0:
+                daily = income / rental_days
             values = [
-                "首次出租" if index == 0 else "转租",
                 order.get("platform", ""), order.get("status", ""),
                 order.get("start_time", ""), order.get("return_time", ""),
-                f"¥ {income:.2f}", f"¥ {daily:.2f}" if daily > 0 else "—",
+                f"{rental_days:g} 天" if rental_days > 0 else "—",
+                _money_text(daily) if daily > 0 else "—",
+                _money_text(income), _money_text(order.get("net_income", income) or 0.0),
             ]
             for column, value in enumerate(values):
                 self.table.setItem(index, column, QTableWidgetItem(str(value)))
@@ -254,18 +266,19 @@ class RentalHistoryDialog(QDialog):
         if not index.isValid() or index.row() >= len(self.orders):
             return
         order = self.orders[index.row()]
-        order_type = "首次出租" if index.row() == 0 else "转租"
         QMessageBox.information(
             self,
             "订单详情",
             "\n".join([
-                f"类型：{order_type}",
                 f"平台：{order.get('platform', '')}",
                 f"订单号：{order.get('order_no', '')}",
                 f"状态：{order.get('status', '')}",
                 f"出租：{order.get('start_time', '')}",
                 f"归还：{order.get('return_time', '')}",
-                f"实际收入：¥ {float(order.get('income', 0.0) or 0.0):.2f}",
+                f"租期：{float(order.get('rental_days', 0.0) or 0.0):g} 天",
+                f"日租（原价）：{_money_text(order.get('daily_rent', 0.0) or 0.0)}",
+                f"订单金额：{_money_text(order.get('income', 0.0) or 0.0)}",
+                f"净收入：{_money_text(order.get('net_income', order.get('income', 0.0)) or 0.0)}",
             ]),
         )
 
@@ -442,6 +455,10 @@ class CS2ManagerApp(QMainWindow):
         self.browser_token_btn.setObjectName("primaryBtn")
         self.browser_token_btn.setToolTip("首次安装 browser-extension 后，将令牌粘贴到扩展弹窗。")
         self.browser_token_btn.clicked.connect(self._copy_browser_bridge_token)
+        self.clipboard_import_btn = QPushButton("📋 从剪贴板导入订单")
+        self.clipboard_import_btn.setObjectName("successBtn")
+        self.clipboard_import_btn.setToolTip("复制 C5、ECO 或 IGXE 订单页文本后点击，程序会自动识别平台。")
+        self.clipboard_import_btn.clicked.connect(self._import_rental_orders_from_clipboard)
 
         self.c5_login_btn = QPushButton("C5 隔离登录（备用）")
         self.c5_login_btn.setObjectName("primaryBtn")
@@ -459,6 +476,7 @@ class CS2ManagerApp(QMainWindow):
         browser_layout.addWidget(open_igxe_btn)
         browser_layout.addWidget(self.browser_c5_sync_btn)
         browser_layout.addWidget(self.browser_token_btn)
+        browser_layout.addWidget(self.clipboard_import_btn)
         browser_layout.addStretch()
         fallback_layout = QHBoxLayout()
         fallback_layout.addWidget(self.c5_login_btn)
@@ -508,18 +526,14 @@ class CS2ManagerApp(QMainWindow):
         self.table = QTableWidget()
         self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
-            "ID", "饰品名称", "相位", "模板", "磨损度", "成本(元)",
-            "平台", "状态/倒计时", "日租金", "已租天数", "累计收益", "备注"
-        ])
-
-        self.table.setHorizontalHeaderLabels([
             "ID", "饰品名称", "相位", "模板", "磨损度", "成本(元)", "平台",
-            "状态 / 倒计时", "日租估算", "最新出租日期", "订单收入", "订单类型", "备注",
+            "状态 / 倒计时", "租期天数", "日租（原价）", "最新出租日期", "本单净收入", "累计净收益",
         ])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(11, QHeaderView.ResizeToContents)
+        for column in range(8, 13):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
@@ -624,6 +638,30 @@ class CS2ManagerApp(QMainWindow):
         QApplication.clipboard().setText(self.browser_bridge_token)
         self.c5_sync_status.setText(
             "扩展配对令牌已复制。在 Chrome 加载 browser-extension 后，粘贴到扩展弹窗并保存。"
+        )
+
+    def _import_rental_orders_from_clipboard(self):
+        text = QApplication.clipboard().text().strip()
+        if not text:
+            QMessageBox.information(self, "剪贴板导入", "剪贴板为空。请先从 C5、ECO 或 IGXE 订单页复制文本。")
+            return
+        try:
+            platform, orders = parse_rental_clipboard(text)
+        except ValueError as exc:
+            QMessageBox.warning(self, "剪贴板导入", str(exc))
+            return
+        if not orders:
+            QMessageBox.warning(self, "剪贴板导入", f"已识别 {platform}，但未解析到有效订单。")
+            return
+        self.db.upsert_rental_orders(platform, orders)
+        self.load_data()
+        self.c5_sync_status.setText(
+            f"已从剪贴板导入 {len(orders)} 条 {platform} 订单；已按唯一磨损值关联资产。"
+        )
+        QMessageBox.information(
+            self,
+            "剪贴板导入完成",
+            f"已导入 {len(orders)} 条 {platform} 订单。\n重复订单会按订单号更新，不会重复累计收益。",
         )
 
     def _request_default_browser_c5_sync(self):
@@ -1697,6 +1735,24 @@ class CS2ManagerApp(QMainWindow):
         form_time.addRow("自动刷新频率:", self.cfg_interval)
         layout.addWidget(group_time)
 
+        group_fee = QGroupBox("🧾 出租手续费率（用于订单净收益与年化计算）")
+        form_fee = QFormLayout(group_fee)
+        self.cfg_fee_inputs = {}
+        fee_fields = (
+            ("c5_first_fee", "C5 首次出租费率:"),
+            ("c5_relet_fee", "C5 转租费率:"),
+            ("eco_first_fee", "ECO 首次出租费率:"),
+            ("eco_relet_fee", "ECO 转租费率:"),
+            ("igxe_first_fee", "IGXE 首次出租费率:"),
+            ("igxe_relet_fee", "IGXE 转租费率:"),
+        )
+        for config_key, label in fee_fields:
+            field = QLineEdit(self.db.get_config(config_key))
+            field.setPlaceholderText("例如 0.15 = 15%")
+            self.cfg_fee_inputs[config_key] = field
+            form_fee.addRow(label, field)
+        layout.addWidget(group_fee)
+
         save_btn = QPushButton("💾 保存全部设置")
         save_btn.setObjectName("primaryBtn")
         save_btn.clicked.connect(self.save_settings)
@@ -1872,6 +1928,67 @@ class CS2ManagerApp(QMainWindow):
         return history[-1], history
 
     @staticmethod
+    def _order_number(value) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _order_rental_days(self, order) -> float:
+        stored_days = self._order_number(order.get("rental_days"))
+        if stored_days > 0:
+            return stored_days
+        start = _parse_rental_datetime(order.get("start_time"))
+        end = _parse_rental_datetime(order.get("return_time"))
+        if end <= start:
+            return 0.0
+        duration = (end - start).total_seconds() / 86400
+        # Legacy C5 rows were saved before ``rental_days`` existed.  Its page
+        # only provides timestamps, so render their duration consistently with
+        # the new C5 clipboard parser.
+        if order.get("platform") == "C5GAME":
+            return float(max(0, round(duration)))
+        return max(0.0, duration)
+
+    def _order_daily_rent(self, order) -> float:
+        stored_daily = self._order_number(order.get("daily_rent"))
+        if stored_daily > 0:
+            return stored_daily
+        days = self._order_rental_days(order)
+        gross_income = self._order_number(order.get("income"))
+        return gross_income / days if gross_income > 0 and days > 0 else 0.0
+
+    def _order_gross_income(self, order) -> float:
+        gross_income = self._order_number(order.get("income"))
+        if gross_income > 0:
+            return gross_income
+        return self._order_daily_rent(order) * self._order_rental_days(order)
+
+    def _order_fee_rate(self, order, history) -> float:
+        platform_prefix = {
+            "C5GAME": "c5",
+            "ECOSteam": "eco",
+            "IGXE": "igxe",
+        }.get(order.get("platform", ""), "")
+        if not platform_prefix:
+            return 0.0
+        order_key = (order.get("platform", ""), order.get("order_no", ""))
+        first_key = (
+            history[0].get("platform", ""), history[0].get("order_no", "")
+        ) if history else ("", "")
+        fee_kind = "first" if order_key == first_key else "relet"
+        try:
+            return min(0.999, max(0.0, float(self.db.get_config(f"{platform_prefix}_{fee_kind}_fee") or 0.0)))
+        except ValueError:
+            return 0.0
+
+    def _order_net_income(self, order, history) -> float:
+        return self._order_gross_income(order) * (1 - self._order_fee_rate(order, history))
+
+    def _total_net_income(self, history) -> float:
+        return sum(self._order_net_income(order, history) for order in history)
+
+    @staticmethod
     def _countdown_text(end_time):
         remaining = end_time - datetime.now()
         if remaining.total_seconds() <= 0:
@@ -1927,7 +2044,16 @@ class CS2ManagerApp(QMainWindow):
         if not history:
             QMessageBox.information(self, "订单历史", "该磨损度尚未同步到出租订单。")
             return
-        RentalHistoryDialog(item["name"], item.get("float_val", ""), history, self).exec()
+        display_history = []
+        for order in history:
+            display_order = dict(order)
+            # Older browser-imported rows predate the structured fields.  Fill
+            # their derived values here so the history dialog remains useful.
+            display_order["rental_days"] = self._order_rental_days(order)
+            display_order["daily_rent"] = self._order_daily_rent(order)
+            display_order["net_income"] = self._order_net_income(order, history)
+            display_history.append(display_order)
+        RentalHistoryDialog(item["name"], item.get("float_val", ""), display_history, self).exec()
 
     def load_data(self):
         """Render assets using the newest imported order for each float value."""
@@ -1936,7 +2062,7 @@ class CS2ManagerApp(QMainWindow):
         self.table.setRowCount(0)
         self._dashboard_rental_rows = {}
         total_cost = 0.0
-        daily_rent = 0.0
+        daily_rent_total = 0.0
         rented_count = 0
 
         row = 0
@@ -1947,26 +2073,29 @@ class CS2ManagerApp(QMainWindow):
             latest_order, history = self._latest_rental_for_item(item)
             status_text = item.get("status", "在库")
             status_color = None
-            daily_estimate = float(item.get("rent", 0.0) or 0.0)
+            rental_days = float(item.get("days", 0.0) or 0.0)
+            daily_rent = float(item.get("rent", 0.0) or 0.0)
             start_text = "—"
-            income_text = float(item.get("income", 0.0) or 0.0)
-            order_type = "手动"
+            net_income = float(item.get("income", 0.0) or 0.0)
+            total_net_income = net_income
 
             if latest_order:
                 start = _parse_rental_datetime(latest_order.get("start_time"))
                 end = _parse_rental_datetime(latest_order.get("return_time"))
-                income_text = float(latest_order.get("income", 0.0) or 0.0)
-                duration_days = (end - start).total_seconds() / 86400 if end > start else 0.0
-                daily_estimate = income_text / duration_days if duration_days > 0 else 0.0
+                rental_days = self._order_rental_days(latest_order)
+                daily_rent = self._order_daily_rent(latest_order)
+                net_income = self._order_net_income(latest_order, history)
+                total_net_income = self._total_net_income(history)
                 start_text = latest_order.get("start_time") or "—"
-                order_type = "首次出租" if len(history) == 1 else "转租"
                 order_status = latest_order.get("status", "")
                 if order_status == "租赁中":
-                    rented_count += 1
-                    daily_rent += daily_estimate
                     status_text, status_color = self._rental_status_display(
                         latest_order, status_text
                     )
+                    if end <= datetime.min or end > datetime.now():
+                        rented_count += 1
+                        daily_rent_net = daily_rent * (1 - self._order_fee_rate(latest_order, history))
+                        daily_rent_total += daily_rent_net
                 else:
                     status_text = order_status or status_text
 
@@ -1975,9 +2104,10 @@ class CS2ManagerApp(QMainWindow):
                 str(item["id"]), item["name"], item.get("phase", "-"), item.get("pattern", "-"),
                 item.get("float_val", ""), f"¥ {float(item.get('cost', 0.0) or 0.0):.2f}",
                 item.get("platform", ""), status_text,
-                f"¥ {daily_estimate:.2f}" if daily_estimate > 0 else "—",
-                start_text, f"¥ {income_text:.2f}" if income_text > 0 else "—",
-                order_type, item.get("note", ""),
+                f"{rental_days:g} 天" if rental_days > 0 else "—",
+                _money_text(daily_rent) if daily_rent > 0 else "—",
+                start_text, _money_text(net_income) if net_income > 0 else "—",
+                _money_text(total_net_income) if total_net_income > 0 else "—",
             ]
             for column, value in enumerate(values):
                 table_item = QTableWidgetItem(str(value))
@@ -1992,9 +2122,9 @@ class CS2ManagerApp(QMainWindow):
                 }
             row += 1
 
-        annual_rate = (daily_rent * 365 / total_cost * 100) if total_cost > 0 else 0.0
+        annual_rate = (daily_rent_total * 365 / total_cost * 100) if total_cost > 0 else 0.0
         self.card_cost.findChildren(QLabel)[1].setText(f"¥ {total_cost:,.2f}")
-        self.card_income.findChildren(QLabel)[1].setText(f"¥ {daily_rent:.2f}")
+        self.card_income.findChildren(QLabel)[1].setText(_money_text(daily_rent_total))
         self.card_rented.findChildren(QLabel)[1].setText(f"{rented_count} / {len(self.current_items)} 件")
         self.card_rate.findChildren(QLabel)[1].setText(f"{annual_rate:.2f}%")
         self.lbl_last_update.setText(f"最后更新：{QTime.currentTime().toString('HH:mm:ss')}")
@@ -2129,10 +2259,22 @@ class CS2ManagerApp(QMainWindow):
         self.db.save_config("eco_partner_id", partner_id)
         self.db.save_config("eco_rsa_key", rsa_key)
 
+        for config_key, field in self.cfg_fee_inputs.items():
+            try:
+                fee_rate = float(field.text().strip())
+            except ValueError:
+                QMessageBox.warning(self, "费率校验", f"{config_key} 必须是 0 到 1 之间的小数，例如 0.15。")
+                return
+            if not 0 <= fee_rate < 1:
+                QMessageBox.warning(self, "费率校验", f"{config_key} 必须介于 0 和 1 之间。")
+                return
+            self.db.save_config(config_key, f"{fee_rate:g}")
+
         int_val_map = {0: "0", 1: "5", 2: "15", 3: "30", 4: "60"}
         self.db.save_config("refresh_interval", int_val_map[self.cfg_interval.currentIndex()])
 
         self.update_timer_interval()
+        self.load_data()
         QMessageBox.information(self, "成功", "系统与 API 设置已成功保存在本地 DB！")
 
     def update_timer_interval(self):
