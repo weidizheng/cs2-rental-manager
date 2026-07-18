@@ -952,7 +952,7 @@ class CS2ManagerApp(QMainWindow):
         if platform == "igxe":
             item_id = entry.get("igxe_id") or detail.get("igxe_id")
             if item_id:
-                return f"https://www.igxe.cn/product/trade/730/{item_id}"
+                return f"https://www.igxe.cn/product/730/{item_id}?cur_page=6&sort_rule=1"
             return f"https://www.igxe.cn/market/csgo?keyword={quote(name)}" if name else ""
         if platform == "eco":
             item_id = entry.get("eco_id") or detail.get("eco_id")
