@@ -1,0 +1,27 @@
+# Local credentials and private operational data. Copy this one folder to
+# a private cloud location when moving to another computer; never commit it.
+private-data/
+
+# Legacy locations retained only to prevent accidental commits during migration.
+keys/
+data/
+logs/
+.env
+.env.*
+
+# Python build and test artifacts
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local tools and OS files
+.venv/
+venv/
+.idea/
+.vscode/
+*.log
+Thumbs.db
+Desktop.ini
