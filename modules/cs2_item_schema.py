@@ -32,6 +32,41 @@ def _canonical_name(value: str) -> str:
     return text
 
 
+def _search_text(value: str) -> str:
+    """Normalize human search terms without requiring a full market hash name."""
+    text = unicodedata.normalize("NFKC", value or "").lower()
+    text = text.replace("伽马", "伽玛")
+    text = re.sub(r"[\s|()（）★™_\-]+", "", text)
+    # Common English inputs become comparable to the Chinese local schema.
+    aliases = (
+        ("butterflyknife", "蝴蝶刀"),
+        ("butterfly", "蝴蝶刀"),
+        ("gammadoppler", "伽玛多普勒"),
+        ("gamma", "伽玛"),
+        ("doppler", "多普勒"),
+        ("factorynew", "崭新出厂"),
+        ("minimalwear", "略有磨损"),
+        ("fieldtested", "久经沙场"),
+    )
+    for source, target in aliases:
+        text = text.replace(source, target)
+    return text
+
+
+def _search_fragments(value: str) -> list[str]:
+    """Extract meaningful weapon/finish/wear fragments for unordered matching."""
+    raw_parts = re.split(r"[|()（）]", value or "")
+    fragments = []
+    for part in raw_parts:
+        normalized = _search_text(part)
+        if len(normalized) >= 2 and normalized not in fragments:
+            fragments.append(normalized)
+    full = _search_text(value)
+    if len(full) >= 2 and full not in fragments:
+        fragments.append(full)
+    return fragments
+
+
 def _source_metadata(path: Path) -> dict[str, int]:
     stat = path.stat()
     return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -60,6 +95,88 @@ class CS2ItemSchema:
             schema.by_zh_name.get(_canonical_name(display_name))
             or schema.by_market_hash_name.get(display_name.strip())
         )
+
+    @classmethod
+    def search(cls, query: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Find local schema records from partial Chinese or English user input.
+
+        Matching is deliberately local and read-only: the caller receives
+        candidates to show the user, rather than guessing one item and making
+        a remote price request with an incomplete name.
+        """
+        query_text = _search_text(query)
+        if len(query_text) < 2:
+            return []
+
+        exact = cls.lookup(query)
+        if exact:
+            return [exact]
+
+        schema = cls.get()
+        ranked: list[tuple[int, int, str, dict[str, Any]]] = []
+        seen_market_names = set()
+        for record in schema.by_zh_name.values():
+            market_hash_name = record.get("market_hash_name", "")
+            if not market_hash_name or market_hash_name in seen_market_names:
+                continue
+
+            zh_text = _search_text(record.get("name_zh", ""))
+            en_text = _search_text(market_hash_name)
+            # Do not let a generic "Doppler" substring turn a Gamma/Ruby/etc.
+            # request into a regular Doppler candidate.
+            required_qualifiers = ("伽玛", "红宝石", "蓝宝石", "绿宝石", "黑珍珠")
+            if any(
+                qualifier in query_text and qualifier not in zh_text and qualifier not in en_text
+                for qualifier in required_qualifiers
+            ):
+                continue
+            required_weapons = (
+                "蝴蝶刀", "m9刺刀", "刺刀", "折叠刀", "爪子刀", "弯刀", "短剑",
+                "鲍伊猎刀", "猎杀者匕首", "流浪者匕首", "骷髅匕首", "系绳匕首",
+                "求生匕首", "暗影双匕", "海豹短刀", "折刀",
+            )
+            if any(
+                weapon in query_text and weapon not in zh_text and weapon not in en_text
+                for weapon in required_weapons
+            ):
+                continue
+            fragments = _search_fragments(record.get("name_zh", ""))
+            fragments.extend(
+                fragment for fragment in _search_fragments(market_hash_name)
+                if fragment not in fragments
+            )
+
+            score = 0
+            if query_text in zh_text or query_text in en_text:
+                score += 100 + len(query_text)
+            matched_fragments = 0
+            for fragment in fragments:
+                if fragment == query_text:
+                    score += 80
+                    matched_fragments += 1
+                elif fragment in query_text:
+                    score += len(fragment) * 8
+                    matched_fragments += 1
+                elif query_text in fragment:
+                    score += len(query_text) * 2
+                    matched_fragments += 1
+
+            if score <= 0 or matched_fragments == 0:
+                continue
+            # Prefer normal variants when names are otherwise equally relevant.
+            stattrak_penalty = (
+                1
+                if "stattrak" not in query_text and "stattrak" in _search_text(record.get("name_zh", ""))
+                else 0
+            )
+            ranked.append((score, stattrak_penalty, record.get("name_zh", ""), record))
+            seen_market_names.add(market_hash_name)
+
+        ranked.sort(key=lambda row: (-row[0], row[1], row[2]))
+        records = [record for _score, _stattrak_penalty, _name, record in ranked]
+        if "stattrak" not in query_text:
+            records.sort(key=lambda record: "stattrak" in _search_text(record.get("name_zh", "")))
+        return records[:max(1, limit)]
 
     @classmethod
     def _load_or_build(cls) -> "CS2ItemSchema":

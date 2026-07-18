@@ -160,12 +160,14 @@ private-data/schema-source/skins_not_grouped.zh-CN.json
 
 映射找不到时，程序回退到已有英文 `market_hash_name`，最后才尝试旧的内置名称规则。新饰品或新手套优先通过更新两个源 JSON 解决，不要持续扩充旧规则表。
 
+`CS2ItemSchema.search()` 用于大盘的人类输入检索：会忽略 `★` 与空格，兼容“伽马/伽玛”、`Butterfly Knife` 等常见表达；它返回候选而不擅自猜测唯一物品。候选确认后才以其中完整的英文 `market_hash_name` 加入当前观察分类。
+
 ## 7. 行情页与接口实现
 
 ### 行情观察列表
 
 - 冷启动只读取 `market_cache.json`，不会主动发网络请求。
-- 可用 CSQAQ 搜索添加；可 Ctrl/Shift 多选后从观察列表移除，不会删除资产库存。
+- “搜索并添加”先用本地映射做模糊候选匹配，再由用户选择后加入当前分类；只有没有本地映射的完整英文 `market_hash_name` 才回退到 CSQAQ 查询。可 Ctrl/Shift 多选后从观察列表移除，不会删除资产库存。
 - “AI 批量添加”不会上传截图：它只提供固定提示词、接收用户粘贴的 JSON，再以本地 `CS2ItemSchema` 校验中文名/英文 `market_hash_name`。确认后仅写入 `market_cache.json` 的观察列表；需要点击“刷新行情”才请求报价接口。
 - 市场页内仅将多普勒 P1/P3 合并为一行 `P1 / P3`；资产记录本身不会合并，因为磨损不同仍是不同实物。
 - 图片按 `market_hash_name` 缓存在 `private-data/images/`。

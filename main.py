@@ -527,6 +527,63 @@ class MarketAIImportDialog(QDialog):
             self.status_label.setText("没有可导入的饰品。" + (" " + "；".join(errors[:3]) if errors else ""))
 
 
+class MarketItemSearchDialog(QDialog):
+    """Local schema search results; users choose before a watch item is created."""
+
+    def __init__(self, query, records, parent=None):
+        super().__init__(parent)
+        self.records = records
+        self.setWindowTitle("选择要添加的饰品")
+        self.resize(950, 560)
+
+        layout = QVBoxLayout(self)
+        summary = QLabel(
+            f"“{query}”匹配到 {len(records)} 个本地饰品。请选择要加入当前观察分类的条目。"
+        )
+        summary.setStyleSheet("color: #a6adc8;")
+        layout.addWidget(summary)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["中文名称", "Steam Market Hash Name", "磨损", "模板 ID"])
+        self.table.setRowCount(len(records))
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.table.setAlternatingRowColors(True)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        for row, record in enumerate(records):
+            name_item = QTableWidgetItem(record.get("name_zh", ""))
+            name_item.setData(Qt.UserRole, row)
+            self.table.setItem(row, 0, name_item)
+            self.table.setItem(row, 1, QTableWidgetItem(record.get("market_hash_name", "")))
+            self.table.setItem(row, 2, QTableWidgetItem(record.get("wear_zh", "")))
+            self.table.setItem(row, 3, QTableWidgetItem(str(record.get("paint_index", ""))))
+        if records:
+            self.table.selectRow(0)
+        self.table.doubleClicked.connect(self.accept)
+        layout.addWidget(self.table)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        confirm = QPushButton("添加选中饰品")
+        confirm.setObjectName("primaryBtn")
+        confirm.clicked.connect(self.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(confirm)
+        layout.addLayout(buttons)
+
+    def selected_records(self):
+        selected_rows = sorted({index.row() for index in self.table.selectionModel().selectedRows()})
+        return [self.records[row] for row in selected_rows if 0 <= row < len(self.records)]
+
+
 _LINE_ICON_PATHS = {
     "app": "M4 4h16v16H4z M7 15l3-3 2 2 4-5 M7 8h.01 M11 8h.01 M15 8h.01",
     "dashboard": "M4 4h6v6H4z M14 4h6v6h-6z M4 14h6v6H4z M14 14h6v6h-6z",
@@ -2259,10 +2316,32 @@ class CS2ManagerApp(QMainWindow):
     # ── 搜索并添加 ──
 
     def query_csqaq_market(self):
-        """搜索 CSQAQ 并将结果添加到大盘"""
+        """Resolve human text locally first, then add explicit user selections."""
         keyword = self.market_input.text().strip()
         if not keyword:
             QMessageBox.warning(self, "提示", "请输入要查询的饰品名称！")
+            return
+
+        local_matches = CS2ItemSchema.search(keyword, limit=100)
+        if local_matches:
+            dialog = MarketItemSearchDialog(keyword, local_matches, self)
+            if dialog.exec() != QDialog.Accepted:
+                return
+            selected_records = dialog.selected_records()
+            if not selected_records:
+                QMessageBox.information(self, "添加饰品", "请至少选择一个饰品。")
+                return
+            self._add_local_market_search_records(keyword, selected_records)
+            return
+
+        # The CSQAQ batch endpoint accepts full market hash names, not a
+        # keyword search.  Keep it only as a fallback for unmapped exact names.
+        if "|" not in keyword or "(" not in keyword:
+            QMessageBox.information(
+                self,
+                "未找到本地映射",
+                "未找到匹配饰品。可尝试补充武器、皮肤或磨损，例如“蝴蝶刀 伽马多普勒”。",
+            )
             return
 
         token = self.db.get_config("csqaq_token")
@@ -2280,6 +2359,61 @@ class CS2ManagerApp(QMainWindow):
             worker_fn=lambda w: w.batch_price_csqaq(token, [keyword]),
             on_finished=self._on_search_add_result,
             on_error=self._on_csqaq_error,
+        )
+
+    @staticmethod
+    def _phase_hint_from_search(keyword):
+        match = re.search(r"(?:^|\s|[|（(])([Pp][1-4])(?:$|\s|[|）)])", keyword or "")
+        return match.group(1).upper() if match else "-"
+
+    def _add_local_market_search_records(self, keyword, records):
+        phase = self._phase_hint_from_search(keyword)
+        existing = {
+            self._market_watch_identity(entry.get("market_hash_name", entry.get("name", "")), entry.get("phase", "-"))
+            for entry in self._market_tracked_items
+        }
+        added = 0
+        skipped = 0
+        for record in records:
+            market_hash_name = record.get("market_hash_name", "")
+            if not market_hash_name:
+                continue
+            identity = self._market_watch_identity(market_hash_name, phase)
+            if identity in existing:
+                skipped += 1
+                continue
+            entry = {
+                "key": f"{market_hash_name}|{phase}",
+                "name": record.get("name_zh", market_hash_name),
+                "phase": phase,
+                "market_hash_name": market_hash_name,
+                "image_url": record.get("image", ""),
+                "csqaq_price": 0.0,
+                "eco_min_rent": 0.0,
+                "c5_short_rent": 0.0,
+                "c5_long_rent": 0.0,
+                "yyyp_short_rent": 0.0,
+                "yyyp_long_rent": 0.0,
+                "igxe_short_rent": 0.0,
+                "igxe_long_rent": 0.0,
+                "links": {},
+                "updated_at": "",
+                "detail": {},
+            }
+            self._apply_schema_mapping(entry)
+            self._market_tracked_items.append(entry)
+            existing.add(identity)
+            added += 1
+
+        if added:
+            self._deduplicate_market_tracked_items()
+            self._populate_market_table()
+            self._refresh_market_category_selector()
+            self._save_market_cache()
+        QMessageBox.information(
+            self,
+            "添加饰品",
+            f"已添加 {added} 条，跳过 {skipped} 条重复项。\n点击“刷新行情”即可查询报价。",
         )
 
     def _on_search_add_result(self, result):
