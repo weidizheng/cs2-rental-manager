@@ -275,6 +275,8 @@ class CS2ManagerApp(QMainWindow):
         self._c5_thread = None
         self._c5_worker = None
         self._market_auto_refresh_deadline = 0.0
+        self._market_auto_refresh_enabled = False
+        self._dashboard_rental_rows = {}
 
         # 当前市场详情页选中的物品标识 (name|phase)
         self._current_market_item_key = ""
@@ -289,6 +291,11 @@ class CS2ManagerApp(QMainWindow):
         self.market_auto_refresh_timer = QTimer(self)
         self.market_auto_refresh_timer.setSingleShot(True)
         self.market_auto_refresh_timer.timeout.connect(self._run_scheduled_market_refresh)
+
+        # Keep rental end-time displays live without reloading data or making API calls.
+        self.rental_countdown_timer = QTimer(self)
+        self.rental_countdown_timer.timeout.connect(self._update_dashboard_rental_countdowns)
+        self.rental_countdown_timer.start(1000)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.on_auto_refresh)
@@ -428,6 +435,10 @@ class CS2ManagerApp(QMainWindow):
         refresh_btn = QPushButton("🔄 刷新")
         refresh_btn.clicked.connect(self.load_data)
 
+        self.dashboard_auto_refresh_btn = QPushButton("⏱ 开启自动刷新（10:00）")
+        self.dashboard_auto_refresh_btn.setObjectName("primaryBtn")
+        self.dashboard_auto_refresh_btn.clicked.connect(self._toggle_market_auto_refresh)
+
         self.filter_box = QComboBox()
         self.filter_box.addItems(["全部平台", "C5GAME", "ECOSteam", "悠悠有品", "IGXE", "BUFF"])
         self.filter_box.currentTextChanged.connect(self.load_data)
@@ -438,6 +449,7 @@ class CS2ManagerApp(QMainWindow):
         toolbar.addWidget(history_btn)
         toolbar.addWidget(del_btn)
         toolbar.addWidget(refresh_btn)
+        toolbar.addWidget(self.dashboard_auto_refresh_btn)
         toolbar.addStretch()
         toolbar.addWidget(QLabel("筛选:"))
         toolbar.addWidget(self.filter_box)
@@ -637,9 +649,9 @@ class CS2ManagerApp(QMainWindow):
         refresh_market_btn.clicked.connect(self._refresh_all_market_data)
         search_layout.addWidget(refresh_market_btn)
 
-        force_eco_btn = QPushButton("⏱ 10分钟后自动刷新")
+        force_eco_btn = QPushButton("⏱ 开启自动刷新（10:00）")
         force_eco_btn.setObjectName("primaryBtn")
-        force_eco_btn.setToolTip("倒计时结束后自动刷新一次 CSQAQ 与 ECO 行情")
+        force_eco_btn.setToolTip("每 10 分钟自动刷新 CSQAQ 与 ECO 行情；再次点击可停止")
         force_eco_btn.clicked.connect(self._toggle_market_auto_refresh)
         self.market_auto_refresh_btn = force_eco_btn
         search_layout.addWidget(force_eco_btn)
@@ -1247,33 +1259,56 @@ class CS2ManagerApp(QMainWindow):
 
     # ── 刷新全部行情（顺序队列） ──
 
+    def _set_market_auto_refresh_button_text(self, text):
+        """Keep the dashboard and market-page controls in sync."""
+        for button in (
+            getattr(self, "dashboard_auto_refresh_btn", None),
+            getattr(self, "market_auto_refresh_btn", None),
+        ):
+            if button is not None:
+                button.setText(text)
+
+    def _schedule_next_market_auto_refresh(self):
+        """Start one ten-minute interval while keeping recurring mode enabled."""
+        self._market_auto_refresh_deadline = time.monotonic() + 10 * 60
+        self.market_auto_refresh_timer.start(10 * 60 * 1000)
+        if not self.market_countdown_timer.isActive():
+            self.market_countdown_timer.start(1000)
+        self._update_market_auto_refresh_countdown()
+
     def _toggle_market_auto_refresh(self):
-        if self.market_auto_refresh_timer.isActive():
+        if self._market_auto_refresh_enabled:
+            self._market_auto_refresh_enabled = False
             self.market_auto_refresh_timer.stop()
             self.market_countdown_timer.stop()
             self._market_auto_refresh_deadline = 0.0
-            self.market_auto_refresh_btn.setText("⏱ 10分钟后自动刷新")
+            self._set_market_auto_refresh_button_text("⏱ 开启自动刷新（10:00）")
             self.lbl_market_update.setText("已取消自动刷新倒计时")
             return
 
-        self._market_auto_refresh_deadline = time.monotonic() + 10 * 60
-        self.market_auto_refresh_timer.start(10 * 60 * 1000)
-        self.market_countdown_timer.start(1000)
-        self._update_market_auto_refresh_countdown()
+        self._market_auto_refresh_enabled = True
+        self._schedule_next_market_auto_refresh()
 
     def _update_market_auto_refresh_countdown(self):
-        remaining = max(0, int(self._market_auto_refresh_deadline - time.monotonic()))
+        if not self._market_auto_refresh_enabled:
+            return
+        remaining = max(0, int(self._market_auto_refresh_deadline - time.monotonic() + 0.999))
         minutes, seconds = divmod(remaining, 60)
-        self.market_auto_refresh_btn.setText(f"⏱ 自动刷新 {minutes:02d}:{seconds:02d}")
+        self._set_market_auto_refresh_button_text(
+            f"⏱ 自动刷新 {minutes:02d}:{seconds:02d}"
+        )
 
     def _run_scheduled_market_refresh(self):
-        self.market_countdown_timer.stop()
-        self._market_auto_refresh_deadline = 0.0
-        self.market_auto_refresh_btn.setText("⏱ 自动刷新已执行")
-        if self._market_refresh_thread and self._market_refresh_thread.isRunning():
-            self.lbl_market_update.setText("自动刷新已跳过：当前已有刷新任务")
+        if not self._market_auto_refresh_enabled:
             return
-        self.lbl_market_update.setText("10 分钟倒计时结束，正在自动刷新行情…")
+
+        # Schedule the next interval before running the network job.  A slow refresh
+        # therefore never leaves the visible countdown stopped at zero.
+        self._schedule_next_market_auto_refresh()
+        if self._market_refresh_thread and self._market_refresh_thread.isRunning():
+            self.lbl_market_update.setText("自动刷新已跳过：当前已有刷新任务，已重新计时")
+            return
+        self.lbl_market_update.setText("每 10 分钟自动刷新：正在刷新行情…")
         self._refresh_all_market_data()
 
     def _refresh_all_market_data(self, force_eco: bool = False):
@@ -1687,9 +1722,40 @@ class CS2ManagerApp(QMainWindow):
         remaining = end_time - datetime.now()
         if remaining.total_seconds() <= 0:
             return "已到期"
-        total_hours = int(remaining.total_seconds() // 3600)
-        days, hours = divmod(total_hours, 24)
-        return f"剩 {days}天 {hours}小时"
+        total_seconds = int(remaining.total_seconds())
+        days, remainder = divmod(total_seconds, 24 * 60 * 60)
+        hours, remainder = divmod(remainder, 60 * 60)
+        minutes, seconds = divmod(remainder, 60)
+        if days:
+            return f"剩 {days}天 {hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"剩 {hours:02d}:{minutes:02d}:{seconds:02d}"
+
+    def _rental_status_display(self, latest_order, fallback_status):
+        """Build a live status cell for the most recent rental order."""
+        order_status = str(latest_order.get("status", "") or "").strip()
+        if order_status != "租赁中":
+            return order_status or fallback_status, None
+
+        end_time = _parse_rental_datetime(latest_order.get("return_time"))
+        if end_time <= datetime.min:
+            return "租赁中 · 归还时间未知", QColor("#fab387")
+
+        remaining_seconds = (end_time - datetime.now()).total_seconds()
+        color = QColor("#f38ba8") if remaining_seconds <= 12 * 60 * 60 else QColor("#a6e3a1")
+        return f"租赁中 · {self._countdown_text(end_time)}", color
+
+    def _update_dashboard_rental_countdowns(self):
+        """Update only visible rental countdown cells once a second."""
+        for state in self._dashboard_rental_rows.values():
+            status_item = self.table.item(state["row"], 7)
+            if status_item is None:
+                continue
+            status_text, status_color = self._rental_status_display(
+                state["latest_order"], state["fallback_status"]
+            )
+            status_item.setText(status_text)
+            if status_color is not None:
+                status_item.setForeground(status_color)
 
     def show_selected_rental_history(self):
         selected_row = self.table.currentRow()
@@ -1714,6 +1780,7 @@ class CS2ManagerApp(QMainWindow):
         self.current_items = self.db.get_all_items()
         filter_platform = self.filter_box.currentText()
         self.table.setRowCount(0)
+        self._dashboard_rental_rows = {}
         total_cost = 0.0
         daily_rent = 0.0
         rented_count = 0
@@ -1743,8 +1810,9 @@ class CS2ManagerApp(QMainWindow):
                 if order_status == "租赁中":
                     rented_count += 1
                     daily_rent += daily_estimate
-                    status_text = f"租赁中 · {self._countdown_text(end)}" if end > datetime.min else "租赁中"
-                    status_color = QColor("#a6e3a1") if end > datetime.now() else QColor("#f38ba8")
+                    status_text, status_color = self._rental_status_display(
+                        latest_order, status_text
+                    )
                 else:
                     status_text = order_status or status_text
 
@@ -1762,6 +1830,12 @@ class CS2ManagerApp(QMainWindow):
                 if column == 7 and status_color:
                     table_item.setForeground(status_color)
                 self.table.setItem(row, column, table_item)
+            if latest_order and str(latest_order.get("status", "") or "").strip() == "租赁中":
+                self._dashboard_rental_rows[item["id"]] = {
+                    "row": row,
+                    "latest_order": latest_order,
+                    "fallback_status": item.get("status", "在库"),
+                }
             row += 1
 
         annual_rate = (daily_rent * 365 / total_cost * 100) if total_cost > 0 else 0.0
