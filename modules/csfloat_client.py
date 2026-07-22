@@ -24,6 +24,9 @@ class CSFloatClient(BaseAPIClient):
     # worker cannot bypass a 429 from the previous refresh.
     _global_cooldown_until = 0.0
     _global_last_request_time = 0.0
+    _global_cooldown_reason = ""
+    _global_pacing_interval = 1.25
+    _global_pacing_until = 0.0
 
     def __init__(self, api_key: str, timeout: int = 12):
         # CSFloat publishes per-endpoint response headers instead of one fixed
@@ -44,20 +47,53 @@ class CSFloatClient(BaseAPIClient):
         """Clear the in-process cooldown (primarily useful for offline tests)."""
         cls._global_cooldown_until = 0.0
         cls._global_last_request_time = 0.0
+        cls._global_cooldown_reason = ""
+        cls._global_pacing_interval = 1.25
+        cls._global_pacing_until = 0.0
 
     @classmethod
-    def _set_cooldown(cls, until: float):
-        cls._global_cooldown_until = max(cls._global_cooldown_until, until)
+    def _set_cooldown(cls, until: float, reason: str = "CSFloat 频控"):
+        if until >= cls._global_cooldown_until:
+            cls._global_cooldown_until = until
+            cls._global_cooldown_reason = reason
+        logger.warning(
+            "[CSFloat] 服务端频控反馈：%s，等待约 %s 秒",
+            reason,
+            max(0, int(until - time.time() + 0.999)),
+        )
 
     @classmethod
     def cooldown_remaining(cls) -> int:
         return max(0, int(cls._global_cooldown_until - time.time() + 0.999))
 
+    @classmethod
+    def cooldown_reason(cls) -> str:
+        if cls.cooldown_remaining() <= 0:
+            return ""
+        return cls._global_cooldown_reason or "CSFloat 频控"
+
+    @classmethod
+    def effective_request_interval(cls) -> float:
+        if time.time() < cls._global_pacing_until:
+            return max(1.25, float(cls._global_pacing_interval or 1.25))
+        return 1.25
+
+    @classmethod
+    def _rate_limited_result(cls, *, request_made: bool) -> dict[str, Any]:
+        return {
+            "success": False,
+            "error": "rate_limited",
+            "retry_after": cls.cooldown_remaining(),
+            "rate_limit_source": cls.cooldown_reason(),
+            "request_made": request_made,
+        }
+
     def _wait_rate_limit(self):
         """Enforce the minimum interval across newly-created refresh clients."""
+        interval = max(self.min_interval, type(self).effective_request_interval())
         elapsed = time.time() - type(self)._global_last_request_time
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
+        if elapsed < interval:
+            time.sleep(interval - elapsed)
         type(self)._global_last_request_time = time.time()
         self.last_request_time = type(self)._global_last_request_time
 
@@ -67,6 +103,13 @@ class CSFloatClient(BaseAPIClient):
             value = response.headers.get(name)
             if value is not None:
                 return value
+        normalized = {
+            str(key).casefold(): value
+            for key, value in getattr(response, "headers", {}).items()
+        }
+        for name in names:
+            if str(name).casefold() in normalized:
+                return normalized[str(name).casefold()]
         return None
 
     def _observe_rate_headers(self, response):
@@ -87,22 +130,39 @@ class CSFloatClient(BaseAPIClient):
                 except (TypeError, ValueError, OverflowError):
                     pass
         if retry_at > time.time():
-            self._set_cooldown(retry_at)
+            self._set_cooldown(retry_at, "CSFloat Retry-After 响应头")
 
         try:
             remaining = int(float(remaining_raw))
         except (TypeError, ValueError):
             remaining = None
-        if remaining is not None and remaining <= 1 and reset_raw is not None:
+        reset_at = 0.0
+        if remaining is not None and reset_raw is not None:
             try:
                 reset_value = float(reset_raw)
                 if reset_value > time.time() * 100:
                     reset_value /= 1000.0
                 # Providers commonly expose either seconds-from-now or a Unix timestamp.
                 reset_at = reset_value if reset_value > time.time() - 60 else time.time() + reset_value
-                self._set_cooldown(reset_at)
             except (TypeError, ValueError):
                 pass
+        if remaining is not None and reset_at > time.time():
+            if remaining <= 1:
+                self._set_cooldown(
+                    reset_at, "CSFloat RateLimit-Remaining/Reset 响应头"
+                )
+            else:
+                # Treat every CSFloat endpoint and every workspace as one
+                # conservative request pool.  The next client instance inherits
+                # this server-directed interval instead of starting a fresh burst.
+                safe_interval = min(
+                    60.0,
+                    max(self.min_interval, (reset_at - time.time()) / remaining),
+                )
+                cls = type(self)
+                if reset_at >= cls._global_pacing_until:
+                    cls._global_pacing_interval = safe_interval
+                    cls._global_pacing_until = reset_at
 
     def _get_json(
         self,
@@ -114,12 +174,7 @@ class CSFloatClient(BaseAPIClient):
         if not self.api_key:
             return {"success": False, "error": "missing_api_key", "request_made": False}
         if self.cooldown_remaining() > 0:
-            return {
-                "success": False,
-                "error": "rate_limited",
-                "retry_after": self.cooldown_remaining(),
-                "request_made": False,
-            }
+            return self._rate_limited_result(request_made=False)
 
         self._wait_rate_limit()
         try:
@@ -142,13 +197,8 @@ class CSFloatClient(BaseAPIClient):
             return {"success": False, "error": "forbidden", "request_made": True}
         if response.status_code == 429:
             if self.cooldown_remaining() <= 0:
-                self._set_cooldown(time.time() + 60)
-            return {
-                "success": False,
-                "error": "rate_limited",
-                "retry_after": self.cooldown_remaining(),
-                "request_made": True,
-            }
+                self._set_cooldown(time.time() + 60, "CSFloat HTTP 429")
+            return self._rate_limited_result(request_made=True)
         if not 200 <= response.status_code < 300:
             logger.warning(
                 "[CSFloat] %s %s HTTP %s: %s",
@@ -269,12 +319,7 @@ class CSFloatClient(BaseAPIClient):
         if not self.api_key:
             return {"success": False, "error": "missing_api_key", "request_made": False}
         if self.cooldown_remaining() > 0:
-            return {
-                "success": False,
-                "error": "rate_limited",
-                "retry_after": self.cooldown_remaining(),
-                "request_made": False,
-            }
+            return self._rate_limited_result(request_made=False)
 
         self._wait_rate_limit()
         try:
@@ -306,13 +351,8 @@ class CSFloatClient(BaseAPIClient):
             return {"success": False, "error": "forbidden", "request_made": True}
         if response.status_code == 429:
             if self.cooldown_remaining() <= 0:
-                self._set_cooldown(time.time() + 60)
-            return {
-                "success": False,
-                "error": "rate_limited",
-                "retry_after": self.cooldown_remaining(),
-                "request_made": True,
-            }
+                self._set_cooldown(time.time() + 60, "CSFloat HTTP 429")
+            return self._rate_limited_result(request_made=True)
         if response.status_code != 200:
             logger.warning(
                 "[CSFloat] HTTP %s: %s", response.status_code, response.text[:200]
@@ -375,12 +415,7 @@ class CSFloatClient(BaseAPIClient):
         if not listing_id:
             return {"success": False, "error": "missing_listing", "request_made": False}
         if self.cooldown_remaining() > 0:
-            return {
-                "success": False,
-                "error": "rate_limited",
-                "retry_after": self.cooldown_remaining(),
-                "request_made": False,
-            }
+            return self._rate_limited_result(request_made=False)
 
         self._wait_rate_limit()
         try:
@@ -405,13 +440,8 @@ class CSFloatClient(BaseAPIClient):
             return {"success": False, "error": "forbidden", "request_made": True}
         if response.status_code == 429:
             if self.cooldown_remaining() <= 0:
-                self._set_cooldown(time.time() + 60)
-            return {
-                "success": False,
-                "error": "rate_limited",
-                "retry_after": self.cooldown_remaining(),
-                "request_made": True,
-            }
+                self._set_cooldown(time.time() + 60, "CSFloat HTTP 429")
+            return self._rate_limited_result(request_made=True)
         if response.status_code != 200:
             logger.warning(
                 "[CSFloat] 最高求购 HTTP %s: %s", response.status_code, response.text[:200]

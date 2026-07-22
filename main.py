@@ -82,7 +82,7 @@ ORDER_PAGE_URLS = {
 # Detailed market requests rotate in the background so a large watch list
 # never stalls behind one monolithic refresh.
 MARKET_ROLLING_REFRESH_SECONDS = 12
-CSFLOAT_BUY_DETAIL_LIMIT = 5
+CSFLOAT_BUY_DETAIL_LIMIT = 1
 CSFLOAT_BUY_AUTO_REFRESH_SECONDS = 10 * 60
 
 
@@ -1100,10 +1100,10 @@ class CS2ManagerApp(QMainWindow):
         self._active_market_category_id = "rentals"
         self._market_thumbnail_cache = {}
         self._csfloat_buy_order_rows = []
+        self._csfloat_buy_detail_cursor = 0
         self._csfloat_buy_refresh_in_progress = False
         self._csfloat_buy_has_loaded = False
         self._csfloat_buy_refresh_background = False
-        self._csfloat_buy_manual_refresh_pending = False
         self._csfloat_buy_last_auto_refresh_at = 0.0
         self._csfloat_buy_fx_rate = self._configured_usd_cny_rate()
         self._csfloat_buy_fx_source = "手动备用"
@@ -1318,7 +1318,7 @@ class CS2ManagerApp(QMainWindow):
         if index == 0 and hasattr(self, "table"):
             self.load_data()
         elif index == 2 and not self._csfloat_buy_has_loaded:
-            self._refresh_csfloat_buy_orders()
+            self._request_global_sync_now()
 
     def _resize_edges_at(self, position):
         if self.isMaximized():
@@ -1357,8 +1357,8 @@ class CS2ManagerApp(QMainWindow):
                 key = event.key()
                 on_market_page = self.tabs.currentWidget() is getattr(self, "tab_market", None)
                 if key == Qt.Key_F5 and on_market_page:
-                    if not event.isAutoRepeat() and not self._market_refresh_is_running():
-                        self._refresh_all_market_data()
+                    if not event.isAutoRepeat():
+                        self._request_global_sync_now()
                     return True
                 focus = QApplication.focusWidget()
                 editing_text = isinstance(focus, (QLineEdit, QPlainTextEdit, QComboBox))
@@ -1821,11 +1821,11 @@ class CS2ManagerApp(QMainWindow):
         ai_import_btn.clicked.connect(self._open_ai_market_import)
         search_layout.addWidget(ai_import_btn)
 
-        refresh_market_btn = QPushButton("刷新行情")
+        refresh_market_btn = QPushButton("立即同步")
         refresh_market_btn.setObjectName("successBtn")
         self._set_button_icon(refresh_market_btn, "refresh", "#11111b")
-        refresh_market_btn.clicked.connect(self._refresh_all_market_data)
-        refresh_market_btn.setToolTip("刷新全部分类行情（大盘页快捷键：F5）")
+        refresh_market_btn.clicked.connect(self._request_global_sync_now)
+        refresh_market_btn.setToolTip("按全局频率排队同步；不会绕过 CSFloat 频控（快捷键：F5）")
         search_layout.addWidget(refresh_market_btn)
 
         self.market_refresh_progress_label = self._create_global_sync_button()
@@ -2828,8 +2828,12 @@ class CS2ManagerApp(QMainWindow):
         buttons = getattr(self, "_sync_progress_buttons", [])
         if not buttons:
             return
+        cooldown = CSFloatClient.cooldown_remaining()
+        cooldown_reason = CSFloatClient.cooldown_reason()
         total = self._market_rolling_cycle_total
-        if total <= 0:
+        if cooldown > 0:
+            text = f"同步等待 {cooldown}s"
+        elif total <= 0:
             text = "同步暂停" if not self._market_rolling_sync_enabled else "同步 --"
         else:
             completed = max(0, min(total, total - len(self._market_rolling_cycle_pending)))
@@ -2844,11 +2848,34 @@ class CS2ManagerApp(QMainWindow):
         tooltip = (
             f"全局后台数据同步{state}。\n"
             "统一控制资产本地更新、大盘逐件行情和 CSFloat 求购监测；"
-            "求购读取最多每 10 分钟一次，并遵守 CSFloat 返回的频控冷却。"
+            "所有工作区共用同一个服务端自适应请求间隔和冷却时间。"
+            + (f"\n当前反馈：{cooldown_reason}，剩余约 {cooldown} 秒。" if cooldown else "")
         )
         for button in buttons:
             button.setText(text)
             button.setToolTip(tooltip)
+
+    def _request_global_sync_now(self):
+        """Queue one dispatcher cycle without bypassing shared pacing/cooldown."""
+        if not self._market_rolling_sync_enabled:
+            self.lbl_market_update.setText("全局数据同步已暂停；点击“同步暂停”按钮继续")
+            return False
+        cooldown = CSFloatClient.cooldown_remaining()
+        if cooldown > 0:
+            reason = CSFloatClient.cooldown_reason() or "CSFloat 服务端频控"
+            self.lbl_market_update.setText(
+                f"全局同步等待：{reason}，约 {cooldown} 秒后自动继续"
+            )
+            self.csfloat_buy_status_label.setText(
+                f"{reason} · 约 {cooldown} 秒后由全局调度自动继续"
+            )
+            self._update_market_rolling_progress()
+            return False
+        if self._market_refresh_is_running() or self._csfloat_buy_refresh_in_progress:
+            self.lbl_market_update.setText("全局同步已在运行，本次操作沿用当前队列")
+            return False
+        self._run_rolling_market_refresh()
+        return True
 
     def _toggle_market_rolling_sync(self):
         """Pause/resume every automatic data source behind the shared buttons."""
@@ -2881,10 +2908,17 @@ class CS2ManagerApp(QMainWindow):
             or self._csfloat_buy_refresh_in_progress
         ):
             return
-        if self._csfloat_buy_manual_refresh_pending:
-            if self._refresh_csfloat_buy_orders(background=False):
-                self._csfloat_buy_manual_refresh_pending = False
-                return
+        cooldown = CSFloatClient.cooldown_remaining()
+        if cooldown > 0:
+            reason = CSFloatClient.cooldown_reason() or "CSFloat 服务端频控"
+            self.lbl_market_update.setText(
+                f"全局同步等待：{reason}，约 {cooldown} 秒后自动继续"
+            )
+            self.csfloat_buy_status_label.setText(
+                f"{reason} · 约 {cooldown} 秒后自动继续"
+            )
+            self._update_market_rolling_progress()
+            return
         if self._maybe_auto_refresh_csfloat_buy_orders():
             return
         refresh_items, refresh_groups = self._collect_all_market_refresh_items()
@@ -2945,7 +2979,7 @@ class CS2ManagerApp(QMainWindow):
                 QMessageBox.information(
                     self,
                     "数据同步中",
-                    "CSFloat 求购正在读取或核对，请等待当前请求完成后再刷新行情。",
+                    "CSFloat 求购正在读取，请等待当前全局请求完成。",
                 )
             return
         if refresh_items is None or refresh_groups is None:
@@ -3079,8 +3113,6 @@ class CS2ManagerApp(QMainWindow):
         self._market_refresh_background = False
         self._market_refresh_fast_only = False
         self._update_market_category_controls()
-        if self._csfloat_buy_manual_refresh_pending:
-            QTimer.singleShot(0, lambda: self._refresh_csfloat_buy_orders(background=False))
 
     # ── 市场数据缓存 ──
 
@@ -3256,7 +3288,7 @@ class CS2ManagerApp(QMainWindow):
             self,
             "AI 批量添加完成",
             f"已添加 {added} 条，跳过 {skipped} 条重复项。\n"
-            "新条目已保存到本地观察列表；点击“刷新行情”后会获取报价。",
+            "新条目已保存到本地观察列表；点击“立即同步”后会按全局频率获取报价。",
         )
 
     # ── 搜索并添加 ──
@@ -3361,7 +3393,7 @@ class CS2ManagerApp(QMainWindow):
         QMessageBox.information(
             self,
             "添加饰品",
-            f"已添加 {added} 条，跳过 {skipped} 条重复项。\n点击“刷新行情”即可查询报价。",
+            f"已添加 {added} 条，跳过 {skipped} 条重复项。\n点击“立即同步”即可排队查询报价。",
         )
 
     def _on_search_add_result(self, result):
@@ -3556,6 +3588,10 @@ class CS2ManagerApp(QMainWindow):
             "network": "网络请求失败",
             "invalid_json": "CSFloat 返回格式异常",
         }
+        if error == "rate_limited":
+            source = str((result or {}).get("rate_limit_source") or "CSFloat 服务端频控")
+            retry_after = int((result or {}).get("retry_after") or 0)
+            return source + (f"，约 {retry_after} 秒后自动继续" if retry_after else "")
         if error.startswith("http_"):
             return f"CSFloat 服务返回 {error.removeprefix('http_')}"
         return labels.get(error, error)
@@ -3572,8 +3608,9 @@ class CS2ManagerApp(QMainWindow):
             return False
         cooldown = CSFloatClient.cooldown_remaining()
         if cooldown > 0:
+            reason = CSFloatClient.cooldown_reason() or "CSFloat 服务端频控"
             self.csfloat_buy_status_label.setText(
-                f"CSFloat 频控冷却中（约 {cooldown} 秒），稍后自动继续"
+                f"{reason} · 约 {cooldown} 秒后由全局调度自动继续"
             )
             return False
         return self._refresh_csfloat_buy_orders(background=True)
@@ -3582,9 +3619,6 @@ class CS2ManagerApp(QMainWindow):
         if self._csfloat_buy_refresh_in_progress:
             return False
         if self._market_refresh_is_running():
-            if not background:
-                self._csfloat_buy_manual_refresh_pending = True
-                self.csfloat_buy_status_label.setText("已排队：当前行情请求完成后读取求购")
             return False
         api_key = self.db.get_config("csfloat_api_key").strip()
         if not api_key:
@@ -3594,14 +3628,12 @@ class CS2ManagerApp(QMainWindow):
             return False
         cooldown = CSFloatClient.cooldown_remaining()
         if cooldown > 0:
+            reason = CSFloatClient.cooldown_reason() or "CSFloat 服务端频控"
             self.csfloat_buy_status_label.setText(
-                f"CSFloat 频控冷却中（约 {cooldown} 秒），稍后自动继续"
+                f"{reason} · 约 {cooldown} 秒后由全局调度自动继续"
             )
-            if not background:
-                self._csfloat_buy_manual_refresh_pending = True
             return False
 
-        self._csfloat_buy_manual_refresh_pending = False
         self._csfloat_buy_refresh_in_progress = True
         self._csfloat_buy_refresh_background = bool(background)
         prefix = "后台自动读取" if background else "读取"
@@ -3610,6 +3642,14 @@ class CS2ManagerApp(QMainWindow):
 
         manual_fx_rate = self._configured_usd_cny_rate()
         auto_fx_rate = self.db.get_config("auto_usd_cny_rate") != "0"
+        detail_cursor = self._csfloat_buy_detail_cursor
+        cached_details = {
+            str((record.get("order") or {}).get("id") or ""): copy.deepcopy(
+                record.get("detail") or {}
+            )
+            for record in self._csfloat_buy_order_rows
+            if str((record.get("order") or {}).get("id") or "")
+        }
 
         def task(worker):
             if auto_fx_rate:
@@ -3632,8 +3672,17 @@ class CS2ManagerApp(QMainWindow):
                 return
 
             orders = order_result.get("orders", [])
-            details = {}
-            for order in orders[:CSFLOAT_BUY_DETAIL_LIMIT]:
+            details = cached_details
+            if orders:
+                offset = detail_cursor % len(orders)
+                detail_orders = (orders[offset:] + orders[:offset])[
+                    :CSFLOAT_BUY_DETAIL_LIMIT
+                ]
+                next_detail_cursor = (offset + len(detail_orders)) % len(orders)
+            else:
+                detail_orders = []
+                next_detail_cursor = 0
+            for order in detail_orders:
                 if worker._is_canceled:
                     return
                 order_id = str(order.get("id") or "")
@@ -3673,6 +3722,8 @@ class CS2ManagerApp(QMainWindow):
                 "count": order_result.get("count", len(orders)),
                 "details": details,
                 "detail_limit": CSFLOAT_BUY_DETAIL_LIMIT,
+                "detail_updated": len(detail_orders),
+                "next_detail_cursor": next_detail_cursor,
                 "fx": fx_result,
             }))
 
@@ -3695,8 +3746,6 @@ class CS2ManagerApp(QMainWindow):
             logger.warning("[CSFloat求购] 后台自动同步失败: %s", error_message)
         else:
             QMessageBox.warning(self, "CSFloat 求购读取失败", str(error_message))
-        if self._market_rolling_sync_enabled:
-            QTimer.singleShot(0, self._run_rolling_market_refresh)
 
     def _on_csfloat_buy_orders_loaded(self, result):
         _tag, payload = result
@@ -3704,6 +3753,7 @@ class CS2ManagerApp(QMainWindow):
         self._csfloat_buy_refresh_background = False
         self._csfloat_buy_last_auto_refresh_at = time.time()
         self._csfloat_buy_has_loaded = True
+        self._csfloat_buy_detail_cursor = int(payload.get("next_detail_cursor") or 0)
         self._update_market_rolling_progress()
 
         account = payload.get("account", {})
@@ -3756,13 +3806,16 @@ class CS2ManagerApp(QMainWindow):
 
         analyzed = sum(bool(row["detail"]) for row in rows)
         username = account.get("username") or "当前账户"
-        limit_note = "" if len(orders) <= payload.get("detail_limit", 5) else f"；本轮详细分析前 {analyzed} 单"
+        updated_details = int(payload.get("detail_updated") or 0)
+        limit_note = (
+            ""
+            if len(orders) <= payload.get("detail_limit", 1)
+            else f"；本轮轮换分析 {updated_details} 单，已有详情 {analyzed} 单"
+        )
         self.csfloat_buy_status_label.setText(
             f"{username} · {datetime.now().strftime('%H:%M:%S')} 已更新 · "
             f"1 USD = ¥{rate:.4f}（{self._csfloat_buy_fx_source}）{limit_note}"
         )
-        if self._market_rolling_sync_enabled:
-            QTimer.singleShot(0, self._run_rolling_market_refresh)
 
     def _csfloat_table_item(self, text, color="#cdd6f4", tooltip=""):
         item = QTableWidgetItem(str(text))

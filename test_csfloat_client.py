@@ -116,6 +116,20 @@ class CSFloatClientTests(unittest.TestCase):
         self.assertEqual(result["error"], "rate_limited")
         self.assertFalse(result["request_made"])
         self.assertEqual(second_client.session.calls, [])
+        self.assertIn("Retry-After", result["rate_limit_source"])
+
+    def test_rate_headers_adapt_one_global_interval_for_all_clients(self):
+        client = CSFloatClient("test-key")
+        client._observe_rate_headers(FakeResponse([], headers={
+            "ratelimit-remaining": "10",
+            "ratelimit-reset": str(time.time() + 50),
+        }))
+        self.assertGreaterEqual(CSFloatClient.effective_request_interval(), 4.8)
+        another_client = CSFloatClient("test-key")
+        self.assertEqual(
+            another_client.effective_request_interval(),
+            client.effective_request_interval(),
+        )
 
     def test_wrapped_data_response_is_supported(self):
         name = "M4A4 | Poseidon (Factory New)"

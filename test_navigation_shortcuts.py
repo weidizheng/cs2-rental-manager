@@ -47,6 +47,15 @@ class NavigationShortcutFocusTests(unittest.TestCase):
         self.assertIn("_open_csfloat_buy_item_from_cell", source)
         self.assertIn("打开 CSFloat 求购", source)
 
+    def test_all_workspace_refresh_entries_use_the_global_dispatcher(self):
+        switch_source = inspect.getsource(CS2ManagerApp.switch_page)
+        key_source = inspect.getsource(CS2ManagerApp.eventFilter)
+        market_source = inspect.getsource(CS2ManagerApp.init_market_tab)
+        self.assertIn("_request_global_sync_now", switch_source)
+        self.assertNotIn("_refresh_csfloat_buy_orders", switch_source)
+        self.assertIn("_request_global_sync_now", key_source)
+        self.assertIn("_request_global_sync_now", market_source)
+
     def test_csfloat_buy_analysis_reports_tied_top_without_claiming_ownership(self):
         result = _csfloat_buy_order_analysis(
             10000,

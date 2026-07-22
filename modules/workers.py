@@ -627,9 +627,14 @@ class MarketRefreshWorker(QObject):
                         self.error.emit("CSFloat 拒绝访问，请检查 API Key 权限或网络环境。")
                     elif error_code == "rate_limited":
                         retry_after = int(result.get("retry_after") or 0)
-                        csfloat_stop_reason = f"频控冷却 {retry_after} 秒"
+                        rate_source = str(
+                            result.get("rate_limit_source")
+                            or CSFloatClient.cooldown_reason()
+                            or "CSFloat 服务端频控"
+                        )
+                        csfloat_stop_reason = f"{rate_source} · 等待 {retry_after} 秒"
                         self.error.emit(
-                            f"CSFloat 已进入频控冷却，本轮停止请求；约 {retry_after} 秒后可重试。"
+                            f"{rate_source}；全局同步暂停发起新请求，约 {retry_after} 秒后自动继续。"
                         )
                     elif error_code == "invalid_json":
                         csfloat_stop_reason = "响应格式异常"
