@@ -5,6 +5,7 @@ import signal
 import time
 import re
 import copy
+import faulthandler
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from datetime import datetime, timedelta
 from urllib.parse import quote
@@ -20,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QTimer, QThread, QUrl, QTime, QSize, QByteArray, QEvent, QLocale,
-    QSettings,
+    QSettings, Slot,
 )
 from PySide6.QtGui import (
     QFont, QColor, QPixmap, QIcon, QPainter, QDesktopServices, QDoubleValidator, QIntValidator, QShortcut, QKeySequence,
@@ -41,6 +42,12 @@ from modules.cs2_item_schema import CS2ItemSchema, phase_hint_from_search
 from modules.rental_order_parsers import parse_rental_clipboard
 from modules.domain_models import InventoryItemDraft
 from modules.rental_matching import match_order_to_items
+from modules.asset_import import apply_asset_import_plan, plan_asset_import
+from modules.startup_manager import (
+    StartupNotSupportedError,
+    is_startup_enabled,
+    set_startup_enabled,
+)
 from modules.csfloat_buy_analysis import (
     analyze_csfloat_buy_order as _csfloat_buy_order_analysis,
 )
@@ -59,6 +66,7 @@ from modules.dashboard_service import (
 )
 from modules.ui_theme import APP_QSS
 from modules.version import __version__
+from modules.paths import get_private_path
 from modules.csfloat_client import CSFloatClient
 from modules.exchange_rate_client import ExchangeRateClient
 from modules.cloud_sync import (
@@ -736,10 +744,12 @@ class MarketAIImportDialog(QDialog):
 class AssetAIImportDialog(QDialog):
     """Paste and validate AI-extracted inventory rows before one-click import."""
 
-    def __init__(self, normalize_item, parent=None):
+    def __init__(self, normalize_item, existing_items=None, parent=None):
         super().__init__(parent)
         self._normalize_item = normalize_item
+        self._existing_items = list(existing_items or [])
         self.validated_items: list[dict] = []
+        self.import_decisions = []
         self.setWindowTitle("AI 辅助批量导入资产")
         self.resize(1180, 740)
 
@@ -812,17 +822,20 @@ class AssetAIImportDialog(QDialog):
     def _parse_response(self):
         self.preview_table.setRowCount(0)
         self.validated_items = []
+        self.import_decisions = []
         raw_items, errors = parse_ai_market_items(self.response_edit.toPlainText())
+        valid_rows = []
         for index, raw_item in enumerate(raw_items, start=1):
             entry, message = self._normalize_item(raw_item)
             row = self.preview_table.rowCount()
             self.preview_table.insertRow(row)
+            preview_item = entry or raw_item
             values = [
-                raw_item.get("name", ""), raw_item.get("phase", "-"),
-                raw_item.get("float_val", ""), raw_item.get("cost", ""),
-                raw_item.get("platform", ""), raw_item.get("status", "在库"),
+                preview_item.get("name", ""), preview_item.get("phase", "-"),
+                preview_item.get("float_val", ""), preview_item.get("cost", ""),
+                preview_item.get("platform", ""), preview_item.get("status", "在库"),
                 raw_item.get("cooldown_hours", 0),
-                raw_item.get("market_hash_name", raw_item.get("mhn", "")), message,
+                preview_item.get("market_hash_name", preview_item.get("mhn", "")), message,
             ]
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(str(value))
@@ -833,12 +846,39 @@ class AssetAIImportDialog(QDialog):
                 errors.append(f"第 {index} 条：{message}")
             else:
                 self.validated_items.append(entry)
+                valid_rows.append(row)
 
-        self.confirm_button.setEnabled(bool(self.validated_items))
+        self.import_decisions = plan_asset_import(
+            self._existing_items, self.validated_items
+        )
+        actionable = 0
+        for row, decision in zip(valid_rows, self.import_decisions):
+            result_cell = self.preview_table.item(row, 8)
+            result_cell.setText(decision.message)
+            if decision.action == "merge":
+                result_cell.setForeground(QColor("#f9e2af"))
+                actionable += 1
+            elif decision.action == "add":
+                result_cell.setForeground(QColor("#a6e3a1"))
+                actionable += 1
+            elif decision.action == "ambiguous":
+                result_cell.setForeground(QColor("#f38ba8"))
+            else:
+                result_cell.setForeground(QColor("#9399b2"))
+
+        self.confirm_button.setEnabled(actionable > 0)
         if self.validated_items:
-            suffix = f"；{len(errors)} 条需要修正" if errors else ""
+            counts = {
+                action: sum(d.action == action for d in self.import_decisions)
+                for action in ("add", "merge", "skip", "ambiguous")
+            }
+            summary = (
+                f"新增 {counts['add']}，合并 {counts['merge']}，"
+                f"跳过 {counts['skip']}，待确认 {counts['ambiguous']}"
+            )
+            suffix = f"；另有 {len(errors)} 条格式错误" if errors else ""
             self.status_label.setText(
-                f"已确认 {len(self.validated_items)} 件可导入{suffix}。确认后才会写入资产库。"
+                f"预览结果：{summary}{suffix}。确认后只写入新增和安全合并项。"
             )
         else:
             self.status_label.setText(
@@ -1099,7 +1139,9 @@ class CS2ManagerApp(QMainWindow):
         self._market_categories = {}
         self._active_market_category_id = "rentals"
         self._market_thumbnail_cache = {}
+        self._market_table_render_pending = False
         self._csfloat_buy_order_rows = []
+        self._csfloat_buy_table_render_pending = False
         self._csfloat_buy_detail_cursor = 0
         self._csfloat_buy_refresh_in_progress = False
         self._csfloat_buy_has_loaded = False
@@ -1266,6 +1308,25 @@ class CS2ManagerApp(QMainWindow):
             current = (current + direction) % workspace_count
         self.switch_page(current)
 
+    def _queue_navigation(self, callback, *args):
+        """Run keyboard navigation after the current Qt event is fully released.
+
+        Rebuilding a table from inside an event filter can delete the exact cell
+        widget that is still dispatching the key press.  PySide may then fail in
+        native code without a Python traceback.  One zero-delay turn keeps WASD
+        responsive while moving all widget replacement outside that event.
+        """
+        if getattr(self, "_navigation_pending", False):
+            return
+        self._navigation_pending = True
+
+        def navigate():
+            self._navigation_pending = False
+            if not getattr(self, "_threads_stopped_for_close", False):
+                callback(*args)
+
+        QTimer.singleShot(0, navigate)
+
     def _focus_current_search(self):
         target = (
             getattr(self, "dashboard_search", None)
@@ -1295,7 +1356,13 @@ class CS2ManagerApp(QMainWindow):
             page = int(self.ui_settings.value("window/page", 0))
         except (TypeError, ValueError):
             page = 0
-        self.switch_page(page if 0 <= page < self.tabs.count() else 0)
+        # Restoring the last workspace must not bypass the shared background
+        # dispatcher.  In particular, reopening on the CSFloat page used to
+        # fire an immediate request before the normal paced timer had started.
+        self.switch_page(
+            page if 0 <= page < self.tabs.count() else 0,
+            request_sync=False,
+        )
 
     def _save_ui_state(self):
         self.ui_settings.setValue("window/geometry", self.saveGeometry())
@@ -1310,15 +1377,35 @@ class CS2ManagerApp(QMainWindow):
                 self.ui_settings.setValue(key, table.horizontalHeader().saveState())
         self.ui_settings.sync()
 
-    def switch_page(self, index):
+    def switch_page(self, index, *, request_sync=True):
         """Switch a left-navigation page without recreating existing page widgets."""
+        previous_index = self.tabs.currentIndex()
         self.tabs.setCurrentIndex(index)
+        if previous_index != index:
+            market_running = (
+                self._market_refresh_is_running()
+                if hasattr(self, "_market_refresh_is_running") else False
+            )
+            logger.info(
+                "[导航] 工作区 %s -> %s（行情刷新=%s，求购刷新=%s）",
+                previous_index,
+                index,
+                market_running,
+                getattr(self, "_csfloat_buy_refresh_in_progress", False),
+            )
         for button_index, button in enumerate(self.navigation_buttons):
             button.setChecked(button_index == index)
         if index == 0 and hasattr(self, "table"):
             self.load_data()
-        elif index == 2 and not self._csfloat_buy_has_loaded:
-            self._request_global_sync_now()
+        elif index == 1 and getattr(self, "_market_table_render_pending", False):
+            self._populate_market_table()
+            self._market_table_render_pending = False
+        elif index == 2:
+            if getattr(self, "_csfloat_buy_table_render_pending", False):
+                self._populate_csfloat_buy_order_table()
+                self._csfloat_buy_table_render_pending = False
+            if request_sync and not self._csfloat_buy_has_loaded:
+                self._request_global_sync_now()
 
     def _resize_edges_at(self, position):
         if self.isMaximized():
@@ -1364,16 +1451,16 @@ class CS2ManagerApp(QMainWindow):
                 editing_text = isinstance(focus, (QLineEdit, QPlainTextEdit, QComboBox))
                 if not editing_text and not event.isAutoRepeat():
                     if key == Qt.Key_W:
-                        self._step_workspace(-1)
+                        self._queue_navigation(self._step_workspace, -1)
                         return True
                     if key == Qt.Key_S:
-                        self._step_workspace(1)
+                        self._queue_navigation(self._step_workspace, 1)
                         return True
                     if key == Qt.Key_A and on_market_page:
-                        self._step_market_category(-1)
+                        self._queue_navigation(self._step_market_category, -1)
                         return True
                     if key == Qt.Key_D and on_market_page:
-                        self._step_market_category(1)
+                        self._queue_navigation(self._step_market_category, 1)
                         return True
             if event.type() in (QEvent.MouseMove, QEvent.MouseButtonPress):
                 position = self.mapFromGlobal(event.globalPosition().toPoint())
@@ -2071,7 +2158,11 @@ class CS2ManagerApp(QMainWindow):
             control.setEnabled(enabled)
 
     def _market_refresh_is_running(self):
-        return bool(self._market_refresh_thread and self._market_refresh_thread.isRunning())
+        # Keep the dispatcher closed until the exact finished callback releases
+        # this slot.  ``isRunning()`` can become false one event-loop turn before
+        # cleanup; starting a replacement in that gap lets the old callback
+        # clear the new QThread reference and can crash PySide during GC.
+        return self._market_refresh_thread is not None
 
     def _update_market_category_controls(self):
         self._set_market_category_controls_enabled(
@@ -2990,7 +3081,7 @@ class CS2ManagerApp(QMainWindow):
             return
 
         # 如果已有刷新线程在运行，不允许重复启动
-        if self._market_refresh_thread and self._market_refresh_thread.isRunning():
+        if self._market_refresh_thread is not None:
             if not background:
                 QMessageBox.information(self, "提示", "正在刷新行情中，请等待完成...")
             return
@@ -3021,33 +3112,35 @@ class CS2ManagerApp(QMainWindow):
         self._market_refresh_background = background
         self._market_refresh_fast_only = fast_only
 
-        self._market_refresh_thread = QThread()
-        self._market_refresh_worker = MarketRefreshWorker()
+        refresh_thread = QThread()
+        refresh_worker = MarketRefreshWorker()
+        self._market_refresh_thread = refresh_thread
+        self._market_refresh_worker = refresh_worker
         # The worker must never mutate dictionaries owned by the GUI thread.
         items_copy = copy.deepcopy(refresh_items)
-        self._market_refresh_worker.configure_refresh(
+        refresh_worker.configure_refresh(
             token, eco_partner, eco_rsa, items_copy,
             self._build_market_hash_name_for_entry, force_eco,
             csfloat_api_key, usd_cny_rate, auto_usd_cny_rate,
             fast_only, background,
         )
-        self._market_refresh_worker.moveToThread(self._market_refresh_thread)
+        refresh_worker.moveToThread(refresh_thread)
 
         # 连接信号
-        self._market_refresh_worker.progress.connect(self._on_market_refresh_progress)
-        self._market_refresh_worker.row_updated.connect(self._on_market_refresh_row_updated)
-        self._market_refresh_worker.result_ready.connect(self._on_market_refresh_finished)
-        self._market_refresh_worker.error.connect(lambda msg: logger.warning(f"[大盘刷新] {msg}"))
+        refresh_worker.progress.connect(self._on_market_refresh_progress)
+        refresh_worker.row_updated.connect(self._on_market_refresh_row_updated)
+        refresh_worker.result_ready.connect(self._on_market_refresh_finished)
+        refresh_worker.error.connect(lambda msg: logger.warning(f"[大盘刷新] {msg}"))
 
         # 安全清理
-        self._market_refresh_worker.task_completed.connect(self._market_refresh_thread.quit)
-        self._market_refresh_worker.task_completed.connect(self._market_refresh_worker.deleteLater)
-        self._market_refresh_thread.finished.connect(self._market_refresh_thread.deleteLater)
-        self._market_refresh_thread.finished.connect(self._cleanup_market_refresh_thread)
+        refresh_worker.task_completed.connect(refresh_thread.quit)
+        refresh_worker.task_completed.connect(refresh_worker.deleteLater)
+        refresh_thread.finished.connect(self._cleanup_market_refresh_thread)
+        refresh_thread.finished.connect(refresh_thread.deleteLater)
 
         # 启动
-        self._market_refresh_thread.started.connect(self._market_refresh_worker.run_refresh)
-        self._market_refresh_thread.start()
+        refresh_thread.started.connect(refresh_worker.run_refresh)
+        refresh_thread.start()
 
     def _build_market_hash_name_for_entry(self, entry: dict) -> str:
         """从 entry 构建 market_hash_name"""
@@ -3091,10 +3184,16 @@ class CS2ManagerApp(QMainWindow):
             )
             rolling_cycle_completed = not self._market_rolling_cycle_pending
             self._update_market_rolling_progress()
-        self._populate_market_table()
+        market_page_visible = self.tabs.currentIndex() == 1
+        if market_page_visible:
+            self._populate_market_table()
+            self._market_table_render_pending = False
+        else:
+            self._market_table_render_pending = True
         self._save_market_cache()
         if not self._market_refresh_background or rolling_cycle_completed:
-            self.load_data()
+            if self.tabs.currentIndex() == 0:
+                self.load_data()
         eco_status = str(result.get("eco_status_text", ""))
         csfloat_status = str(result.get("csfloat_status_text", ""))
         status_parts = [status for status in (eco_status, csfloat_status) if status]
@@ -3106,8 +3205,13 @@ class CS2ManagerApp(QMainWindow):
             self.title_bar.set_sync_status("行情已更新", "#a6e3a1")
         self._market_refresh_groups = {}
 
-    def _cleanup_market_refresh_thread(self):
-        """清理市场刷新线程引用"""
+    @Slot()
+    def _cleanup_market_refresh_thread(self, thread=None):
+        """Release only the market thread that actually emitted ``finished``."""
+        thread = thread or self.sender()
+        if thread is not self._market_refresh_thread:
+            logger.warning("[大盘刷新] 忽略过期线程的清理回调")
+            return
         self._market_refresh_thread = None
         self._market_refresh_worker = None
         self._market_refresh_background = False
@@ -3802,7 +3906,11 @@ class CS2ManagerApp(QMainWindow):
             })
         self._csfloat_buy_order_rows = rows
         self._set_card_value(self.csfloat_top_count_card, f"{top_count} 单", "#cba6f7")
-        self._populate_csfloat_buy_order_table()
+        if self.tabs.currentIndex() == 2:
+            self._populate_csfloat_buy_order_table()
+            self._csfloat_buy_table_render_pending = False
+        else:
+            self._csfloat_buy_table_render_pending = True
 
         analyzed = sum(bool(row["detail"]) for row in rows)
         username = account.get("username") or "当前账户"
@@ -4031,6 +4139,19 @@ class CS2ManagerApp(QMainWindow):
         idx_map = {"0": 0, "5": 1, "15": 2, "30": 3, "60": 4}
         self.cfg_interval.setCurrentIndex(idx_map.get(cur_int, 2))
         form_time.addRow("自动刷新频率:", self.cfg_interval)
+        self.cfg_startup = QCheckBox("登录 Windows 后自动启动本软件")
+        self.cfg_startup.setToolTip(
+            "使用当前 Windows 用户的启动项，不需要管理员权限；此设置仅对本机生效。"
+        )
+        try:
+            self.cfg_startup.setChecked(is_startup_enabled())
+        except StartupNotSupportedError:
+            self.cfg_startup.setEnabled(False)
+            self.cfg_startup.setToolTip("当前系统不支持 Windows 开机自启动")
+        except OSError as exc:
+            self.cfg_startup.setEnabled(False)
+            self.cfg_startup.setToolTip(f"读取系统启动项失败：{exc}")
+        form_time.addRow("开机自启动:", self.cfg_startup)
         layout.addWidget(group_time)
 
         group_fee = QGroupBox("出租手续费率（用于订单净收益与年化计算）")
@@ -5198,31 +5319,20 @@ class CS2ManagerApp(QMainWindow):
         return record, "可导入"
 
     def _open_ai_asset_import(self):
-        dialog = AssetAIImportDialog(self._normalize_ai_asset_item, self)
-        if dialog.exec() != QDialog.Accepted or not dialog.validated_items:
+        dialog = AssetAIImportDialog(
+            self._normalize_ai_asset_item,
+            self.db.get_all_items(),
+            self,
+        )
+        if dialog.exec() != QDialog.Accepted or not dialog.import_decisions:
             return
-        existing = {
-            (
-                str(item.get("market_hash_name") or item.get("name") or "").casefold(),
-                str(item.get("float_val") or "").strip(),
-            )
-            for item in self.db.get_all_items()
-        }
-        added = 0
-        skipped = 0
-        for record in dialog.validated_items:
-            identity = (
-                str(record.get("market_hash_name") or record.get("name") or "").casefold(),
-                str(record.get("float_val") or "").strip(),
-            )
-            if identity in existing:
-                skipped += 1
-                continue
-            self.db.add_item(record)
-            existing.add(identity)
-            added += 1
+        counts = apply_asset_import_plan(self.db, dialog.import_decisions)
         self.load_data()
-        self._show_toast(f"AI 资产导入完成：新增 {added} 件，跳过 {skipped} 件重复项")
+        self._show_toast(
+            "AI 资产导入完成："
+            f"新增 {counts['added']}，合并 {counts['merged']}，"
+            f"跳过 {counts['skipped']}，待确认 {counts['ambiguous']}"
+        )
 
     def edit_selected_item(self):
         selected_row = self.table.currentRow()
@@ -5336,9 +5446,24 @@ class CS2ManagerApp(QMainWindow):
         }
         self.db.save_configs(config_values)
 
+        startup_error = None
+        if self.cfg_startup.isEnabled():
+            try:
+                set_startup_enabled(self.cfg_startup.isChecked())
+            except (OSError, StartupNotSupportedError) as exc:
+                startup_error = str(exc)
+
         self.update_timer_interval()
         self.load_data()
-        self._show_toast("设置已保存，费率已重新应用于收益统计")
+        if startup_error:
+            QMessageBox.warning(
+                self,
+                "开机自启动设置失败",
+                f"其他设置已经保存，但 Windows 启动项修改失败：\n{startup_error}",
+            )
+            self._show_toast("其他设置已保存；开机自启动修改失败")
+        else:
+            self._show_toast("设置已保存，费率与开机自启动状态已更新")
 
     def update_timer_interval(self):
         if not self._market_rolling_sync_enabled:
@@ -5373,6 +5498,15 @@ class CS2ManagerApp(QMainWindow):
         super().closeEvent(event)
 
 if __name__ == "__main__":
+    fatal_log_handle = None
+    try:
+        fatal_log_path = get_private_path("logs", "fatal-crash.log")
+        fatal_log_path.parent.mkdir(parents=True, exist_ok=True)
+        fatal_log_handle = fatal_log_path.open("a", encoding="utf-8", buffering=1)
+        faulthandler.enable(fatal_log_handle, all_threads=True)
+    except (OSError, RuntimeError) as exc:
+        logger.warning("无法启用原生崩溃堆栈记录: %s", exc)
+
     app = QApplication(sys.argv)
 
     def request_shutdown(*_):

@@ -1,6 +1,8 @@
 import os
 import time
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -146,6 +148,33 @@ class WorkerThreadingTests(unittest.TestCase):
         self.assertIn("probe failure", state["error"])
         self.app.processEvents()
         self.assertNotIn(thread, harness._active_threads)
+
+    def test_stale_market_thread_cleanup_cannot_clear_a_replacement(self):
+        current_thread = object()
+        stale_thread = object()
+        fake = SimpleNamespace(
+            _market_refresh_thread=current_thread,
+            _market_refresh_worker=object(),
+            _market_refresh_background=True,
+            _market_refresh_fast_only=True,
+            _update_market_category_controls=MagicMock(),
+            sender=lambda: stale_thread,
+        )
+
+        CS2ManagerApp._cleanup_market_refresh_thread(fake, stale_thread)
+        self.assertIs(fake._market_refresh_thread, current_thread)
+        fake._update_market_category_controls.assert_not_called()
+
+        CS2ManagerApp._cleanup_market_refresh_thread(fake, current_thread)
+        self.assertIsNone(fake._market_refresh_thread)
+        self.assertIsNone(fake._market_refresh_worker)
+        fake._update_market_category_controls.assert_called_once()
+
+    def test_finished_market_thread_stays_busy_until_identity_cleanup(self):
+        fake = SimpleNamespace(_market_refresh_thread=object())
+        self.assertTrue(CS2ManagerApp._market_refresh_is_running(fake))
+        fake._market_refresh_thread = None
+        self.assertFalse(CS2ManagerApp._market_refresh_is_running(fake))
 
 
 if __name__ == "__main__":

@@ -112,7 +112,8 @@ class CSFloatClient(BaseAPIClient):
                 return normalized[str(name).casefold()]
         return None
 
-    def _observe_rate_headers(self, response):
+    def _observe_rate_headers(self, response, path: str = ""):
+        endpoint = f"（{path}）" if path else ""
         remaining_raw = self._header(
             response, "ratelimit-remaining", "x-ratelimit-remaining"
         )
@@ -130,7 +131,9 @@ class CSFloatClient(BaseAPIClient):
                 except (TypeError, ValueError, OverflowError):
                     pass
         if retry_at > time.time():
-            self._set_cooldown(retry_at, "CSFloat Retry-After 响应头")
+            self._set_cooldown(
+                retry_at, f"CSFloat Retry-After 响应头{endpoint}"
+            )
 
         try:
             remaining = int(float(remaining_raw))
@@ -149,7 +152,8 @@ class CSFloatClient(BaseAPIClient):
         if remaining is not None and reset_at > time.time():
             if remaining <= 1:
                 self._set_cooldown(
-                    reset_at, "CSFloat RateLimit-Remaining/Reset 响应头"
+                    reset_at,
+                    f"CSFloat RateLimit-Remaining/Reset 响应头{endpoint}",
                 )
             else:
                 # Treat every CSFloat endpoint and every workspace as one
@@ -190,14 +194,17 @@ class CSFloatClient(BaseAPIClient):
                 "request_made": True,
             }
 
-        self._observe_rate_headers(response)
+        self._observe_rate_headers(response, path)
         if response.status_code == 401:
             return {"success": False, "error": "unauthorized", "request_made": True}
         if response.status_code == 403:
             return {"success": False, "error": "forbidden", "request_made": True}
         if response.status_code == 429:
             if self.cooldown_remaining() <= 0:
-                self._set_cooldown(time.time() + 60, "CSFloat HTTP 429")
+                self._set_cooldown(
+                    time.time() + 60,
+                    f"CSFloat HTTP 429（{path}）",
+                )
             return self._rate_limited_result(request_made=True)
         if not 200 <= response.status_code < 300:
             logger.warning(

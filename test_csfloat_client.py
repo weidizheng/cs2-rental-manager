@@ -118,6 +118,15 @@ class CSFloatClientTests(unittest.TestCase):
         self.assertEqual(second_client.session.calls, [])
         self.assertIn("Retry-After", result["rate_limit_source"])
 
+    def test_429_feedback_identifies_the_endpoint(self):
+        client = CSFloatClient("test-key")
+        client.session = FakeSession(FakeResponse([], status_code=429))
+
+        result = client.get_my_buy_orders()
+
+        self.assertEqual(result["error"], "rate_limited")
+        self.assertIn("/me/buy-orders", result["rate_limit_source"])
+
     def test_rate_headers_adapt_one_global_interval_for_all_clients(self):
         client = CSFloatClient("test-key")
         client._observe_rate_headers(FakeResponse([], headers={

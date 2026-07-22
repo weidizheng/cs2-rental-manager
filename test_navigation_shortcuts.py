@@ -1,6 +1,8 @@
 import os
 import inspect
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -39,6 +41,17 @@ class NavigationShortcutFocusTests(unittest.TestCase):
             self.assertIn(key, source)
         for widget in ("QLineEdit", "QPlainTextEdit", "QComboBox"):
             self.assertIn(widget, source)
+        self.assertIn("_queue_navigation", source)
+        self.assertIn("QTimer.singleShot", inspect.getsource(CS2ManagerApp._queue_navigation))
+
+    def test_background_refresh_defers_rendering_hidden_tables(self):
+        market_source = inspect.getsource(CS2ManagerApp._on_market_refresh_finished)
+        buy_source = inspect.getsource(CS2ManagerApp._on_csfloat_buy_orders_loaded)
+        switch_source = inspect.getsource(CS2ManagerApp.switch_page)
+        self.assertIn("_market_table_render_pending", market_source)
+        self.assertIn("_csfloat_buy_table_render_pending", buy_source)
+        self.assertIn("_market_table_render_pending", switch_source)
+        self.assertIn("_csfloat_buy_table_render_pending", switch_source)
 
     def test_buy_page_uses_one_sync_control_and_clickable_item_column(self):
         source = inspect.getsource(CS2ManagerApp.init_csfloat_buy_orders_tab)
@@ -55,6 +68,19 @@ class NavigationShortcutFocusTests(unittest.TestCase):
         self.assertNotIn("_refresh_csfloat_buy_orders", switch_source)
         self.assertIn("_request_global_sync_now", key_source)
         self.assertIn("_request_global_sync_now", market_source)
+
+    def test_restoring_csfloat_workspace_does_not_request_immediately(self):
+        fake = SimpleNamespace(
+            tabs=MagicMock(),
+            navigation_buttons=[],
+            _csfloat_buy_has_loaded=False,
+            _request_global_sync_now=MagicMock(),
+        )
+
+        CS2ManagerApp.switch_page(fake, 2, request_sync=False)
+
+        fake.tabs.setCurrentIndex.assert_called_once_with(2)
+        fake._request_global_sync_now.assert_not_called()
 
     def test_csfloat_buy_analysis_reports_tied_top_without_claiming_ownership(self):
         result = _csfloat_buy_order_analysis(
