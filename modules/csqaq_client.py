@@ -1,6 +1,5 @@
 import logging
 import time
-from typing import Dict, Any, List, Optional
 
 import requests
 
@@ -136,7 +135,7 @@ class CSQAQClient(BaseAPIClient):
                             "min_sell_price": min_price,
                         }
 
-                    logger.info(
+                    logger.debug(
                         f"[CSQAQ] getPriceByMarketHashName 成功, "
                         f"请求 {len(hash_name_list)} 个, "
                         f"返回 {len(parsed_result)} 个"

@@ -115,7 +115,42 @@ class ECOMarketCache:
             for row in rows
         }
 
-    def replace_snapshot(self, items: list[dict[str, Any]]) -> dict[tuple[str, str], dict[str, Any]]:
+    def load_snapshot_for_hash_names(
+        self, hash_names: list[str]
+    ) -> dict[tuple[str, str], dict[str, Any]]:
+        """Load only watched market names while preserving all phase rows."""
+        names = list(dict.fromkeys(str(name).strip() for name in hash_names if str(name).strip()))
+        if not names:
+            return {}
+
+        rows = []
+        # Stay well below SQLite's common 999-variable limit.
+        for start in range(0, len(names), 400):
+            chunk = names[start:start + 400]
+            placeholders = ",".join("?" for _ in chunk)
+            with self._session() as conn:
+                rows.extend(conn.execute(
+                    f"""
+                    SELECT hash_name, style_key, style_name, sell_price, rent_price
+                    FROM eco_prices
+                    WHERE partner_id = ? AND hash_name IN ({placeholders})
+                    """,
+                    (self.partner_id, *chunk),
+                ).fetchall())
+        return {
+            (row["hash_name"], row["style_key"]): {
+                "eco_sell_price": row["sell_price"],
+                "eco_rent_price": row["rent_price"],
+                "style_name": row["style_name"],
+            }
+            for row in rows
+        }
+
+    def replace_snapshot(
+        self,
+        items: list[dict[str, Any]],
+        return_snapshot: bool = True,
+    ) -> dict[tuple[str, str], dict[str, Any]]:
         """Atomically replace the prior full snapshot with a newly fetched one."""
         rows: dict[tuple[str, str], tuple[str, str, str, float, float]] = {}
         for item in items:
@@ -153,7 +188,7 @@ class ECOMarketCache:
                 """,
                 (self.partner_id, fetched_at, len(rows)),
             )
-        return self.load_snapshot()
+        return self.load_snapshot() if return_snapshot else {}
 
     @staticmethod
     def find_price(

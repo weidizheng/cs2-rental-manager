@@ -1,0 +1,6 @@
+-r requirements.txt
+
+PyInstaller==6.21.0
+Pillow==12.2.0
+coverage==7.15.2
+ruff==0.15.22

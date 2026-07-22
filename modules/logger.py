@@ -17,11 +17,12 @@ def setup_logger(name: str = "CS2Rental") -> logging.Logger:
     if logger.handlers:
         return logger
 
-    # 文件 Handler (带轮转，最大 5MB，保留 3 个备份)
+    # File logs are intentionally bounded: current file + two backups can use
+    # at most about 6 MB, even if the program runs for years.
     fh = RotatingFileHandler(
         os.path.join(LOG_DIR, "app.log"),
-        maxBytes=5 * 1024 * 1024,
-        backupCount=3,
+        maxBytes=2 * 1024 * 1024,
+        backupCount=2,
         encoding="utf-8",
     )
     fh.setFormatter(

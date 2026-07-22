@@ -3,7 +3,7 @@ import json
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 
 import requests
 from Crypto.Hash import SHA256
@@ -116,20 +116,13 @@ class ECOClient(BaseAPIClient):
     # 接口 1: 获取全量在售价格与起租价（60 秒缓存）
     # ──────────────────────────────────────────────
 
-    def get_hash_name_and_price_list(self, force_refresh: bool = False) -> dict:
-        """Get a phase-aware snapshot, preferring the local SQLite cache.
-
-        ECO only offers a full-list endpoint here. A fresh cache (10 minutes by
-        default) prevents repeated 39k-item downloads; a force refresh is the
-        only normal path that bypasses it.
-        """
+    def _ensure_market_cache(self, force_refresh: bool = False) -> None:
+        """Refresh the full ECO snapshot only when stale or explicitly forced."""
         cached_status = self.market_cache.status()
         if not force_refresh and self.market_cache.is_fresh(CACHE_TTL_SECONDS):
             self.last_price_source = "cache"
             self.last_cache_status = cached_status
-            snapshot = self.market_cache.load_snapshot()
-            logger.info(f"[ECO] 使用本地行情缓存，共 {len(snapshot)} 条")
-            return snapshot
+            return
 
         with _snapshot_refresh_lock:
             # Another worker may have refreshed the SQLite cache while this one
@@ -137,46 +130,71 @@ class ECOClient(BaseAPIClient):
             if not force_refresh and self.market_cache.is_fresh(CACHE_TTL_SECONDS):
                 self.last_price_source = "cache"
                 self.last_cache_status = self.market_cache.status()
-                return self.market_cache.load_snapshot()
+                return
 
-            stale_snapshot = self.market_cache.load_snapshot()
+            has_stale_snapshot = bool(cached_status and cached_status.get("item_count", 0))
             if not self.partner_id or not self.private_key_str:
-                self.last_price_source = "stale" if stale_snapshot else "none"
+                self.last_price_source = "stale" if has_stale_snapshot else "none"
                 self.last_cache_status = cached_status
                 logger.warning("[ECO] PartnerId 或私钥未配置，跳过全量更新")
-                return stale_snapshot
+                return
 
             endpoint = "/Api/Market/GetHashNameAndPriceList"
             resp_data = self._make_signed_request(endpoint, {"GameID": "730", "NeedStyleInfo": True})
             if not resp_data:
-                self.last_price_source = "stale" if stale_snapshot else "none"
+                self.last_price_source = "stale" if has_stale_snapshot else "none"
+                self.last_cache_status = cached_status
                 logger.warning("[ECO] 全量行情更新失败，保留旧缓存")
-                return stale_snapshot
+                return
 
             code = resp_data.get("ResultCode", resp_data.get("code", resp_data.get("Code")))
             if isinstance(code, str):
                 code = int(code) if code.isdigit() else None
             if code not in (0, 200):
                 msg = resp_data.get("ResultMsg", resp_data.get("msg", resp_data.get("Msg", "未知错误")))
-                self.last_price_source = "stale" if stale_snapshot else "none"
+                self.last_price_source = "stale" if has_stale_snapshot else "none"
+                self.last_cache_status = cached_status
                 logger.warning(f"[ECO] 全量行情业务错误: code={code}, msg={msg}")
-                return stale_snapshot
+                return
 
             result_list = resp_data.get("ResultData") or []
             if not isinstance(result_list, list):
-                self.last_price_source = "stale" if stale_snapshot else "none"
+                self.last_price_source = "stale" if has_stale_snapshot else "none"
+                self.last_cache_status = cached_status
                 logger.warning("[ECO] 全量行情 ResultData 格式异常，保留旧缓存")
-                return stale_snapshot
+                return
 
-            snapshot = self.market_cache.replace_snapshot(result_list)
+            self.market_cache.replace_snapshot(result_list, return_snapshot=False)
             self.last_price_source = "network"
             self.last_cache_status = self.market_cache.status()
-            logger.info(f"[ECO] 全量行情已更新并写入本地缓存，共 {len(snapshot)} 条")
-            return snapshot
+            logger.info(
+                f"[ECO] 全量行情已更新并写入本地缓存，共 "
+                f"{(self.last_cache_status or {}).get('item_count', 0)} 条"
+            )
+
+    def get_hash_name_and_price_list(self, force_refresh: bool = False) -> dict:
+        """Compatibility path that returns the complete cached snapshot."""
+        self._ensure_market_cache(force_refresh=force_refresh)
+        return self.market_cache.load_snapshot()
+
+    def get_prices_for_hash_names(
+        self, hash_names: list[str], force_refresh: bool = False
+    ) -> dict:
+        """Refresh if needed, then read only watched names from local SQLite."""
+        self._ensure_market_cache(force_refresh=force_refresh)
+        snapshot = self.market_cache.load_snapshot_for_hash_names(hash_names)
+        logger.debug(
+            "[ECO] SQLite 按需读取：观察 %s 个 HashName，命中 %s 条相位记录",
+            len(set(hash_names)),
+            len(snapshot),
+        )
+        return snapshot
 
     def get_price(self, market_hash_name: str, phase: str = "", force_refresh: bool = False) -> dict:
         """Return the exact cached ECO quote for one market name and phase."""
-        snapshot = self.get_hash_name_and_price_list(force_refresh=force_refresh)
+        snapshot = self.get_prices_for_hash_names(
+            [market_hash_name], force_refresh=force_refresh
+        )
         return self.market_cache.find_price(snapshot, market_hash_name, phase)
 
     # ──────────────────────────────────────────────

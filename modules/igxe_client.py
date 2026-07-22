@@ -1,6 +1,5 @@
 import logging
 import requests
-from typing import Dict, Any, List, Optional
 
 from modules.base_client import BaseAPIClient
 

@@ -1,5 +1,5 @@
-# Local credentials and private operational data. Copy this one folder to
-# a private cloud location when moving to another computer; never commit it.
+# Local credentials and private operational data. Never commit it; use the
+# encrypted sync bundle (or re-enter credentials) when changing Windows users.
 private-data/
 
 # Legacy locations retained only to prevent accidental commits during migration.
@@ -16,6 +16,10 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+build/
+release/
+release-*/
+dist/
 
 # Local tools and OS files
 .venv/

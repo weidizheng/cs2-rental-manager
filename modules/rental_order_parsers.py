@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from modules.c5_rental_browser import parse_c5_rent_text
+from modules.rental_terms import classify_rental_term
 
 
 def _float(value: str | None) -> float:
@@ -40,10 +41,16 @@ def _normal_datetime(value: str) -> str:
 
 
 def _status_from_text(text: str, default: str = "") -> str:
-    for status in ("租赁中", "已转交", "已完成", "已取消", "已关闭", "已退款"):
+    for status in ("已归还", "待归还", "租赁中", "已转交", "已完成", "已取消", "已关闭", "已退款"):
         if status in text:
             return status
     return default
+
+
+def _transfer_status_from_text(text: str) -> str:
+    """Read the explicit C5 transfer state without confusing reward text."""
+    value = _first(r"转租状态\s*[：:]?\s*([^\r\n*]+)", text)
+    return value.strip()[:30] if value else ""
 
 
 def _end_from_start_and_days(start_time: str, rental_days: float) -> str:
@@ -93,7 +100,7 @@ def parse_c5_detail_clipboard(text: str) -> list[dict[str, Any]]:
         r"租赁到期\s*[：:]?\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text
     ))
     return_deadline = _normal_datetime(_first(
-        r"归还截止\s*[：:]?\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text
+        r"归还截[止至]\s*[：:]?\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", text
     ))
     return_time = rental_end or _end_from_start_and_days(start_time, rental_days) or return_deadline
     reward, reward_status, reward_known = _c5_transfer_reward(text)
@@ -103,10 +110,14 @@ def parse_c5_detail_clipboard(text: str) -> list[dict[str, Any]]:
         "float_val": _first(r"磨损\s*[：:]?\s*([0-9.]+)", text),
         "daily_rent": daily_rent,
         "rental_days": rental_days,
+        "rental_type": classify_rental_term("C5GAME", rental_days, text),
         "deposit": _float(_first(r"饰品押金[\s\S]{0,80}?￥\s*([0-9.]+)", text)),
         "income": income,
         "start_time": start_time,
         "return_time": return_time,
+        "rental_end_time": rental_end or return_time,
+        "return_deadline": return_deadline,
+        "transfer_status": _transfer_status_from_text(text),
         "status": _status_from_text(text),
         "transfer_reward": reward,
         "reward_status": reward_status,
@@ -136,10 +147,14 @@ def parse_eco_clipboard(text: str) -> list[dict[str, Any]]:
             "float_val": float_val,
             "daily_rent": daily_rent,
             "rental_days": rental_days,
+            "rental_type": classify_rental_term("ECOSteam", rental_days, block),
             "deposit": deposit,
             "income": daily_rent * rental_days,
             "start_time": start_time,
             "return_time": return_time,
+            "rental_end_time": return_time,
+            "return_deadline": return_deadline,
+            "transfer_status": "",
             "status": _status_from_text(block),
             "raw_text": block[:4000],
         })
@@ -175,10 +190,14 @@ def parse_igxe_clipboard(text: str) -> list[dict[str, Any]]:
             "float_val": float_val,
             "daily_rent": daily_rent,
             "rental_days": rental_days,
+            "rental_type": classify_rental_term("IGXE", rental_days, block),
             "deposit": deposit,
             "income": income,
             "start_time": start_time,
             "return_time": return_time,
+            "rental_end_time": rental_end_time or return_time,
+            "return_deadline": return_deadline,
+            "transfer_status": "",
             "status": status,
             "raw_text": block[:4000],
         })

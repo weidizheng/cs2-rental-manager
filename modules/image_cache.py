@@ -8,10 +8,13 @@
 import os
 import json
 import logging
+import hashlib
+import tempfile
 import requests
 from typing import Optional, Dict, Any
 
 from modules.paths import get_private_data_dir
+from modules.atomic_io import atomic_write_json
 
 logger = logging.getLogger("CS2Rental")
 
@@ -25,10 +28,7 @@ class ImageCache:
 
     @staticmethod
     def get_local_path(market_hash_name: str) -> str:
-        """
-        获取本地图片路径。
-        将特殊字符替换为下划线，防止文件系统不兼容。
-        """
+        """Return a collision-resistant cache path, with legacy compatibility."""
         safe_name = (
             market_hash_name
             .replace("/", "_")
@@ -36,7 +36,12 @@ class ImageCache:
             .replace(":", "_")
             .replace(" ", "_")
         )
-        return os.path.join(IMAGES_DIR, f"{safe_name}.png")
+        legacy_path = os.path.join(IMAGES_DIR, f"{safe_name}.png")
+        digest = hashlib.sha256(str(market_hash_name).encode("utf-8")).hexdigest()[:32]
+        hashed_path = os.path.join(IMAGES_DIR, f"{digest}.img")
+        if os.path.exists(hashed_path) or not os.path.exists(legacy_path):
+            return hashed_path
+        return legacy_path
 
     @staticmethod
     def exists(market_hash_name: str) -> bool:
@@ -62,10 +67,38 @@ class ImageCache:
             return None
         try:
             os.makedirs(IMAGES_DIR, exist_ok=True)
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=10, stream=True)
             if resp.status_code == 200:
-                with open(local_path, "wb") as f:
-                    f.write(resp.content)
+                content_type = str(resp.headers.get("Content-Type") or "").lower()
+                content_length = int(resp.headers.get("Content-Length") or 0)
+                maximum_bytes = 10 * 1024 * 1024
+                if content_type and not content_type.startswith("image/"):
+                    logger.warning("[ImageCache] 非图片响应: %s", market_hash_name)
+                    return None
+                if content_length > maximum_bytes:
+                    logger.warning("[ImageCache] 图片超过 10 MB: %s", market_hash_name)
+                    return None
+                temp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        "wb", dir=IMAGES_DIR, prefix=".image.", suffix=".tmp", delete=False
+                    ) as image_file:
+                        temp_path = image_file.name
+                        written = 0
+                        for chunk in resp.iter_content(chunk_size=64 * 1024):
+                            if not chunk:
+                                continue
+                            written += len(chunk)
+                            if written > maximum_bytes:
+                                raise ValueError("图片下载超过 10 MB")
+                            image_file.write(chunk)
+                        image_file.flush()
+                        os.fsync(image_file.fileno())
+                    os.replace(temp_path, local_path)
+                    temp_path = None
+                finally:
+                    if temp_path and os.path.exists(temp_path):
+                        os.remove(temp_path)
                 logger.info(f"[ImageCache] 图片下载成功: {market_hash_name}")
                 return local_path
             else:
@@ -103,9 +136,8 @@ class MarketCache:
         """
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
-            with open(MARKET_CACHE_PATH, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            logger.info(f"[MarketCache] 行情缓存已保存 ({MarketCache._summary(data)})")
+            atomic_write_json(MARKET_CACHE_PATH, data)
+            logger.debug(f"[MarketCache] 行情缓存已保存 ({MarketCache._summary(data)})")
         except Exception as e:
             logger.warning(f"[MarketCache] 保存失败: {e}")
 
