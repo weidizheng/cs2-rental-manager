@@ -485,7 +485,7 @@ class RentalHistoryDialog(QDialog):
         self.table = QTableWidget()
         self.table.setColumnCount(9)
         self.table.setHorizontalHeaderLabels([
-            "平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "转租奖励（成本）", "净收入",
+            "平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "C5 转租奖励（成本）", "净收入",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -504,8 +504,8 @@ class RentalHistoryDialog(QDialog):
                 f"{rental_days:g} 天" if rental_days > 0 else "—",
                 _money_text(daily) if daily > 0 else "—",
                 _money_text(income),
-                _money_text(order.get("transfer_reward", 0.0) or 0.0)
-                if order.get("transfer_reward_known") else "—",
+                _money_text(order.get("transfer_reward_cost", 0.0) or 0.0)
+                if order.get("transfer_reward_cost", 0.0) else "—",
                 _money_text(order.get("net_income", income) or 0.0),
             ]
             for column, value in enumerate(values):
@@ -533,11 +533,21 @@ class RentalHistoryDialog(QDialog):
                 f"租期：{float(order.get('rental_days', 0.0) or 0.0):g} 天",
                 f"日租（原价）：{_money_text(order.get('daily_rent', 0.0) or 0.0)}",
                 f"订单金额：{_money_text(order.get('income', 0.0) or 0.0)}",
-                f"转租奖励：{_money_text(order.get('transfer_reward', 0.0) or 0.0)}"
-                f"（{order.get('reward_status', '未读取')}）"
-                if order.get("transfer_reward_known") else "转租奖励：未从 C5 订单详情读取",
+                self._reward_detail_text(order),
                 f"净收入：{_money_text(order.get('net_income', order.get('income', 0.0)) or 0.0)}",
             ]),
+        )
+
+    @staticmethod
+    def _reward_detail_text(order):
+        if order.get("platform") != "C5GAME":
+            return "C5 转租奖励：不适用于此平台"
+        if not order.get("transfer_reward_known"):
+            return "C5 转租奖励：未从 C5 订单详情读取"
+        return (
+            f"C5 页面奖励：{_money_text(order.get('transfer_reward', 0.0) or 0.0)}"
+            f"（{order.get('reward_status', '未读取')}）\n"
+            f"已计入成本：{_money_text(order.get('transfer_reward_cost', 0.0) or 0.0)}"
         )
 
 
@@ -561,7 +571,7 @@ class RentalImportPreviewDialog(QDialog):
         self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
             "平台", "订单号", "饰品", "磨损", "出租时间", "归还时间",
-            "租期", "日租（原价）", "订单金额", "转租奖励（成本）", "状态", "定价方式", "关联资产",
+            "租期", "日租（原价）", "订单金额", "C5 页面奖励（待核验）", "状态", "定价方式", "关联资产",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -587,7 +597,7 @@ class RentalImportPreviewDialog(QDialog):
                 _money_text(daily_rent) if daily_rent > 0 else "—",
                 _money_text(income),
                 _money_text(order.get("transfer_reward", 0.0) or 0.0)
-                if order.get("transfer_reward_known") else "—",
+                if platform == "C5GAME" and order.get("transfer_reward_known") else "—",
                 order.get("status", "") or "—",
             ]
             for column, value in enumerate(values):
@@ -4412,11 +4422,42 @@ class CS2ManagerApp(QMainWindow):
             return daily_rent * rental_days * self._order_discount_rate(order)
         return self._order_number(order.get("income"))
 
-    def _order_transfer_reward(self, order) -> float:
-        """C5 reward is a separate landlord cost, not part of its service fee."""
-        if order.get("platform") != "C5GAME" or not order.get("transfer_reward_known"):
+    def _order_transfer_reward(self, order, history) -> float:
+        """Return a verified C5 relet reward, capped at five percent of this order."""
+        if (
+            order.get("platform") != "C5GAME"
+            or not order.get("transfer_reward_known")
+            or str(order.get("reward_status", "") or "") not in {"待发放", "已发放"}
+        ):
             return 0.0
-        return max(0.0, self._order_number(order.get("transfer_reward")))
+        order_index = next(
+            (index for index, candidate in enumerate(history)
+             if self._order_key(candidate) == self._order_key(order)),
+            -1,
+        )
+        if order_index < 0 or order_index + 1 >= len(history):
+            return 0.0
+        next_order = history[order_index + 1]
+        if next_order.get("platform") != "C5GAME":
+            return 0.0
+        rental_end = self._rental_end_datetime(order)
+        next_start = _parse_platform_datetime_utc(
+            next_order.get("start_time"), next_order.get("platform", "")
+        )
+        if rental_end <= datetime.min or next_start <= datetime.min:
+            return 0.0
+        # C5 only grants the reward when the next renter is handed over inside
+        # its twelve-hour relet window.  A small overlap is tolerated because
+        # page timestamps may straddle the handover second.
+        if not (
+            rental_end - timedelta(minutes=30)
+            <= next_start
+            <= rental_end + RENTAL_RELET_WINDOW
+        ):
+            return 0.0
+        reward = max(0.0, self._order_number(order.get("transfer_reward")))
+        maximum = max(0.0, self._order_gross_income(order)) * 0.05
+        return min(reward, maximum)
 
     def _order_fee_rate(self, order, history, fee_rates=None) -> float:
         if order.get("platform") == "IGXE":
@@ -4505,7 +4546,7 @@ class CS2ManagerApp(QMainWindow):
             self._order_gross_income(order),
             self._order_fee_rate(order, history, fee_rates),
         )
-        net_income -= self._order_transfer_reward(order)
+        net_income -= self._order_transfer_reward(order, history)
         if order.get("platform") == "IGXE":
             # IGXE settles its displayed order amount by truncating to cents.
             return float(Decimal(str(net_income)).quantize(Decimal("0.01"), rounding=ROUND_DOWN))
@@ -4798,6 +4839,7 @@ class CS2ManagerApp(QMainWindow):
             # their derived values here so the history dialog remains useful.
             display_order["rental_days"] = self._order_rental_days(order)
             display_order["daily_rent"] = self._order_daily_rent(order)
+            display_order["transfer_reward_cost"] = self._order_transfer_reward(order, history)
             display_order["net_income"] = self._order_net_income(order, history)
             rental_end = self._rental_end_datetime(order)
             if rental_end > datetime.min:
