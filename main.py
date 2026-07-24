@@ -485,7 +485,7 @@ class RentalHistoryDialog(QDialog):
         self.table = QTableWidget()
         self.table.setColumnCount(9)
         self.table.setHorizontalHeaderLabels([
-            "平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "C5 转租奖励（成本）", "净收入",
+            "平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "C5 转租奖励（已结算成本）", "净收入",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -544,10 +544,18 @@ class RentalHistoryDialog(QDialog):
             return "C5 转租奖励：不适用于此平台"
         if not order.get("transfer_reward_known"):
             return "C5 转租奖励：未从 C5 订单详情读取"
+        reward_status = str(order.get("reward_status", "未读取") or "未读取")
+        transfer_status = str(order.get("transfer_status", "未读取") or "未读取")
+        cost = order.get("transfer_reward_cost", 0.0) or 0.0
+        settlement = (
+            f"已结算并计入成本：{_money_text(cost)}"
+            if cost else "未计入成本（仅在 C5 显示“已发放”后结算）"
+        )
         return (
             f"C5 页面奖励：{_money_text(order.get('transfer_reward', 0.0) or 0.0)}"
-            f"（{order.get('reward_status', '未读取')}）\n"
-            f"已计入成本：{_money_text(order.get('transfer_reward_cost', 0.0) or 0.0)}"
+            f"（{reward_status}）\n"
+            f"转租状态：{transfer_status}\n"
+            f"{settlement}"
         )
 
 
@@ -4423,36 +4431,12 @@ class CS2ManagerApp(QMainWindow):
         return self._order_number(order.get("income"))
 
     def _order_transfer_reward(self, order, history) -> float:
-        """Return a verified C5 relet reward, capped at five percent of this order."""
+        """Return the final C5 reward, never a provisional maximum or estimate."""
         if (
             order.get("platform") != "C5GAME"
             or not order.get("transfer_reward_known")
-            or str(order.get("reward_status", "") or "") not in {"待发放", "已发放"}
-        ):
-            return 0.0
-        order_index = next(
-            (index for index, candidate in enumerate(history)
-             if self._order_key(candidate) == self._order_key(order)),
-            -1,
-        )
-        if order_index < 0 or order_index + 1 >= len(history):
-            return 0.0
-        next_order = history[order_index + 1]
-        if next_order.get("platform") != "C5GAME":
-            return 0.0
-        rental_end = self._rental_end_datetime(order)
-        next_start = _parse_platform_datetime_utc(
-            next_order.get("start_time"), next_order.get("platform", "")
-        )
-        if rental_end <= datetime.min or next_start <= datetime.min:
-            return 0.0
-        # C5 only grants the reward when the next renter is handed over inside
-        # its twelve-hour relet window.  A small overlap is tolerated because
-        # page timestamps may straddle the handover second.
-        if not (
-            rental_end - timedelta(minutes=30)
-            <= next_start
-            <= rental_end + RENTAL_RELET_WINDOW
+            or str(order.get("reward_status", "") or "") != "已发放"
+            or str(order.get("transfer_status", "") or "") != "已转交"
         ):
             return 0.0
         reward = max(0.0, self._order_number(order.get("transfer_reward")))

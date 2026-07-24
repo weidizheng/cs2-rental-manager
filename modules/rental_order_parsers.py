@@ -77,15 +77,18 @@ def _end_from_return_deadline(return_deadline: str, grace_hours: float = 12.0) -
 
 
 def _c5_transfer_reward(text: str) -> tuple[float, str, bool]:
-    """Return only a confirmed C5 transfer-reward amount, never a maximum."""
+    """Read C5 reward display state; only ``已发放`` is a settled amount."""
     section_match = re.search(r"转租奖励([\s\S]{0,160})", text)
     if not section_match:
         return 0.0, "", False
     section = section_match.group(1)
     if "已取消" in section:
         return 0.0, "已取消", True
+    if "最高奖励" in section:
+        amount = _float(_first(r"￥\s*([0-9.]+)", section))
+        return amount, "最高奖励", True
     status = next((value for value in ("待发放", "已发放") if value in section), "")
-    if not status or "最高奖励" in section:
+    if not status:
         return 0.0, "", False
     amount = _float(_first(r"￥\s*([0-9.]+)", section))
     return amount, status, amount >= 0

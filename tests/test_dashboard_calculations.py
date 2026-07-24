@@ -339,33 +339,28 @@ class DashboardCalculationTests(unittest.TestCase):
         self.assertEqual(rates["c5_first_fee"], 0.05)
         self.assertEqual(rates["eco_relet_fee"], 0.05)
 
-    def test_c5_transfer_reward_requires_a_verified_twelve_hour_relet_and_caps_at_five_percent(self):
+    def test_c5_transfer_reward_only_uses_c5_final_settlement_and_caps_at_five_percent(self):
         app = CS2ManagerApp.__new__(CS2ManagerApp)
         original = {
             "platform": "C5GAME",
             "order_no": "original",
             "daily_rent": 100.0,
             "rental_days": 1.0,
-            "rental_end_time": "2026-07-20 12:00:00",
             "transfer_reward": 8.0,
             "transfer_reward_known": True,
-            "reward_status": "待发放",
+            "reward_status": "已发放",
+            "transfer_status": "已转交",
         }
-        eligible_next = {
-            "platform": "C5GAME",
-            "order_no": "relet",
-            "start_time": "2026-07-20 23:59:00",
-        }
-        self.assertEqual(app._order_transfer_reward(original, [original, eligible_next]), 5.0)
+        self.assertEqual(app._order_transfer_reward(original, [original]), 5.0)
 
-        outside_window = dict(eligible_next, start_time="2026-07-21 00:01:00")
-        self.assertEqual(app._order_transfer_reward(original, [original, outside_window]), 0.0)
+        provisional = dict(original, transfer_reward=5.0, reward_status="最高奖励", transfer_status="未转租")
+        self.assertEqual(app._order_transfer_reward(provisional, [provisional]), 0.0)
 
-        other_platform = dict(eligible_next, platform="ECOSteam")
-        self.assertEqual(app._order_transfer_reward(original, [original, other_platform]), 0.0)
+        pending = dict(original, transfer_reward=5.0, reward_status="待发放")
+        self.assertEqual(app._order_transfer_reward(pending, [pending]), 0.0)
 
         non_c5 = dict(original, platform="IGXE")
-        self.assertEqual(app._order_transfer_reward(non_c5, [non_c5, eligible_next]), 0.0)
+        self.assertEqual(app._order_transfer_reward(non_c5, [non_c5]), 0.0)
 
     def test_igxe_confirmed_pricing_mode_overrides_legacy_fee_settings(self):
         class DBStub:
