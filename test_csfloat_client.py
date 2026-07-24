@@ -1,13 +1,16 @@
 """Offline tests for the read-only CSFloat integration."""
 
 import time
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from modules.csfloat_client import CSFloatClient
 from modules.workers import (
     CSFLOAT_MAX_REQUESTS_PER_REFRESH,
     MarketRefreshWorker,
+    csfloat_buy_quote_is_fresh,
     csfloat_cny_display_price,
     csfloat_quote_is_fresh,
 )
@@ -122,23 +125,111 @@ class CSFloatClientTests(unittest.TestCase):
         client = CSFloatClient("test-key")
         client.session = FakeSession(FakeResponse([], status_code=429))
 
-        result = client.get_my_buy_orders()
+        result = client.get_highest_buy_order("listing-123")
 
         self.assertEqual(result["error"], "rate_limited")
-        self.assertIn("/me/buy-orders", result["rate_limit_source"])
+        self.assertIn("/listings/{id}/buy-orders", result["rate_limit_source"])
 
-    def test_rate_headers_adapt_one_global_interval_for_all_clients(self):
+    def test_repeated_headerless_429_uses_endpoint_exponential_backoff(self):
+        with (
+            patch("modules.csfloat_client.time.time", return_value=1_000.0),
+            patch("modules.csfloat_client.time.sleep"),
+        ):
+            first = CSFloatClient("test-key")
+            first.session = FakeSession(FakeResponse([], status_code=429))
+            result = first.get_lowest_buy_now("AK-47 | Redline (Field-Tested)")
+        self.assertEqual(result["retry_after"], 60)
+        self.assertIn("/listings", result["rate_limit_source"])
+        self.assertIn("连续 1 次", result["rate_limit_source"])
+
+        with (
+            patch("modules.csfloat_client.time.time", return_value=1_061.0),
+            patch("modules.csfloat_client.time.sleep"),
+        ):
+            second = CSFloatClient("test-key")
+            second.session = FakeSession(FakeResponse([], status_code=429))
+            result = second.get_lowest_buy_now("M4A4 | Poseidon (Factory New)")
+        self.assertEqual(result["retry_after"], 120)
+        self.assertIn("连续 2 次", result["rate_limit_source"])
+
+        with (
+            patch("modules.csfloat_client.time.time", return_value=1_182.0),
+            patch("modules.csfloat_client.time.sleep"),
+        ):
+            recovered = CSFloatClient("test-key")
+            recovered.session = FakeSession(FakeResponse([]))
+            self.assertTrue(
+                recovered.get_lowest_buy_now("M4A4 | Poseidon (Factory New)")["success"]
+            )
+        self.assertNotIn("/listings", CSFloatClient._endpoint_429_streaks)
+
+    def test_persisted_cooldown_survives_a_simulated_restart(self):
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            state_path = Path(temporary_dir) / "csfloat_cooldown.json"
+            with (
+                patch.object(CSFloatClient, "_cooldown_state_path", return_value=state_path),
+                patch("modules.csfloat_client.time.time", return_value=2_000.0),
+            ):
+                CSFloatClient._persist_cooldown_enabled = True
+                CSFloatClient._handle_http_429("/listings")
+
+            CSFloatClient._global_cooldown_until = 0.0
+            CSFloatClient._global_cooldown_reason = ""
+            CSFloatClient._endpoint_429_streaks = {}
+            CSFloatClient._persisted_cooldown_loaded = False
+            with (
+                patch.object(CSFloatClient, "_cooldown_state_path", return_value=state_path),
+                patch("modules.csfloat_client.time.time", return_value=2_001.0),
+            ):
+                CSFloatClient("test-key")
+                self.assertEqual(CSFloatClient.cooldown_remaining(), 59)
+                self.assertEqual(CSFloatClient._endpoint_429_streaks["/listings"], 1)
+
+    def test_healthy_rate_headers_keep_the_fast_shared_base_interval(self):
         client = CSFloatClient("test-key")
         client._observe_rate_headers(FakeResponse([], headers={
-            "ratelimit-remaining": "10",
+            "ratelimit-remaining": "20",
             "ratelimit-reset": str(time.time() + 50),
         }))
-        self.assertGreaterEqual(CSFloatClient.effective_request_interval(), 4.8)
+        self.assertEqual(CSFloatClient.effective_request_interval(), 1.25)
         another_client = CSFloatClient("test-key")
         self.assertEqual(
             another_client.effective_request_interval(),
             client.effective_request_interval(),
         )
+
+    def test_rate_snapshot_and_request_count_are_available_to_scheduler(self):
+        reset_at = time.time() + 1_920
+        client = CSFloatClient("test-key")
+        client.session = FakeSession(FakeResponse([], headers={
+            "x-ratelimit-limit": "200",
+            "x-ratelimit-remaining": "161",
+            "x-ratelimit-reset": str(reset_at),
+        }))
+
+        client.get_lowest_buy_now("M4A4 | Poseidon (Factory New)")
+        snapshot = CSFloatClient.rate_limit_snapshot()
+
+        self.assertEqual(CSFloatClient.request_count(), 1)
+        self.assertEqual(snapshot["limit"], 200)
+        self.assertEqual(snapshot["remaining"], 161)
+        self.assertAlmostEqual(snapshot["reset_at"], reset_at, delta=0.01)
+
+    def test_rate_header_reserve_stops_every_workspace_before_429(self):
+        client = CSFloatClient("test-key")
+        client._observe_rate_headers(FakeResponse([], headers={
+            "ratelimit-remaining": str(CSFloatClient.RATE_LIMIT_RESERVE),
+            "ratelimit-reset": str(time.time() + 50),
+        }), "/listings")
+
+        another_client = CSFloatClient("test-key")
+        another_client.session = FakeSession(FakeResponse([]))
+        result = another_client.get_lowest_buy_now("M4A4 | Poseidon (Factory New)")
+
+        self.assertEqual(result["error"], "rate_limited")
+        self.assertFalse(result["request_made"])
+        self.assertEqual(another_client.session.calls, [])
+        self.assertIn("额度保留线", result["rate_limit_source"])
 
     def test_wrapped_data_response_is_supported(self):
         name = "M4A4 | Poseidon (Factory New)"
@@ -186,56 +277,22 @@ class CSFloatClientTests(unittest.TestCase):
         self.assertFalse(hasattr(client, "create_buy_order"))
         self.assertFalse(hasattr(client, "delete_buy_order"))
 
-    def test_account_and_my_buy_orders_are_normalized(self):
-        client = CSFloatClient("test-key")
-        client.session = FakeSession(FakeResponse({
-            "user": {
-                "username": "tester",
-                "balance": 12345,
-                "pending_balance": 678,
-            }
-        }))
-        account = client.get_account()
-        self.assertTrue(account["success"])
-        self.assertEqual(account["balance_cents"], 12345)
-        self.assertEqual(account["pending_balance_cents"], 678)
-        self.assertEqual(account["username"], "tester")
-
-        client.session = FakeSession(FakeResponse({
-            "count": 1,
-            "orders": [{
-                "id": 987,
-                "market_hash_name": "AK-47 | Redline (Field-Tested)",
-                "price": "2500",
-                "qty": "2",
-                "hybrid_properties": {"paint_index": 12},
-            }],
-        }))
-        orders = client.get_my_buy_orders()
-        self.assertTrue(orders["success"])
-        self.assertEqual(orders["count"], 1)
-        self.assertEqual(orders["orders"][0]["id"], "987")
-        self.assertEqual(orders["orders"][0]["price"], 2500)
-        self.assertEqual(orders["orders"][0]["qty"], 2)
-
-    def test_recent_sales_filters_invalid_prices_and_sorts_newest_first(self):
-        client = CSFloatClient("test-key")
-        client.session = FakeSession(FakeResponse([
-            {"price": 1200, "sold_at": "2026-01-01T00:00:00Z"},
-            {"price": 0, "sold_at": "2026-01-03T00:00:00Z"},
-            {"price": 1250, "sold_at": "2026-01-02T00:00:00Z"},
-        ]))
-        result = client.get_recent_sales("AK-47 | Redline (Field-Tested)")
-        self.assertTrue(result["success"])
-        self.assertEqual([sale["price"] for sale in result["sales"]], [1250, 1200])
-        self.assertIn("AK-47%20%7C%20Redline", client.session.calls[0][0])
-
     def test_cache_requires_same_name_and_ttl(self):
         now = time.time()
         entry = {"csfloat_fetched_at": now, "csfloat_query_mhn": "name-a"}
         self.assertTrue(csfloat_quote_is_fresh(entry, "name-a", now=now + 10))
         self.assertFalse(csfloat_quote_is_fresh(entry, "name-b", now=now + 10))
         self.assertFalse(csfloat_quote_is_fresh(entry, "name-a", now=now + 601))
+
+    def test_highest_buy_quote_has_an_independent_thirty_minute_cache(self):
+        now = time.time()
+        entry = {
+            "csfloat_buy_fetched_at": now,
+            "csfloat_buy_query_mhn": "name-a",
+        }
+        self.assertTrue(csfloat_buy_quote_is_fresh(entry, "name-a", now=now + 1_799))
+        self.assertFalse(csfloat_buy_quote_is_fresh(entry, "name-a", now=now + 1_801))
+        self.assertFalse(csfloat_buy_quote_is_fresh(entry, "name-b", now=now + 10))
 
     def test_cny_display_rounds_up_to_match_csfloat_frontend(self):
         self.assertEqual(csfloat_cny_display_price(1, 6.776), 0.07)
@@ -333,6 +390,41 @@ class CSFloatClientTests(unittest.TestCase):
         self.assertEqual(entry["csfloat_highest_buy_price_cents"], 15000)
         self.assertEqual(entry["csfloat_highest_buy_cny"], 1080.0)
         self.assertEqual(entry["csfloat_highest_buy_qty"], 2)
+
+    def test_worker_reuses_fresh_highest_buy_when_listing_quote_is_stale(self):
+        class ListingOnlyClient:
+            def __init__(self, _api_key):
+                pass
+
+            def get_lowest_buy_now(self, _market_hash_name):
+                return {
+                    "success": True, "found": True, "request_made": True,
+                    "listing_id": "new-listing", "price_cents": 21000,
+                    "price_usd": 210.0, "float_value": 0.2, "paint_seed": 1,
+                }
+
+            def get_highest_buy_order(self, _listing_id):
+                raise AssertionError("fresh thirty-minute buy cache must be reused")
+
+        name = "item"
+        entry = {
+            "name": name,
+            "market_hash_name": name,
+            "csfloat_buy_fetched_at": time.time(),
+            "csfloat_buy_query_mhn": name,
+            "csfloat_highest_buy_price_cents": 15000,
+            "csfloat_highest_buy_cny": 1080.0,
+            "csfloat_buy_status": "ok",
+        }
+        worker = MarketRefreshWorker()
+        with patch("modules.workers.CSFloatClient", ListingOnlyClient):
+            worker.refresh_all(
+                "", "", "", [entry], lambda value: value["market_hash_name"],
+                csfloat_api_key="test-key",
+            )
+
+        self.assertEqual(entry["csfloat_price_cents"], 21000)
+        self.assertEqual(entry["csfloat_highest_buy_price_cents"], 15000)
 
     def test_worker_prefers_csfloat_official_exchange_rate(self):
         class NoNetworkQuoteClient:

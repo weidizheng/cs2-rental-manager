@@ -5,7 +5,7 @@ from __future__ import annotations
 import sqlite3
 
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
@@ -179,6 +179,23 @@ def _migration_6(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_7(conn: sqlite3.Connection) -> None:
+    """Persist the user-confirmed pricing mode for IGXE imports."""
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rental_orders'"
+    ).fetchone()
+    if not table_exists:
+        # A few historical minimalist databases only contained ``items``.
+        # DBManager creates the complete rental table before normal migration;
+        # standalone migration callers must still be able to upgrade safely.
+        return
+    _add_columns(
+        conn,
+        "rental_orders",
+        (("pricing_mode", "TEXT NOT NULL DEFAULT ''"),),
+    )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
@@ -186,6 +203,7 @@ MIGRATIONS = {
     4: _migration_4,
     5: _migration_5,
     6: _migration_6,
+    7: _migration_7,
 }
 
 

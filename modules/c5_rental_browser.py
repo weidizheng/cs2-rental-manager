@@ -59,7 +59,7 @@ def parse_c5_rent_text(page_text: str) -> list[dict[str, Any]]:
     """
     order_starts = list(re.finditer(r"订单号\s*[：:]?\s*(\d{8,})", page_text))
     orders: list[dict[str, Any]] = []
-    statuses = ("租赁中", "已转交", "已完成", "已取消", "已关闭", "已退款")
+    statuses = ("租赁中", "已转交", "已归还", "已完成", "已取消", "已关闭", "已退款")
 
     for index, start in enumerate(order_starts):
         end = order_starts[index + 1].start() if index + 1 < len(order_starts) else len(page_text)

@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime
 
 from main import CS2ManagerApp
-from modules.cs2_item_schema import CS2ItemSchema, phase_hint_from_search
+from modules.cs2_item_schema import CS2ItemSchema, _canonical_name, phase_hint_from_search
 
 
 class ItemSchemaPhaseSearchTests(unittest.TestCase):
@@ -59,6 +59,51 @@ class ItemSchemaPhaseSearchTests(unittest.TestCase):
             "Sapphire",
         )
         self.assertEqual(name, "流浪者匕首（★） | 多普勒 (崭新出厂)")
+
+    def test_red_racer_typo_does_not_collapse_into_slingshot(self):
+        slingshot_market_name = "★ Sport Gloves | Slingshot (Field-Tested)"
+        slingshot = {
+            "id": "slingshot",
+            "name_zh": "运动手套（★） | 弹弓 (久经沙场)",
+            "market_hash_name": slingshot_market_name,
+            "paint_index": "1006",
+            "phase": "-",
+        }
+        red_racer_market_name = "★ Sport Gloves | Red Racer (Field-Tested)"
+        red_racer = {
+            "id": "red-racer",
+            "name_zh": "运动手套（★） | 赤色追风 (久经沙场)",
+            "market_hash_name": red_racer_market_name,
+            "paint_index": "10087",
+            "phase": "-",
+        }
+        schema = CS2ItemSchema._instance
+        schema.by_zh_name[_canonical_name(red_racer["name_zh"])] = red_racer
+        schema.by_zh_name[_canonical_name(slingshot["name_zh"])] = slingshot
+        schema.by_market_hash_name[red_racer_market_name] = red_racer
+        schema.by_market_hash_name[slingshot_market_name] = slingshot
+        schema.records.extend((red_racer, slingshot))
+
+        mapped = CS2ItemSchema.lookup_variant(
+            "运动手套（★） | 赤色迫风 (久经沙场)",
+            "Sport Gloves | Slingshot (Field-Tested)",
+            "-",
+        )
+
+        self.assertEqual(mapped["name_zh"], "运动手套（★） | 赤色追风 (久经沙场)")
+        self.assertEqual(mapped["market_hash_name"], red_racer_market_name)
+        self.assertEqual(
+            CS2ItemSchema.lookup("Sport Gloves | Slingshot (Field-Tested)")["name_zh"],
+            "运动手套（★） | 弹弓 (久经沙场)",
+        )
+        app = CS2ManagerApp.__new__(CS2ManagerApp)
+        self.assertEqual(
+            app._build_market_hash_name({
+                "name": "运动手套（★） | 赤色迫风 (久经沙场)",
+                "market_hash_name": "Sport Gloves | Slingshot (Field-Tested)",
+            }),
+            red_racer_market_name,
+        )
 
     def test_ai_asset_import_maps_to_chinese_and_sets_cooldown(self):
         app = CS2ManagerApp.__new__(CS2ManagerApp)

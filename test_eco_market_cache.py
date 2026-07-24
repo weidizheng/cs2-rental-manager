@@ -36,6 +36,21 @@ class ECOSelectiveCacheTests(unittest.TestCase):
         self.assertEqual(set(snapshot), {("Wanted", ""), ("Wanted", "phase2")})
         self.assertEqual(client.last_price_source, "cache")
 
+    def test_snapshot_retains_only_the_current_and_one_recent_partner(self):
+        cache_path = Path(self.temp_dir.name) / "retained-accounts.db"
+        first = ECOMarketCache("partner-one", cache_path)
+        second = ECOMarketCache("partner-two", cache_path)
+        third = ECOMarketCache("partner-three", cache_path)
+        snapshot = [{"HashName": "Wanted", "StyleName": "", "Price": 100, "RentGoodsBottomPrice": 1}]
+
+        first.replace_snapshot(snapshot, return_snapshot=False)
+        second.replace_snapshot(snapshot, return_snapshot=False)
+        third.replace_snapshot(snapshot, return_snapshot=False)
+
+        self.assertIsNone(first.status())
+        self.assertIsNotNone(second.status())
+        self.assertIsNotNone(third.status())
+
 
 if __name__ == "__main__":
     unittest.main()

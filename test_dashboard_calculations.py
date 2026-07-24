@@ -29,6 +29,62 @@ class DashboardCalculationTests(unittest.TestCase):
                     _rental_lifecycle_state(rental_end, now),
                     (expected_state, expected_end),
                 )
+
+    def test_returned_order_starts_full_seven_day_cd_at_actual_return_time(self):
+        rental_end = datetime(2026, 7, 23, 10, 0, 0)
+        returned_at = datetime(2026, 7, 23, 22, 26, 15)
+        self.assertEqual(
+            _rental_lifecycle_state(rental_end, returned_at, returned_at),
+            ("cooldown", returned_at + timedelta(days=7)),
+        )
+        self.assertEqual(
+            _rental_lifecycle_state(
+                rental_end,
+                returned_at + timedelta(days=7),
+                returned_at,
+            ),
+            ("available", None),
+        )
+
+    def test_only_active_orders_past_the_return_window_need_an_update(self):
+        now = datetime(2026, 7, 24, 13, 0, 0)
+        orders = [
+            {
+                "platform": "ECOSteam",
+                "order_no": "overdue",
+                "status": "租赁中",
+                "return_deadline": "2026-07-24 20:00:00",
+            },
+            {
+                "platform": "ECOSteam",
+                "order_no": "current",
+                "status": "待归还",
+                "return_deadline": "2026-07-25 00:00:00",
+            },
+            {
+                "platform": "ECOSteam",
+                "order_no": "returned",
+                "status": "已归还",
+                "return_deadline": "2026-07-24 20:00:00",
+            },
+        ]
+        stale = CS2ManagerApp._orders_needing_update(orders, now)
+        self.assertEqual([order["order_no"] for order in stale], ["overdue"])
+
+    def test_update_status_derives_deadline_without_a_return_deadline(self):
+        orders = [
+            {
+                "platform": "C5GAME",
+                "order_no": "derived-deadline",
+                "status": "租赁中",
+                "rental_end_time": "2026-07-24 12:00:00",
+            }
+        ]
+
+        stale = CS2ManagerApp._orders_needing_update(orders, datetime(2099, 1, 1))
+
+        self.assertEqual([order["order_no"] for order in stale], ["derived-deadline"])
+
     def test_one_percent_cost_surcharge_is_added_and_rounded_to_cents(self):
         self.assertEqual(_adjust_cost_by_percent(2121.76, 1), 2142.98)
 
@@ -92,6 +148,65 @@ class DashboardCalculationTests(unittest.TestCase):
         self.assertEqual(
             [entry["item"]["id"] for entry in sorted_records],
             [4, 2, 3, 1],
+        )
+
+    def test_dashboard_prioritizes_the_shortest_known_countdown(self):
+        now = datetime(2026, 7, 22, 12, 0, 0)
+
+        def record(item_id, deadline=None, unknown=False):
+            return {
+                "item": {"id": item_id, "name": f"Type {item_id}", "cost": 100},
+                "platform": "C5GAME",
+                "is_currently_rented": bool(deadline or unknown),
+                "sort_deadline": deadline,
+                "has_unknown_timer": unknown,
+            }
+
+        records = [
+            record(1),
+            record(2, now + timedelta(hours=5)),
+            record(3, now + timedelta(hours=2)),
+            record(4, unknown=True),
+        ]
+        sorted_records = _sort_dashboard_records(records)
+        self.assertEqual(
+            [entry["item"]["id"] for entry in sorted_records],
+            [3, 2, 4, 1],
+        )
+
+    def test_dashboard_sorts_active_rentals_before_cooldowns(self):
+        now = datetime(2026, 7, 22, 12, 0, 0)
+
+        def record(item_id, priority, deadline):
+            return {
+                "item": {"id": item_id, "name": f"Type {item_id}", "cost": 100},
+                "platform": "C5GAME",
+                "is_currently_rented": priority == 0,
+                "sort_deadline": deadline,
+                "lifecycle_priority": priority,
+            }
+
+        records = [
+            record(1, 1, now + timedelta(hours=1)),
+            record(2, 0, now + timedelta(hours=5)),
+            record(3, 1, now + timedelta(hours=3)),
+            record(4, 0, now + timedelta(hours=2)),
+        ]
+        self.assertEqual(
+            [entry["item"]["id"] for entry in _sort_dashboard_records(records)],
+            [4, 2, 1, 3],
+        )
+
+    def test_eco_uses_return_deadline_for_existing_order_countdowns(self):
+        order = {
+            "platform": "ECOSteam",
+            "start_time": "2026-07-22 01:20:03",
+            "rental_days": 10,
+            "return_deadline": "2026-08-01 19:23:43",
+        }
+        self.assertEqual(
+            CS2ManagerApp._rental_end_datetime(order),
+            datetime(2026, 7, 31, 23, 23, 43),
         )
 
     def test_refresh_collection_includes_inactive_categories_and_deduplicates(self):
@@ -217,6 +332,28 @@ class DashboardCalculationTests(unittest.TestCase):
         self.assertEqual(len(set(Stub.db.calls)), 6)
         self.assertEqual(rates["c5_first_fee"], 0.05)
         self.assertEqual(rates["eco_relet_fee"], 0.05)
+
+    def test_igxe_confirmed_pricing_mode_overrides_legacy_fee_settings(self):
+        class DBStub:
+            @staticmethod
+            def get_config(_key):
+                return "0.42"
+
+        class Stub:
+            db = DBStub()
+
+            @staticmethod
+            def _is_relet_order(_order, _history):
+                return False
+
+        one_click = CS2ManagerApp._order_fee_rate(
+            Stub(), {"platform": "IGXE", "pricing_mode": "one_click"}, []
+        )
+        manual = CS2ManagerApp._order_fee_rate(
+            Stub(), {"platform": "IGXE", "pricing_mode": "manual"}, []
+        )
+        self.assertEqual(one_click, 0.05)
+        self.assertEqual(manual, 0.10)
 
 
 if __name__ == "__main__":

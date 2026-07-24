@@ -91,8 +91,17 @@ def is_non_earning_rental_status(status) -> bool:
     return str(status or "").strip() in {"已取消", "已关闭", "已退款"}
 
 
-def rental_lifecycle_state(rental_end: datetime, now: datetime | None = None):
+def rental_lifecycle_state(
+    rental_end: datetime,
+    now: datetime | None = None,
+    returned_at: datetime | None = None,
+):
     now = now or datetime.now()
+    if returned_at is not None and returned_at > datetime.min:
+        cooldown_end = returned_at + RENTAL_COOLDOWN_DURATION
+        if now < cooldown_end:
+            return "cooldown", cooldown_end
+        return "available", None
     if rental_end <= datetime.min:
         return "unknown", None
     if now < rental_end:
@@ -121,9 +130,22 @@ def sort_dashboard_records(records: list[dict]) -> list[dict]:
         type_key = (platform, item_type)
         type_min_costs[type_key] = min(type_min_costs.get(type_key, cost), cost)
 
+    def countdown_key(record):
+        deadline = record.get("sort_deadline")
+        try:
+            lifecycle_priority = int(record.get("lifecycle_priority", 2))
+        except (TypeError, ValueError):
+            lifecycle_priority = 2
+        if isinstance(deadline, datetime) and deadline > datetime.min:
+            return lifecycle_priority, deadline
+        if record.get("has_unknown_timer"):
+            return lifecycle_priority, datetime.max
+        return 3, datetime.max
+
     return sorted(
         records,
         key=lambda record: (
+            *countdown_key(record),
             -platform_rented_counts.get(str(record.get("platform") or "未分类"), 0),
             -platform_total_counts.get(str(record.get("platform") or "未分类"), 0),
             str(record.get("platform") or "未分类").casefold(),
@@ -136,3 +158,27 @@ def sort_dashboard_records(records: list[dict]) -> list[dict]:
             int(record["item"].get("id", 0) or 0),
         ),
     )
+
+
+def build_market_quote_index(categories: dict, identity_builder) -> tuple[dict, dict]:
+    """Index cached quote rows once for dashboard rendering."""
+    identity_quotes = {}
+    name_quotes = {}
+    for category in categories.values():
+        for quote_entry in category.get("items", []):
+            quote_identity = identity_builder(
+                quote_entry.get("market_hash_name", quote_entry.get("name", "")),
+                quote_entry.get("phase", "-"),
+            )
+            identity_quotes.setdefault(quote_identity, quote_entry)
+            fallback_name = str(quote_entry.get("name", "")).strip().casefold()
+            if fallback_name:
+                name_quotes.setdefault(fallback_name, quote_entry)
+    return identity_quotes, name_quotes
+
+
+def find_market_quote(quote_index, market_hash_name, phase, fallback_name, identity_builder):
+    """Resolve an inventory asset to the most specific cached market quote."""
+    identity_quotes, name_quotes = quote_index
+    identity = identity_builder(market_hash_name, phase)
+    return identity_quotes.get(identity) or name_quotes.get(str(fallback_name or "").strip().casefold()) or {}

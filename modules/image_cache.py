@@ -3,7 +3,7 @@
 
 功能：
 1. 本地图片异步下载与缓存 (data/images/{market_hash_name}.png)
-2. 行情缓存落盘 (data/market_cache.json)，冷启动时直接读取渲染界面
+2. 兼容读取旧版行情缓存 (data/market_cache.json) 以迁移至 SQLite
 """
 import os
 import json
@@ -21,6 +21,8 @@ logger = logging.getLogger("CS2Rental")
 DATA_DIR = str(get_private_data_dir())
 IMAGES_DIR = os.path.join(DATA_DIR, "images")
 MARKET_CACHE_PATH = os.path.join(DATA_DIR, "market_cache.json")
+MAX_IMAGE_CACHE_BYTES = 250 * 1024 * 1024
+MAX_IMAGE_CACHE_FILES = 2_000
 
 
 class ImageCache:
@@ -47,6 +49,34 @@ class ImageCache:
     def exists(market_hash_name: str) -> bool:
         """检查本地图片是否存在"""
         return os.path.exists(ImageCache.get_local_path(market_hash_name))
+
+    @staticmethod
+    def prune(
+        max_bytes: int = MAX_IMAGE_CACHE_BYTES,
+        max_files: int = MAX_IMAGE_CACHE_FILES,
+    ) -> None:
+        """Keep the regenerable image cache within a predictable disk budget."""
+        try:
+            candidates = []
+            with os.scandir(IMAGES_DIR) as entries:
+                for entry in entries:
+                    if not entry.is_file() or not entry.name.lower().endswith((".img", ".png")):
+                        continue
+                    stat = entry.stat()
+                    candidates.append((stat.st_mtime, stat.st_size, entry.path))
+            total_bytes = sum(item[1] for item in candidates)
+            excess_files = max(0, len(candidates) - max_files)
+            for _, size, path in sorted(candidates):
+                if total_bytes <= max_bytes and excess_files <= 0:
+                    break
+                try:
+                    os.remove(path)
+                    total_bytes -= size
+                    excess_files -= 1
+                except OSError:
+                    continue
+        except OSError:
+            logger.debug("[ImageCache] 清理图片缓存失败", exc_info=True)
 
     @staticmethod
     def download(market_hash_name: str, url: str) -> Optional[str]:
@@ -96,6 +126,7 @@ class ImageCache:
                         os.fsync(image_file.fileno())
                     os.replace(temp_path, local_path)
                     temp_path = None
+                    ImageCache.prune()
                 finally:
                     if temp_path and os.path.exists(temp_path):
                         os.remove(temp_path)
@@ -111,7 +142,7 @@ class ImageCache:
 
 
 class MarketCache:
-    """行情数据缓存管理器（落盘到 data/market_cache.json）"""
+    """Legacy market-cache reader retained for one-time SQLite migration."""
 
     @staticmethod
     def _summary(data: Dict[str, Any]) -> str:
@@ -129,7 +160,7 @@ class MarketCache:
     @staticmethod
     def save(data: Dict[str, Any]):
         """
-        保存行情缓存到 JSON 文件。
+        保存旧版行情缓存到 JSON 文件（仅兼容旧调用，当前应用不会调用）。
 
         Args:
             data: 以 "{name}|{phase}" 为 key 的行情数据字典

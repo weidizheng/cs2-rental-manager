@@ -102,7 +102,7 @@ class DataIntegrityTests(unittest.TestCase):
             "SELECT cooldown_until FROM items"
         ).fetchone()[0]
         connection.close()
-        self.assertEqual(version, 6)
+        self.assertEqual(version, 7)
         self.assertTrue(deadline)
 
     def test_blank_asset_ids_are_generated_and_preserved(self):
@@ -177,6 +177,30 @@ class DataIntegrityTests(unittest.TestCase):
         self.assertFalse(
             any(order["order_no"] == "rolled-back" for order in self.db.get_rental_orders())
         )
+
+    def test_watchlist_keeps_cached_quotes_in_sqlite(self):
+        watchlist = {
+            "format": "market_categories_v1",
+            "active_category_id": "rentals",
+            "categories": [{
+                "id": "rentals",
+                "name": "Rentals",
+                "items": [{
+                    "key": "A|-",
+                    "name": "A",
+                    "market_hash_name": "A",
+                    "phase": "-",
+                    "csqaq_min_sell_price": 123.45,
+                    "csfloat_min_sell_cny": 120.01,
+                    "detail": {"name_zh": "A"},
+                }],
+            }],
+        }
+        self.db.save_market_watchlist(watchlist)
+        saved = self.db.load_market_watchlist()["categories"][0]["items"][0]
+        self.assertEqual(saved["csqaq_min_sell_price"], 123.45)
+        self.assertEqual(saved["csfloat_min_sell_cny"], 120.01)
+        self.assertEqual(saved["detail"], {"name_zh": "A"})
 
 
 class ItemDialogValidationTests(unittest.TestCase):

@@ -13,6 +13,7 @@ from modules.paths import get_private_path
 
 
 CACHE_TTL_SECONDS = 10 * 60
+MAX_CACHED_PARTNERS = 2
 DB_PATH = get_private_path("eco_market_cache.db")
 
 
@@ -188,6 +189,20 @@ class ECOMarketCache:
                 """,
                 (self.partner_id, fetched_at, len(rows)),
             )
+            # A full snapshot may hold tens of thousands of rows.  Keep the
+            # current account and one recent account, then reclaim old ones.
+            old_partners = conn.execute(
+                """
+                SELECT partner_id FROM eco_cache_meta
+                WHERE partner_id != ?
+                ORDER BY fetched_at DESC, partner_id DESC
+                """,
+                (self.partner_id,),
+            ).fetchall()
+            for old_partner in old_partners[MAX_CACHED_PARTNERS - 1:]:
+                partner_id = old_partner["partner_id"]
+                conn.execute("DELETE FROM eco_prices WHERE partner_id = ?", (partner_id,))
+                conn.execute("DELETE FROM eco_cache_meta WHERE partner_id = ?", (partner_id,))
         return self.load_snapshot() if return_snapshot else {}
 
     @staticmethod

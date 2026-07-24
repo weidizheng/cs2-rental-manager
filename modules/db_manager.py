@@ -22,11 +22,6 @@ CONFIGS_JSON_PATH = os.path.join(DATA_DIR, "configs.json")
 
 logger = logging.getLogger("CS2Rental")
 
-WATCH_PERSIST_FIELDS = (
-    "key", "name", "phase", "market_hash_name", "image_url", "links",
-    "schema_id", "paint_index", "csqaq_good_id", "c5_id", "yyyp_id",
-    "igxe_id", "eco_id",
-)
 SECRET_CONFIG_KEYS = {
     "csqaq_token", "csfloat_api_key", "eco_partner_id", "eco_rsa_key",
 }
@@ -224,6 +219,7 @@ class DBManager:
             transfer_reward_cents INTEGER NOT NULL DEFAULT 0,
             reward_status TEXT DEFAULT '',
             transfer_reward_known INTEGER DEFAULT 0,
+            pricing_mode TEXT NOT NULL DEFAULT '',
             item_id INTEGER DEFAULT NULL,
             match_method TEXT NOT NULL DEFAULT '',
             match_confidence REAL NOT NULL DEFAULT 0.0,
@@ -567,8 +563,8 @@ class DBManager:
                     start_time, return_time, rental_end_time, return_deadline, transfer_status,
                     status, raw_text, transfer_reward, transfer_reward_cents,
                     reward_status, transfer_reward_known,
-                    item_id, match_method, match_confidence, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pricing_mode, item_id, match_method, match_confidence, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(platform, order_no) DO UPDATE SET
                     item_name=excluded.item_name,
                     float_val=excluded.float_val,
@@ -597,6 +593,8 @@ class DBManager:
                     reward_status=CASE WHEN excluded.transfer_reward_known=1
                         THEN excluded.reward_status ELSE rental_orders.reward_status END,
                     transfer_reward_known=MAX(rental_orders.transfer_reward_known, excluded.transfer_reward_known),
+                    pricing_mode=CASE WHEN excluded.pricing_mode!=''
+                        THEN excluded.pricing_mode ELSE rental_orders.pricing_mode END,
                     item_id=COALESCE(excluded.item_id, rental_orders.item_id),
                     match_method=CASE WHEN excluded.item_id IS NOT NULL
                         THEN excluded.match_method ELSE rental_orders.match_method END,
@@ -634,6 +632,7 @@ class DBManager:
                     money_to_cents(transfer_reward),
                     order.get("reward_status", ""),
                     1 if order.get("transfer_reward_known", False) else 0,
+                    str(order.get("pricing_mode", "") or ""),
                     association["item_id"],
                     association["method"],
                     association["confidence"],
@@ -654,7 +653,7 @@ class DBManager:
                        income_cents, daily_rent_cents, rental_days, rental_type, deposit_cents,
                        start_time, return_time, rental_end_time, return_deadline, transfer_status,
                        status, raw_text, transfer_reward_cents, reward_status,
-                       transfer_reward_known, item_id, match_method, match_confidence, synced_at
+                       transfer_reward_known, pricing_mode, item_id, match_method, match_confidence, synced_at
                 FROM rental_orders WHERE platform=?
                 ORDER BY synced_at DESC, id DESC
                 """,
@@ -666,7 +665,7 @@ class DBManager:
                        income_cents, daily_rent_cents, rental_days, rental_type, deposit_cents,
                        start_time, return_time, rental_end_time, return_deadline, transfer_status,
                        status, raw_text, transfer_reward_cents, reward_status,
-                       transfer_reward_known, item_id, match_method, match_confidence, synced_at
+                       transfer_reward_known, pricing_mode, item_id, match_method, match_confidence, synced_at
                 FROM rental_orders ORDER BY synced_at DESC, id DESC
             """)
             rows = cursor.fetchall()
@@ -674,7 +673,7 @@ class DBManager:
             "platform", "order_no", "item_name", "float_val", "income_cents", "daily_rent_cents", "rental_days", "rental_type", "deposit_cents",
             "start_time", "return_time", "rental_end_time", "return_deadline", "transfer_status",
             "status", "raw_text", "transfer_reward_cents", "reward_status",
-            "transfer_reward_known", "item_id", "match_method", "match_confidence", "synced_at",
+            "transfer_reward_known", "pricing_mode", "item_id", "match_method", "match_confidence", "synced_at",
         )
         orders = [dict(zip(columns, row)) for row in rows]
         # Keep reads compatible with rows imported before ``rental_type`` was
@@ -766,7 +765,7 @@ class DBManager:
         return f"{name}|{phase}".casefold()
 
     def save_market_watchlist(self, cache, *, manage_transaction=True):
-        """Persist user-owned watch identities separately from quote cache data."""
+        """Persist the complete market-watch snapshot in the authoritative store."""
         if not isinstance(cache, dict):
             return
         categories = cache.get("categories")
@@ -800,9 +799,11 @@ class DBManager:
                         identity = self._watch_identity(item)
                         if not identity:
                             continue
-                        portable = {
-                            key: item[key] for key in WATCH_PERSIST_FIELDS if key in item
-                        }
+                        # Watch entries never contain API credentials.  Keeping
+                        # the complete normalized snapshot makes SQLite the one
+                        # source of truth for both the watchlist and its latest
+                        # offline quote, eliminating a second JSON cache write.
+                        portable = dict(item)
                         conn.execute(
                             """INSERT INTO market_watch_items(
                                    category_id, identity, data_json, position
@@ -848,7 +849,7 @@ class DBManager:
         self.save_all_configs_to_json()
 
     def load_market_watchlist(self):
-        """Load the durable watch-list projection, without ephemeral prices."""
+        """Load the durable market-watch snapshot, including cached quotes."""
         with self._db_lock:
             conn = self.get_connection()
             categories = []

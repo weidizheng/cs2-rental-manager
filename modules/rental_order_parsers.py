@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import datetime, timedelta
 from typing import Any
 
 from modules.c5_rental_browser import parse_c5_rent_text
+from modules.platform_time import parse_platform_datetime_utc, utc_now
 from modules.rental_terms import classify_rental_term
 
 
@@ -59,6 +61,17 @@ def _end_from_start_and_days(start_time: str, rental_days: float) -> str:
     try:
         start = datetime.strptime(start_time, "%Y-%m-%d %H:%M:%S")
         return (start + timedelta(days=rental_days)).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return ""
+
+
+def _end_from_return_deadline(return_deadline: str, grace_hours: float = 12.0) -> str:
+    """Derive ECO rental end from its explicit return deadline when available."""
+    if not return_deadline:
+        return ""
+    try:
+        deadline = datetime.strptime(return_deadline, "%Y-%m-%d %H:%M:%S")
+        return (deadline - timedelta(hours=grace_hours)).strftime("%Y-%m-%d %H:%M:%S")
     except ValueError:
         return ""
 
@@ -138,9 +151,14 @@ def parse_eco_clipboard(text: str) -> list[dict[str, Any]]:
         rental_days = _float(_first(r"×\s*([0-9.]+)\s*[（(]\s*(?:长租|短租)", block))
         deposit = _float(_first(r"含押金\s*￥\s*([0-9.]+)", block))
         return_deadline = _normal_datetime(_first(r"(20\d{2}年\d{2}月\d{2}日\s+\d{2}:\d{2}:\d{2})\s*前归还", block))
-        # ECO exposes a return deadline.  Rental availability ends at the
-        # explicitly ordered duration, normally about twelve hours earlier.
-        return_time = _end_from_start_and_days(start_time, rental_days) or return_deadline
+        # The page deadline is authoritative.  ECO allows a 12-hour return
+        # window after the rental ends, while creation can precede actual
+        # delivery/start time by hours.
+        rental_end_time = (
+            _end_from_return_deadline(return_deadline)
+            or _end_from_start_and_days(start_time, rental_days)
+        )
+        return_time = rental_end_time or return_deadline
         orders.append({
             "order_no": order_no,
             "item_name": item_name,
@@ -152,7 +170,7 @@ def parse_eco_clipboard(text: str) -> list[dict[str, Any]]:
             "income": daily_rent * rental_days,
             "start_time": start_time,
             "return_time": return_time,
-            "rental_end_time": return_time,
+            "rental_end_time": rental_end_time or return_time,
             "return_deadline": return_deadline,
             "transfer_status": "",
             "status": _status_from_text(block),
@@ -163,16 +181,30 @@ def parse_eco_clipboard(text: str) -> list[dict[str, Any]]:
 
 def parse_igxe_clipboard(text: str) -> list[dict[str, Any]]:
     blocks = _split_blocks(r"(?m)^\s*订单类型\s*[：:]", text)
+    # Some browser/Markdown copies omit the label and/or the individual trade
+    # link. One copied page is still one safe import block in either case.
+    if not blocks and (
+        "igxe.cn/lease/trade/" in text
+        or sum(marker in text for marker in (
+            "创建时间", "租赁到期时间", "归还截止时间", "租赁租金"
+        )) >= 3
+    ):
+        blocks = [text]
     orders: list[dict[str, Any]] = []
     for block in blocks:
         trade_id = _first(r"https?://www\.igxe\.cn/lease/trade/730/(\d+)", block)
-        if not trade_id:
-            continue
         start_time = _normal_datetime(_first(r"创建时间\s*[：:]\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", block))
         rental_end_time = _normal_datetime(_first(r"租赁到期时间\s*[：:]\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", block))
         return_deadline = _normal_datetime(_first(r"归还截止时间\s*[：:]\s*(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})", block))
         return_time = rental_end_time or return_deadline
         item_name = _first(r"\[([^\]]+)\]\(https?://www\.igxe\.cn/lease/trade/730/", block)
+        if not item_name:
+            # Chromium's plain-text clipboard can strip the Markdown link.
+            # The title itself survives as a line containing the weapon/skin
+            # separator, so accept that native direct-copy layout too.
+            item_name = _first(r"(?m)^\s*([^\r\n]+?\|[^\r\n]+?)\s*$", block)
+            if "http" in item_name.lower():
+                item_name = ""
         float_val = _first(r"磨损\s*([0-9.]+)", block)
         daily_rent = _float(_first(r"租赁价格[\s\S]{0,80}?￥\s*([0-9.]+)\s*/\s*天", block))
         # IGXE copied text often preserves Markdown emphasis, for example
@@ -182,8 +214,19 @@ def parse_igxe_clipboard(text: str) -> list[dict[str, Any]]:
         income = _float(_first(r"订单金额[\s\S]{0,80}?￥\s*([0-9.]+)", block))
         if income <= 0:
             income = daily_rent * rental_days
-        parsed_return = _parse_datetime_or_min(return_time)
-        status = "租赁中" if parsed_return and parsed_return > datetime.now() else "已完成"
+        parsed_return = parse_platform_datetime_utc(return_time, "IGXE")
+        status = "租赁中" if parsed_return > utc_now() else "已完成"
+        if not trade_id:
+            # A link-free copy has no IGXE trade ID. Build a repeatable local
+            # key from the immutable order fields, so repeating the same paste
+            # updates the row rather than creating duplicate income.
+            key_source = "|".join((
+                start_time, item_name, float_val, f"{daily_rent:.8f}",
+                f"{rental_days:.8f}", rental_end_time, return_deadline,
+            ))
+            if not (start_time and item_name and (rental_end_time or return_deadline)):
+                continue
+            trade_id = f"clipboard-{hashlib.sha1(key_source.encode('utf-8')).hexdigest()[:16]}"
         orders.append({
             "order_no": f"IGXE-{trade_id}",
             "item_name": item_name,
@@ -212,9 +255,18 @@ def _parse_datetime_or_min(value: str) -> datetime | None:
 
 
 def detect_clipboard_platform(text: str) -> str:
-    if "归还截止时间" in text and "igxe.cn/lease/trade" in text:
+    # Every platform is identified by two page-specific markers instead of
+    # order-number length or copy order.  This keeps Markdown/plain-text
+    # copies equivalent and avoids treating a pending IGXE order (whose amount
+    # is not yet settled) as an unsupported format.
+    igxe_markers = sum(marker in text for marker in (
+        "订单类型", "创建时间", "租赁到期时间", "归还截止时间", "租赁租金"
+    ))
+    if "igxe.cn/lease/trade/" in text or igxe_markers >= 4:
         return "IGXE"
-    if "订单编号" in text and ("前归还" in text or "ECO_" in text):
+    if "订单编号" in text and (
+        "ecosteam.cn/" in text or "前归还" in text or "ECO_" in text
+    ):
         return "ECOSteam"
     if "订单号" in text and "查看详情" in text:
         return "C5GAME"

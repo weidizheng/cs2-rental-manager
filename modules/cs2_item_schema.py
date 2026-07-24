@@ -42,6 +42,10 @@ PHASE_BY_PAINT_INDEX = {
 def _canonical_name(value: str) -> str:
     """Normalize punctuation, whitespace and star placement for local lookup."""
     text = unicodedata.normalize("NFKC", value or "")
+    # A legacy AI-import template produced this typo for Red Racer.  Preserve
+    # the user's Chinese item identity instead of incorrectly trusting a
+    # conflicting model-generated English market name (often Slingshot).
+    text = text.replace("赤色迫风", "赤色追风")
     text = re.sub(r"\s+", "", text)
     match = re.fullmatch(r"★?(.+?)(?:\(★\))?\|(.+)\((.+)\)", text)
     if match:
@@ -141,10 +145,24 @@ class CS2ItemSchema:
     def lookup(cls, display_name: str) -> dict[str, Any] | None:
         """Resolve either a Chinese display name or an English market name."""
         schema = cls.get()
-        return (
-            schema.by_zh_name.get(_canonical_name(display_name))
-            or schema.by_market_hash_name.get(display_name.strip())
+        raw_name = str(display_name or "").strip()
+        mapped = (
+            schema.by_zh_name.get(_canonical_name(raw_name))
+            or schema.by_market_hash_name.get(raw_name)
         )
+        if mapped:
+            return mapped
+        # Older/imported glove and knife records sometimes omit Steam's
+        # leading star even though the rest of the market hash name is exact.
+        # Try the alternate form locally; never change firearm identities.
+        if "|" in raw_name:
+            alternate = (
+                raw_name.removeprefix("★").strip()
+                if raw_name.startswith("★")
+                else f"★ {raw_name}"
+            )
+            return schema.by_market_hash_name.get(alternate)
+        return None
 
     @classmethod
     def lookup_variant(
@@ -171,7 +189,7 @@ class CS2ItemSchema:
                     return record
                 if canonical_display and _canonical_name(record.get("name_zh", "")) == canonical_display:
                     return record
-        return cls.lookup(display_name or market_name)
+        return cls.lookup(display_name) or cls.lookup(market_name)
 
     @classmethod
     def chinese_display_name(

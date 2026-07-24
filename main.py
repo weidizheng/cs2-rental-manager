@@ -12,16 +12,17 @@ from urllib.parse import quote
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton,
-    QTableWidget, QTableWidgetItem, QComboBox, QHeaderView,
+    QTableWidget, QTableWidgetItem, QTableView, QComboBox, QHeaderView,
     QFormLayout, QGroupBox, QMessageBox,
     QAbstractItemView, QDialog, QScrollArea,
     QCheckBox, QFrame, QPlainTextEdit,
     QMenu, QInputDialog, QFileDialog, QStackedWidget, QToolButton, QSizePolicy,
+    QGraphicsOpacityEffect,
     QGridLayout,
 )
 from PySide6.QtCore import (
     Qt, QTimer, QThread, QUrl, QTime, QSize, QByteArray, QEvent, QLocale,
-    QSettings, Slot,
+    QSettings, Slot, QPropertyAnimation, QEasingCurve,
 )
 from PySide6.QtGui import (
     QFont, QColor, QPixmap, QIcon, QPainter, QDesktopServices, QDoubleValidator, QIntValidator, QShortcut, QKeySequence,
@@ -32,14 +33,25 @@ from modules.db_manager import DBManager
 from modules.workers import (
     ApiWorker,
     ApiWorkerCallbackRelay,
+    CSFLOAT_BUY_QUOTE_TTL_SECONDS,
     MarketRefreshWorker,
-    csfloat_cny_display_price,
     csfloat_quote_is_fresh,
 )
 from modules.logger import logger
 from modules.image_cache import ImageCache, MarketCache
+from modules.market_watch_service import (
+    merge_durable_watchlist,
+    normalize_phase,
+    watch_identity,
+)
+from modules.market_table_model import MarketTableModel
 from modules.cs2_item_schema import CS2ItemSchema, phase_hint_from_search
 from modules.rental_order_parsers import parse_rental_clipboard
+from modules.platform_time import (
+    local_datetime_to_utc as _local_datetime_to_utc,
+    parse_platform_datetime_utc as _parse_platform_datetime_utc,
+    utc_now as _utc_now,
+)
 from modules.domain_models import InventoryItemDraft
 from modules.rental_matching import match_order_to_items
 from modules.asset_import import apply_asset_import_plan, plan_asset_import
@@ -48,13 +60,12 @@ from modules.startup_manager import (
     is_startup_enabled,
     set_startup_enabled,
 )
-from modules.csfloat_buy_analysis import (
-    analyze_csfloat_buy_order as _csfloat_buy_order_analysis,
-)
 from modules.dashboard_service import (
     RENTAL_RELET_WINDOW,
     adjust_cost_by_percent as _adjust_cost_by_percent,
+    build_market_quote_index as _build_market_quote_index,
     build_dashboard_rental_history_index as _build_rental_history_index,
+    find_market_quote as _find_market_quote,
     is_non_earning_rental_status as _is_non_earning_rental_status,
     money_text as _money_text,
     parse_rental_datetime as _parse_rental_datetime,
@@ -68,7 +79,6 @@ from modules.ui_theme import APP_QSS
 from modules.version import __version__
 from modules.paths import get_private_path
 from modules.csfloat_client import CSFloatClient
-from modules.exchange_rate_client import ExchangeRateClient
 from modules.cloud_sync import (
     SYNC_FILENAME,
     export_sync_bundle,
@@ -87,11 +97,11 @@ ORDER_PAGE_URLS = {
 }
 
 
-# Detailed market requests rotate in the background so a large watch list
-# never stalls behind one monolithic refresh.
-MARKET_ROLLING_REFRESH_SECONDS = 12
-CSFLOAT_BUY_DETAIL_LIMIT = 1
-CSFLOAT_BUY_AUTO_REFRESH_SECONDS = 10 * 60
+# The timer is only a fallback/wakeup mechanism.  Successful category batches
+# immediately queue the next stage, so a full scan no longer waits one timer
+# tick between every item.
+GLOBAL_SYNC_POLL_SECONDS = 3
+GLOBAL_SYNC_MIN_CYCLE_SECONDS = 10 * 60
 
 
 def _parse_cooldown_datetime(value) -> datetime:
@@ -548,10 +558,10 @@ class RentalImportPreviewDialog(QDialog):
         ))
 
         self.table = QTableWidget()
-        self.table.setColumnCount(12)
+        self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels([
             "平台", "订单号", "饰品", "磨损", "出租时间", "归还时间",
-            "租期", "日租（原价）", "订单金额", "转租奖励（成本）", "状态", "关联资产",
+            "租期", "日租（原价）", "订单金额", "转租奖励（成本）", "状态", "定价方式", "关联资产",
         ])
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(False)
@@ -562,7 +572,7 @@ class RentalImportPreviewDialog(QDialog):
         header.setFont(QFont("Microsoft YaHei", 11, QFont.DemiBold))
         self.table.setFont(QFont("Microsoft YaHei", 11))
         header.setSectionResizeMode(2, QHeaderView.Stretch)
-        for column in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10):
+        for column in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
 
         for row, order in enumerate(orders):
@@ -607,7 +617,22 @@ class RentalImportPreviewDialog(QDialog):
             selector.currentIndexChanged.connect(
                 lambda _index, target=order, field=selector: self._set_order_asset(target, field)
             )
-            self.table.setCellWidget(row, 11, selector)
+            if platform == "IGXE":
+                pricing_selector = QComboBox()
+                pricing_selector.addItem("请选择", "")
+                pricing_selector.addItem("一键定价（服务费 5%）", "one_click")
+                pricing_selector.addItem("手动定价（服务费 10%）", "manual")
+                selected_mode = str(order.get("pricing_mode", "") or "")
+                selected_mode_index = pricing_selector.findData(selected_mode)
+                pricing_selector.setCurrentIndex(max(0, selected_mode_index))
+                pricing_selector.currentIndexChanged.connect(
+                    lambda _index, target=order, field=pricing_selector:
+                    self._set_order_pricing_mode(target, field)
+                )
+                self.table.setCellWidget(row, 11, pricing_selector)
+            else:
+                self.table.setItem(row, 11, QTableWidgetItem("不适用"))
+            self.table.setCellWidget(row, 12, selector)
         layout.addWidget(self.table)
 
         buttons = QHBoxLayout()
@@ -616,7 +641,7 @@ class RentalImportPreviewDialog(QDialog):
         cancel_button.clicked.connect(self.reject)
         confirm_button = QPushButton("确认导入")
         confirm_button.setObjectName("successBtn")
-        confirm_button.clicked.connect(self.accept)
+        confirm_button.clicked.connect(self._accept_import)
         buttons.addWidget(cancel_button)
         buttons.addWidget(confirm_button)
         layout.addLayout(buttons)
@@ -632,6 +657,27 @@ class RentalImportPreviewDialog(QDialog):
         order["item_id"] = int(item_id)
         order["match_method"] = "manual"
         order["match_confidence"] = 1.0
+
+    @staticmethod
+    def _set_order_pricing_mode(order, selector):
+        order["pricing_mode"] = str(selector.currentData() or "")
+
+    def _accept_import(self):
+        if self.platform == "IGXE":
+            unselected = [
+                str(order.get("order_no", "")) for order in self.orders
+                if not order.get("pricing_mode")
+            ]
+            if unselected:
+                QMessageBox.warning(
+                    self,
+                    "请选择 IGXE 定价方式",
+                    "IGXE 页面不提供定价方式，无法由文字可靠判断。\n"
+                    "请为每笔订单选择“一键定价（5%）”或“手动定价（10%）”后再导入：\n"
+                    + "、".join(unselected),
+                )
+                return
+        self.accept()
 
 
 class MarketAIImportDialog(QDialog):
@@ -1105,6 +1151,8 @@ class CS2ManagerApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.ui_settings = QSettings("CS2RentalManager", "Desktop")
+        self._reduce_motion = self.ui_settings.value("accessibility/reduce_motion", False, type=bool)
+        self._page_animation = None
         self.db = DBManager()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.Window)
         self.setWindowTitle("CS2 出租管理")
@@ -1124,13 +1172,20 @@ class CS2ManagerApp(QMainWindow):
         self._market_refresh_background = False
         self._market_refresh_fast_only = False
         self._market_search_in_progress = False
+        self._inventory_market_sync_pending = False
         # One rolling cycle covers every distinct market lookup once.  This is
         # UI-only state: timestamps remain the source of truth after restart.
         self._market_rolling_cycle_pending = set()
         self._market_rolling_cycle_known = set()
         self._market_rolling_cycle_total = 0
+        self._market_rolling_cycle_stage = "market"
+        self._market_rolling_cycle_wait_until = 0.0
+        self._market_refresh_category_name = ""
+        self._global_sync_cycle_request_start_count = CSFloatClient.request_count()
         self._sync_progress_buttons = []
         self._dashboard_rental_rows = {}
+        self._dashboard_cached_items = None
+        self._dashboard_cached_orders = None
 
         # 当前市场详情页选中的物品标识 (name|phase)
         self._current_market_item_key = ""
@@ -1140,16 +1195,6 @@ class CS2ManagerApp(QMainWindow):
         self._active_market_category_id = "rentals"
         self._market_thumbnail_cache = {}
         self._market_table_render_pending = False
-        self._csfloat_buy_order_rows = []
-        self._csfloat_buy_table_render_pending = False
-        self._csfloat_buy_detail_cursor = 0
-        self._csfloat_buy_refresh_in_progress = False
-        self._csfloat_buy_has_loaded = False
-        self._csfloat_buy_refresh_background = False
-        self._csfloat_buy_last_auto_refresh_at = 0.0
-        self._csfloat_buy_fx_rate = self._configured_usd_cny_rate()
-        self._csfloat_buy_fx_source = "手动备用"
-
         self.apply_theme()
         self.init_ui()
 
@@ -1177,7 +1222,7 @@ class CS2ManagerApp(QMainWindow):
         self._market_rolling_sync_enabled = True
         self.update_timer_interval()
         self._reset_market_rolling_cycle()
-        self.market_rolling_refresh_timer.start(MARKET_ROLLING_REFRESH_SECONDS * 1000)
+        self.market_rolling_refresh_timer.start(GLOBAL_SYNC_POLL_SECONDS * 1000)
         self._restore_ui_state()
 
     def apply_theme(self):
@@ -1215,7 +1260,6 @@ class CS2ManagerApp(QMainWindow):
         for index, label, icon_name in (
             (0, "资产总览", "dashboard"),
             (1, "大盘行情", "market"),
-            (2, "CSF 求购", "buy_orders"),
         ):
             button = QPushButton(label)
             button.setObjectName("navButton")
@@ -1239,7 +1283,7 @@ class CS2ManagerApp(QMainWindow):
             "QToolButton { color: #a6adc8; padding: 7px 8px; border-radius: 6px; }"
             "QToolButton:hover { color: #cdd6f4; background: #1e1e2e; }"
         )
-        self.settings_button.clicked.connect(lambda: self.switch_page(3))
+        self.settings_button.clicked.connect(lambda: self.switch_page(2))
         nav_layout.addWidget(self.settings_button)
         footer = QLabel(f"CS2 Rental Manager\nv{__version__} · 本地优先")
         footer.setObjectName("navFooter")
@@ -1259,10 +1303,6 @@ class CS2ManagerApp(QMainWindow):
         self.init_market_tab()
         self.tabs.addWidget(self.tab_market)
 
-        self.tab_csfloat_buy = QWidget()
-        self.init_csfloat_buy_orders_tab()
-        self.tabs.addWidget(self.tab_csfloat_buy)
-
         self.tab_settings = QWidget()
         self.init_settings_tab()
         self.tabs.addWidget(self.tab_settings)
@@ -1275,11 +1315,16 @@ class CS2ManagerApp(QMainWindow):
         self.undo_delete_button.setObjectName("primaryBtn")
         self.undo_delete_button.clicked.connect(self._undo_last_delete)
         self.undo_delete_button.setVisible(False)
+        self.order_update_status_label = QLabel()
+        self.order_update_status_label.setObjectName("orderUpdateStatus")
+        self.order_update_status_label.setVisible(False)
+        self.statusBar().addPermanentWidget(self.order_update_status_label)
         self.statusBar().addPermanentWidget(self.undo_delete_button)
         self.statusBar().setStyleSheet(
             "QStatusBar { background: #11111b; color: #cdd6f4; border-top: 1px solid #313244; }"
         )
         self._last_deleted_item_id = None
+        self._update_order_update_status()
 
     def _install_shortcuts(self):
         self._app_shortcuts = []
@@ -1289,7 +1334,7 @@ class CS2ManagerApp(QMainWindow):
             shortcut.activated.connect(callback)
             self._app_shortcuts.append(shortcut)
 
-        for sequence, page in (("Alt+1", 0), ("Alt+2", 1), ("Alt+3", 2), ("Alt+4", 3)):
+        for sequence, page in (("Alt+1", 0), ("Alt+2", 1), ("Alt+3", 2)):
             add(sequence, lambda target=page: self.switch_page(target))
         add("Alt+Left", lambda: self._step_market_category(-1) if self.tabs.currentIndex() == 1 else None)
         add("Alt+Right", lambda: self._step_market_category(1) if self.tabs.currentIndex() == 1 else None)
@@ -1297,7 +1342,7 @@ class CS2ManagerApp(QMainWindow):
         add("Ctrl+F", self._focus_current_search)
 
     def _step_workspace(self, direction):
-        """Move between the three primary workspaces with wrap-around."""
+        """Move between the two primary workspaces with wrap-around."""
         workspace_count = len(getattr(self, "navigation_buttons", []))
         if workspace_count <= 0:
             return
@@ -1326,6 +1371,18 @@ class CS2ManagerApp(QMainWindow):
                 callback(*args)
 
         QTimer.singleShot(0, navigate)
+    def _step_dashboard_category(self, direction):
+        """Move left/right through asset lifecycle categories with wrap-around."""
+        category_box = getattr(self, "status_filter_box", None)
+        if category_box is None or not category_box.isEnabled():
+            return False
+        count = category_box.count()
+        if count < 2:
+            return False
+        current = max(0, category_box.currentIndex())
+        category_box.setCurrentIndex((current + direction) % count)
+        return True
+
 
     def _focus_current_search(self):
         target = (
@@ -1346,7 +1403,6 @@ class CS2ManagerApp(QMainWindow):
         for key, table_name in (
             ("dashboard/header", "table"),
             ("market/header", "market_table"),
-            ("buy_orders/header", "csfloat_buy_table"),
         ):
             table = getattr(self, table_name, None)
             state = self.ui_settings.value(key)
@@ -1356,9 +1412,6 @@ class CS2ManagerApp(QMainWindow):
             page = int(self.ui_settings.value("window/page", 0))
         except (TypeError, ValueError):
             page = 0
-        # Restoring the last workspace must not bypass the shared background
-        # dispatcher.  In particular, reopening on the CSFloat page used to
-        # fire an immediate request before the normal paced timer had started.
         self.switch_page(
             page if 0 <= page < self.tabs.count() else 0,
             request_sync=False,
@@ -1370,12 +1423,39 @@ class CS2ManagerApp(QMainWindow):
         for key, table_name in (
             ("dashboard/header", "table"),
             ("market/header", "market_table"),
-            ("buy_orders/header", "csfloat_buy_table"),
         ):
             table = getattr(self, table_name, None)
             if table is not None:
                 self.ui_settings.setValue(key, table.horizontalHeader().saveState())
         self.ui_settings.sync()
+
+    def _set_reduced_motion(self, enabled):
+        self._reduce_motion = bool(enabled)
+        self.ui_settings.setValue("accessibility/reduce_motion", self._reduce_motion)
+        self.ui_settings.sync()
+
+    def _animate_current_page(self):
+        """Use a brief opacity transition without delaying or blocking input."""
+        if self._reduce_motion or not self.isVisible():
+            return
+        page = self.tabs.currentWidget()
+        if page is None:
+            return
+        effect = page.graphicsEffect()
+        if not isinstance(effect, QGraphicsOpacityEffect):
+            effect = QGraphicsOpacityEffect(page)
+            page.setGraphicsEffect(effect)
+        if self._page_animation is not None:
+            self._page_animation.stop()
+        effect.setOpacity(0.0)
+        animation = QPropertyAnimation(effect, b"opacity", self)
+        animation.setDuration(160)
+        animation.setStartValue(0.0)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+        animation.finished.connect(lambda: effect.setOpacity(1.0))
+        self._page_animation = animation
+        animation.start()
 
     def switch_page(self, index, *, request_sync=True):
         """Switch a left-navigation page without recreating existing page widgets."""
@@ -1387,25 +1467,20 @@ class CS2ManagerApp(QMainWindow):
                 if hasattr(self, "_market_refresh_is_running") else False
             )
             logger.info(
-                "[导航] 工作区 %s -> %s（行情刷新=%s，求购刷新=%s）",
+                "[导航] 工作区 %s -> %s（行情刷新=%s）",
                 previous_index,
                 index,
                 market_running,
-                getattr(self, "_csfloat_buy_refresh_in_progress", False),
             )
+            if hasattr(self, "_animate_current_page"):
+                self._animate_current_page()
         for button_index, button in enumerate(self.navigation_buttons):
             button.setChecked(button_index == index)
         if index == 0 and hasattr(self, "table"):
-            self.load_data()
+            self._render_dashboard_from_cache()
         elif index == 1 and getattr(self, "_market_table_render_pending", False):
             self._populate_market_table()
             self._market_table_render_pending = False
-        elif index == 2:
-            if getattr(self, "_csfloat_buy_table_render_pending", False):
-                self._populate_csfloat_buy_order_table()
-                self._csfloat_buy_table_render_pending = False
-            if request_sync and not self._csfloat_buy_has_loaded:
-                self._request_global_sync_now()
 
     def _resize_edges_at(self, position):
         if self.isMaximized():
@@ -1442,6 +1517,9 @@ class CS2ManagerApp(QMainWindow):
                 and event.modifiers() == Qt.NoModifier
             ):
                 key = event.key()
+                on_dashboard_page = self.tabs.currentWidget() is getattr(
+                    self, "tab_dashboard", None
+                )
                 on_market_page = self.tabs.currentWidget() is getattr(self, "tab_market", None)
                 if key == Qt.Key_F5 and on_market_page:
                     if not event.isAutoRepeat():
@@ -1456,12 +1534,20 @@ class CS2ManagerApp(QMainWindow):
                     if key == Qt.Key_S:
                         self._queue_navigation(self._step_workspace, 1)
                         return True
-                    if key == Qt.Key_A and on_market_page:
-                        self._queue_navigation(self._step_market_category, -1)
-                        return True
-                    if key == Qt.Key_D and on_market_page:
-                        self._queue_navigation(self._step_market_category, 1)
-                        return True
+                    if key == Qt.Key_A:
+                        if on_dashboard_page:
+                            self._queue_navigation(self._step_dashboard_category, -1)
+                            return True
+                        if on_market_page:
+                            self._queue_navigation(self._step_market_category, -1)
+                            return True
+                    if key == Qt.Key_D:
+                        if on_dashboard_page:
+                            self._queue_navigation(self._step_dashboard_category, 1)
+                            return True
+                        if on_market_page:
+                            self._queue_navigation(self._step_market_category, 1)
+                            return True
             if event.type() in (QEvent.MouseMove, QEvent.MouseButtonPress):
                 position = self.mapFromGlobal(event.globalPosition().toPoint())
                 edges = self._resize_edges_at(position)
@@ -1529,9 +1615,6 @@ class CS2ManagerApp(QMainWindow):
             self.market_table.setColumnWidth(0, 70 if mode != "wide" else 84)
             self.market_table.setColumnWidth(1, 225 if mode == "compact" else 250 if mode == "medium" else 290)
             self.market_table.setFont(QFont("Microsoft YaHei", 10 if mode != "wide" else 11))
-        if hasattr(self, "csfloat_buy_table"):
-            self.csfloat_buy_table.setFont(QFont("Microsoft YaHei", 9 if mode == "compact" else 10))
-            self.csfloat_buy_table.setColumnWidth(0, 245 if mode == "compact" else 310)
         shortcut_hint = getattr(self, "market_shortcut_hint", None)
         if shortcut_hint is not None:
             shortcut_hint.setVisible(mode != "compact")
@@ -1539,7 +1622,9 @@ class CS2ManagerApp(QMainWindow):
         # Re-render only when crossing a breakpoint, so per-cell fonts and row
         # heights follow the new density without doing work on every resize pixel.
         if hasattr(self, "current_items") and hasattr(self, "table"):
-            self.load_data()
+            # A breakpoint only changes presentation density; keep the already
+            # loaded asset/order snapshot instead of querying SQLite again.
+            self._render_dashboard_from_cache()
         if hasattr(self, "_market_tracked_items") and hasattr(self, "market_table"):
             self._populate_market_table()
 
@@ -1629,16 +1714,21 @@ class CS2ManagerApp(QMainWindow):
         self.dashboard_search.setPlaceholderText("搜索饰品名称 / 磨损（Ctrl+F）")
         self.dashboard_search.setClearButtonEnabled(True)
         self.dashboard_search.setMaximumWidth(230)
-        self.dashboard_search.textChanged.connect(self.load_data)
+        self._dashboard_filter_timer = QTimer(self)
+        self._dashboard_filter_timer.setSingleShot(True)
+        self._dashboard_filter_timer.setInterval(180)
+        self._dashboard_filter_timer.timeout.connect(self._render_dashboard_from_cache)
+        self.dashboard_search.textChanged.connect(self._queue_dashboard_filter_render)
 
         self.status_filter_box = QComboBox()
-        self.status_filter_box.addItems(["全部状态", "在库", "出租中", "待转租", "CD冷却"])
-        self.status_filter_box.currentTextChanged.connect(self.load_data)
-        self.status_filter_box.setFixedWidth(100)
+        self.status_filter_box.addItems(["全部状态", "出租中", "待转租", "已归还", "CD冷却", "在库"])
+        self.status_filter_box.currentTextChanged.connect(self._queue_dashboard_filter_render)
+        self.status_filter_box.setFixedWidth(112)
+        self.status_filter_box.setToolTip("资产生命周期分类；在资产总览页可按 A / D 循环切换")
 
         self.filter_box = QComboBox()
         self.filter_box.addItems(["全部平台", "C5GAME", "ECOSteam", "悠悠有品", "IGXE", "BUFF"])
-        self.filter_box.currentTextChanged.connect(self.load_data)
+        self.filter_box.currentTextChanged.connect(self._queue_dashboard_filter_render)
         self.filter_box.setFixedWidth(120)
 
         toolbar.addWidget(add_btn)
@@ -1656,6 +1746,7 @@ class CS2ManagerApp(QMainWindow):
         toolbar.addWidget(self.order_tools_toggle)
         toolbar.addStretch()
         toolbar.addWidget(self.status_filter_box)
+        toolbar.addWidget(QLabel("分类:"))
         toolbar.addWidget(QLabel("平台:"))
         toolbar.addWidget(self.filter_box)
         self.dashboard_columns_btn = QToolButton()
@@ -1755,6 +1846,7 @@ class CS2ManagerApp(QMainWindow):
         v = QLabel(val)
         v.setObjectName("cardValue")
         v.setStyleSheet(f"color: {color}; font-size: 19px; font-weight: bold;")
+        w.value_label = v
 
         lay.addWidget(t)
         lay.addWidget(v)
@@ -1767,9 +1859,16 @@ class CS2ManagerApp(QMainWindow):
 
     def _open_column_menu(self, table, button):
         menu = QMenu(self)
-        for column in range(table.columnCount()):
-            header_item = table.horizontalHeaderItem(column)
-            label = header_item.text() if header_item is not None else f"第 {column + 1} 列"
+        model = table.model()
+        for column in range(model.columnCount()):
+            header_item = (
+                table.horizontalHeaderItem(column)
+                if hasattr(table, "horizontalHeaderItem") else None
+            )
+            label = (
+                header_item.text() if header_item is not None
+                else str(model.headerData(column, Qt.Horizontal, Qt.DisplayRole) or f"第 {column + 1} 列")
+            )
             action = menu.addAction(label)
             action.setCheckable(True)
             action.setChecked(not table.isColumnHidden(column))
@@ -1794,6 +1893,7 @@ class CS2ManagerApp(QMainWindow):
             return
         self._last_deleted_item_id = None
         self.undo_delete_button.setVisible(False)
+        self._sync_market_after_asset_change()
         self.load_data()
         self._show_toast("已恢复刚才删除的饰品")
 
@@ -1942,15 +2042,14 @@ class CS2ManagerApp(QMainWindow):
         layout.addLayout(search_layout)
 
         # ── 一览式大盘表格 ──
-        self.market_table = QTableWidget()
-        self.market_table.setColumnCount(9)
+        self.market_table = QTableView()
+        self.market_model = MarketTableModel(
+            thumbnail_provider=self._market_thumbnail_for_entry,
+            updated_text=self._market_updated_text,
+            parent=self.market_table,
+        )
+        self.market_table.setModel(self.market_model)
         hdr = self.market_table.horizontalHeader()
-        self.market_table.setHorizontalHeaderLabels([
-            "图片", "饰品名称 / Phase", "CSQAQ 国内最低",
-            "CSFloat底价", "ECO 最低日租",
-            "C5 租金（短 / 长）", "悠悠 租金（短 / 长）",
-            "IGXE 租金（短 / 长）", "更新时间",
-        ])
         hdr.setFont(QFont("Microsoft YaHei", 11, QFont.DemiBold))
         self.market_table.setFont(QFont("Microsoft YaHei", 11))
         hdr.setSectionResizeMode(0, QHeaderView.Fixed)
@@ -1990,68 +2089,16 @@ class CS2ManagerApp(QMainWindow):
         # ── 初始加载 ──
         self._init_market_from_cache()
 
-    def _merge_durable_watchlist(self, durable, cached):
-        """Use SQLite identities as truth while retaining rebuildable cached quotes."""
-        durable_categories = durable.get("categories", []) if isinstance(durable, dict) else []
-        cached_categories = cached.get("categories", []) if isinstance(cached, dict) else []
-        if not durable_categories:
-            return cached
-
-        cached_by_category = {}
-        cached_global = {}
-        for category in cached_categories:
-            if not isinstance(category, dict):
-                continue
-            category_id = str(category.get("id") or "")
-            per_category = {}
-            for entry in category.get("items", []):
-                if not isinstance(entry, dict):
-                    continue
-                identity = self._market_watch_identity(
-                    entry.get("market_hash_name", entry.get("name", "")),
-                    entry.get("phase", "-"),
-                ).casefold()
-                per_category[identity] = entry
-                cached_global.setdefault(identity, entry)
-            cached_by_category[category_id] = per_category
-
-        merged_categories = []
-        for category in durable_categories:
-            category_id = str(category.get("id") or "")
-            items = []
-            for durable_entry in category.get("items", []):
-                if not isinstance(durable_entry, dict):
-                    continue
-                identity = self._market_watch_identity(
-                    durable_entry.get("market_hash_name", durable_entry.get("name", "")),
-                    durable_entry.get("phase", "-"),
-                ).casefold()
-                merged_entry = dict(
-                    cached_by_category.get(category_id, {}).get(identity)
-                    or cached_global.get(identity)
-                    or {}
-                )
-                merged_entry.update(durable_entry)
-                items.append(merged_entry)
-            merged_categories.append({
-                "id": category_id,
-                "name": str(category.get("name") or category_id),
-                "items": items,
-            })
-        active = str(durable.get("active_category_id") or "")
-        return {
-            "format": "market_categories_v1",
-            "active_category_id": active,
-            "categories": merged_categories,
-        }
-
     def _init_market_from_cache(self):
-        """Load category-aware market cache without making a network request."""
+        """Load SQLite watch data, merging a legacy JSON snapshot once if present."""
         cached = MarketCache.load()
         durable = self.db.load_market_watchlist()
         has_durable_watchlist = bool(durable.get("categories"))
         if has_durable_watchlist:
-            cached = self._merge_durable_watchlist(durable, cached)
+            # The JSON cache is no longer written.  During the upgrade it can
+            # fill any quote fields absent from older SQLite rows; SQLite wins
+            # whenever both sources have the same field.
+            cached = merge_durable_watchlist(durable, cached)
         migrated_legacy_cache = False
         if isinstance(cached, dict) and isinstance(cached.get("categories"), list):
             for index, raw_category in enumerate(cached["categories"], start=1):
@@ -2081,6 +2128,7 @@ class CS2ManagerApp(QMainWindow):
             }
 
         self._ensure_market_categories()
+        inventory_changed = self._sync_inventory_market_watchlist()
         self._activate_market_category(self._active_market_category_id, render=False)
         for entry in self._market_tracked_items:
             self._apply_schema_mapping(entry)
@@ -2094,13 +2142,18 @@ class CS2ManagerApp(QMainWindow):
                 self._market_categories[self._active_market_category_id]["name"],
                 len(self._market_tracked_items),
             )
-            if migrated_legacy_cache or changed or not has_durable_watchlist:
+            if (
+                migrated_legacy_cache
+                or changed
+                or inventory_changed
+                or not has_durable_watchlist
+            ):
                 self._save_market_cache()
             self._populate_market_table()
             self.lbl_market_update.setText(f"最后更新: {QTime.currentTime().toString('HH:mm:ss')} (缓存)")
         else:
             # No prior list: seed the default "出租品" category from inventory.
-            self._refresh_market_tracked_list()
+            self._populate_market_table()
             self._save_market_cache()
             self.lbl_market_update.setText("最后更新: -- (来自库存)")
 
@@ -2256,6 +2309,70 @@ class CS2ManagerApp(QMainWindow):
         self._refresh_market_category_selector()
         self._populate_market_table()
 
+    def _sync_inventory_market_watchlist(self) -> bool:
+        """Mirror current assets into the dedicated rentals market category."""
+        if self._market_refresh_thread is not None:
+            self._inventory_market_sync_pending = True
+            return False
+        self._ensure_market_categories()
+        category = self._market_categories.setdefault(
+            "rentals", {"name": "出租品", "items": []}
+        )
+        cached_by_identity = {
+            self._market_watch_identity(
+                entry.get("market_hash_name", entry.get("name", "")),
+                entry.get("phase", "-"),
+            ): entry
+            for entry in category.get("items", [])
+        }
+        refreshed_items = []
+        seen = set()
+        for item in self.db.get_all_items():
+            entry = {
+                "key": "",
+                "name": item.get("name", ""),
+                "phase": item.get("phase", "-"),
+                "market_hash_name": self._build_market_hash_name(item),
+            }
+            self._apply_schema_mapping(entry)
+            identity = self._market_watch_identity(
+                entry.get("market_hash_name", entry.get("name", "")),
+                entry.get("phase", "-"),
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            entry["key"] = identity
+            if identity.endswith("|P1/P3"):
+                entry["phase"] = "P1 / P3"
+            merged = dict(cached_by_identity.get(identity, {}))
+            if not merged:
+                merged = {
+                    "csqaq_price": 0.0,
+                    "eco_min_rent": 0.0,
+                    "updated_at": "",
+                    "detail": {},
+                }
+            merged.update(entry)
+            refreshed_items.append(merged)
+
+        changed = category.get("items", []) != refreshed_items
+        category["items"] = refreshed_items
+        if self._active_market_category_id == "rentals":
+            self._market_tracked_items = refreshed_items
+        return changed
+
+    def _sync_market_after_asset_change(self):
+        """Reconcile inventory quotes without mutating a running worker snapshot."""
+        if not self._sync_inventory_market_watchlist():
+            return
+        refresh_items, _ = self._collect_all_market_refresh_items()
+        self._reset_market_rolling_cycle(refresh_items)
+        self._refresh_market_category_selector()
+        if self._active_market_category_id == "rentals":
+            self._populate_market_table()
+        self._save_market_cache()
+
     @staticmethod
     def _apply_schema_mapping(entry: dict):
         """Fill standard Steam market name and image URL from the local schema."""
@@ -2319,11 +2436,14 @@ class CS2ManagerApp(QMainWindow):
 
     def _build_market_hash_name(self, item: dict) -> str:
         """根据饰品数据构建英文 market_hash_name，优先使用已存储的"""
-        mapped_item = CS2ItemSchema.lookup(item.get("name", ""))
+        stored_mhn = item.get("market_hash_name", "")
+        mapped_item = (
+            CS2ItemSchema.lookup(item.get("name", ""))
+            or CS2ItemSchema.lookup(stored_mhn)
+        )
         if mapped_item:
             return mapped_item["market_hash_name"]
 
-        stored_mhn = item.get("market_hash_name", "")
         if stored_mhn and stored_mhn != item.get("name", ""):
             return stored_mhn
 
@@ -2448,36 +2568,22 @@ class CS2ManagerApp(QMainWindow):
 
     def _update_market_relative_times(self):
         """Refresh the display-only rightmost market column every minute."""
-        for row in range(self.market_table.rowCount()):
-            entry = self._market_entry_at_row(row)
-            updated_item = self.market_table.item(row, 8)
-            if entry is not None and updated_item is not None:
-                updated_item.setText(self._market_updated_text(entry))
+        if hasattr(self, "market_model"):
+            self.market_model.refresh_display()
 
     def _market_entry_at_row(self, row):
-        item = self.market_table.item(row, 1)
-        identity = item.data(Qt.UserRole) if item is not None else ""
-        for entry in self._market_tracked_items:
-            candidate = self._market_watch_identity(
-                entry.get("market_hash_name", entry.get("name", "")),
-                entry.get("phase", "-"),
-            )
-            if candidate == identity:
-                return entry
-        return None
+        if not hasattr(self, "market_model"):
+            return None
+        return self.market_model.entry_at(self.market_model.index(row, 0))
 
     def _apply_market_filter(self):
-        if not hasattr(self, "market_table"):
+        if not hasattr(self, "market_model"):
             return
         query = (
-            self.market_filter_input.text().strip().casefold()
+            self.market_filter_input.text()
             if hasattr(self, "market_filter_input") else ""
         )
-        for row in range(self.market_table.rowCount()):
-            item = self.market_table.item(row, 1)
-            text = item.text().casefold() if item is not None else ""
-            tooltip = item.toolTip().casefold() if item is not None else ""
-            self.market_table.setRowHidden(row, bool(query and query not in text and query not in tooltip))
+        self.market_model.set_filter(query)
 
     @staticmethod
     def _market_link_platform(column):
@@ -2615,6 +2721,11 @@ class CS2ManagerApp(QMainWindow):
         self._market_thumbnail_cache[local_path] = (modified_ns, thumbnail)
         return thumbnail
 
+    def _market_thumbnail_for_entry(self, entry: dict) -> QPixmap:
+        """Expose cached thumbnails to the model without creating cell widgets."""
+        local_path = ImageCache.get_local_path(entry.get("market_hash_name", entry.get("name", "")))
+        return self._market_thumbnail(local_path) if os.path.exists(local_path) else QPixmap()
+
     def _set_market_metric_cell(
         self, row, column, primary, secondary, color, tooltip="", emphasize=True
     ):
@@ -2659,6 +2770,19 @@ class CS2ManagerApp(QMainWindow):
 
     def _populate_market_table(self):
         """Render domestic quotes, fixed-price CSFloat listings and rental quotes."""
+        if hasattr(self, "market_model"):
+            sorting_enabled = self.market_table.isSortingEnabled()
+            self.market_table.setSortingEnabled(False)
+            self.market_table.setUpdatesEnabled(False)
+            self.market_model.set_entries(self._market_tracked_items)
+            compact = getattr(self, "_responsive_mode", "wide") != "wide"
+            for row in range(self.market_model.rowCount()):
+                self.market_table.setRowHeight(row, 76 if compact else 86)
+            self.market_table.setUpdatesEnabled(True)
+            self.market_table.setSortingEnabled(sorting_enabled)
+            self.market_empty_label.setVisible(self.market_model.rowCount() == 0)
+            self.market_table.viewport().update()
+            return
         sorting_enabled = self.market_table.isSortingEnabled()
         self.market_table.setSortingEnabled(False)
         self.market_table.setUpdatesEnabled(False)
@@ -2882,6 +3006,8 @@ class CS2ManagerApp(QMainWindow):
         self._market_rolling_cycle_known = identities
         self._market_rolling_cycle_pending = set(identities)
         self._market_rolling_cycle_total = len(identities)
+        self._market_rolling_cycle_stage = "market"
+        self._market_refresh_category_name = ""
         self._update_market_rolling_progress()
 
     def _sync_market_rolling_cycle(self, refresh_items):
@@ -2922,24 +3048,31 @@ class CS2ManagerApp(QMainWindow):
         cooldown = CSFloatClient.cooldown_remaining()
         cooldown_reason = CSFloatClient.cooldown_reason()
         total = self._market_rolling_cycle_total
+        cycle_wait = max(
+            0,
+            int(getattr(self, "_market_rolling_cycle_wait_until", 0.0) - time.time() + 0.999),
+        )
         if cooldown > 0:
             text = f"同步等待 {cooldown}s"
+        elif cycle_wait > 0:
+            minutes, seconds = divmod(cycle_wait, 60)
+            text = f"下轮 {minutes:02d}:{seconds:02d}"
         elif total <= 0:
             text = "同步暂停" if not self._market_rolling_sync_enabled else "同步 --"
         else:
             completed = max(0, min(total, total - len(self._market_rolling_cycle_pending)))
             percent = int(round(completed * 100 / total))
             prefix = "同步暂停" if not self._market_rolling_sync_enabled else "同步"
-            if self._csfloat_buy_refresh_in_progress:
-                activity = " · CSF"
+            if self._market_refresh_category_name:
+                activity = f" · {self._market_refresh_category_name}"
             else:
                 activity = ""
             text = f"{prefix} {percent}%（{completed}/{total}）{activity}"
         state = "运行中，点击暂停" if self._market_rolling_sync_enabled else "已暂停，点击继续"
         tooltip = (
             f"全局后台数据同步{state}。\n"
-            "统一控制资产本地更新、大盘逐件行情和 CSFloat 求购监测；"
-            "所有工作区共用同一个服务端自适应请求间隔和冷却时间。"
+            "固定顺序为：逐个大盘分类 → 资产总览；"
+            "所有工作区共用同一个请求频率、额度保留线和冷却时间。"
             + (f"\n当前反馈：{cooldown_reason}，剩余约 {cooldown} 秒。" if cooldown else "")
         )
         for button in buttons:
@@ -2957,14 +3090,14 @@ class CS2ManagerApp(QMainWindow):
             self.lbl_market_update.setText(
                 f"全局同步等待：{reason}，约 {cooldown} 秒后自动继续"
             )
-            self.csfloat_buy_status_label.setText(
-                f"{reason} · 约 {cooldown} 秒后由全局调度自动继续"
-            )
             self._update_market_rolling_progress()
             return False
-        if self._market_refresh_is_running() or self._csfloat_buy_refresh_in_progress:
+        if self._market_refresh_is_running():
             self.lbl_market_update.setText("全局同步已在运行，本次操作沿用当前队列")
             return False
+        if time.time() < self._market_rolling_cycle_wait_until:
+            self._global_sync_cycle_request_start_count = CSFloatClient.request_count()
+        self._market_rolling_cycle_wait_until = 0.0
         self._run_rolling_market_refresh()
         return True
 
@@ -2972,8 +3105,11 @@ class CS2ManagerApp(QMainWindow):
         """Pause/resume every automatic data source behind the shared buttons."""
         self._market_rolling_sync_enabled = not self._market_rolling_sync_enabled
         if self._market_rolling_sync_enabled:
-            self.market_rolling_refresh_timer.start(MARKET_ROLLING_REFRESH_SECONDS * 1000)
+            self.market_rolling_refresh_timer.start(GLOBAL_SYNC_POLL_SECONDS * 1000)
             self.update_timer_interval()
+            if time.time() < self._market_rolling_cycle_wait_until:
+                self._global_sync_cycle_request_start_count = CSFloatClient.request_count()
+            self._market_rolling_cycle_wait_until = 0.0
             self._update_market_rolling_progress()
             self.lbl_market_update.setText("后台数据同步已继续")
             QTimer.singleShot(0, self._run_rolling_market_refresh)
@@ -2982,22 +3118,21 @@ class CS2ManagerApp(QMainWindow):
         self.market_rolling_refresh_timer.stop()
         self.timer.stop()
         self._update_market_rolling_progress()
-        if (
-            self._market_refresh_is_running()
-            or self._csfloat_buy_refresh_in_progress
-        ):
+        if self._market_refresh_is_running():
             self.lbl_market_update.setText("后台数据同步已暂停（当前请求完成后停止）")
         else:
             self.lbl_market_update.setText("后台数据同步已暂停")
 
     def _run_rolling_market_refresh(self):
-        """Refresh one oldest item without blocking category navigation."""
+        """Run one ordered stage: market categories, then dashboard."""
         if (
             not self._market_rolling_sync_enabled
             or self._market_search_in_progress
             or self._market_refresh_is_running()
-            or self._csfloat_buy_refresh_in_progress
         ):
+            return
+        if time.time() < self._market_rolling_cycle_wait_until:
+            self._update_market_rolling_progress()
             return
         cooldown = CSFloatClient.cooldown_remaining()
         if cooldown > 0:
@@ -3005,43 +3140,40 @@ class CS2ManagerApp(QMainWindow):
             self.lbl_market_update.setText(
                 f"全局同步等待：{reason}，约 {cooldown} 秒后自动继续"
             )
-            self.csfloat_buy_status_label.setText(
-                f"{reason} · 约 {cooldown} 秒后自动继续"
-            )
             self._update_market_rolling_progress()
             return
-        if self._maybe_auto_refresh_csfloat_buy_orders():
-            return
         refresh_items, refresh_groups = self._collect_all_market_refresh_items()
-        if not refresh_items:
-            self._reset_market_rolling_cycle(refresh_items)
-            return
         self._sync_market_rolling_cycle(refresh_items)
-        if not self._market_rolling_cycle_pending:
-            # Keep 100% visible until the next timer tick, then start a new
-            # round so the indicator reads as a completed full scan.
-            self._reset_market_rolling_cycle(refresh_items)
-        candidates = [
-            entry for entry in refresh_items
-            if self._market_watch_identity(
-                entry.get("market_hash_name", entry.get("name", "")),
-                entry.get("phase", "-"),
-            ) in self._market_rolling_cycle_pending
-        ]
-        target = min(
-            candidates or refresh_items,
-            key=lambda entry: float(entry.get("rolling_refreshed_at", 0) or 0),
-        )
-        identity = self._market_watch_identity(
-            target.get("market_hash_name", target.get("name", "")),
-            target.get("phase", "-"),
-        )
-        self._refresh_all_market_data(
-            fast_only=False,
-            background=True,
-            refresh_items=[target],
-            refresh_groups={identity: refresh_groups.get(identity, [target])},
-        )
+        if self._market_rolling_cycle_pending:
+            for category_name, batch_identities in self._collect_market_refresh_batches():
+                pending_identities = [
+                    identity for identity in batch_identities
+                    if identity in self._market_rolling_cycle_pending
+                ]
+                if not pending_identities:
+                    continue
+                batch_groups = {
+                    identity: refresh_groups[identity]
+                    for identity in pending_identities
+                    if identity in refresh_groups
+                }
+                batch_items = [entries[0] for entries in batch_groups.values() if entries]
+                if not batch_items:
+                    continue
+                self._market_refresh_category_name = category_name
+                self._update_market_rolling_progress()
+                self._refresh_all_market_data(
+                    fast_only=False,
+                    background=True,
+                    refresh_items=batch_items,
+                    refresh_groups=batch_groups,
+                )
+                return
+
+        self._market_rolling_cycle_stage = "dashboard"
+        self._market_refresh_category_name = ""
+        self._update_market_rolling_progress()
+        self._complete_global_sync_cycle()
 
     def _collect_all_market_refresh_items(self):
         """Collect every category and deduplicate identical network lookups."""
@@ -3056,6 +3188,102 @@ class CS2ManagerApp(QMainWindow):
                 groups.setdefault(identity, []).append(entry)
         return [entries[0] for entries in groups.values()], groups
 
+    def _collect_market_refresh_batches(self):
+        """Return first-owner identities grouped in visible category order."""
+        seen = set()
+        batches = []
+        for category in self._market_categories.values():
+            identities = []
+            for entry in category.get("items", []):
+                self._apply_schema_mapping(entry)
+                identity = self._market_watch_identity(
+                    entry.get("market_hash_name", entry.get("name", "")),
+                    entry.get("phase", "-"),
+                )
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                identities.append(identity)
+            if identities:
+                batches.append((str(category.get("name") or "大盘分类"), identities))
+        return batches
+
+    def _complete_global_sync_cycle(self):
+        """Finalize dashboard data and arm the next complete ordered cycle."""
+        refresh_items, _ = self._collect_all_market_refresh_items()
+        if self.tabs.currentIndex() == 0:
+            self.load_data()
+        current_request_count = CSFloatClient.request_count()
+        actual_request_cost = max(
+            0,
+            current_request_count - self._global_sync_cycle_request_start_count,
+        )
+        estimated_request_cost = self._estimated_csfloat_cycle_cost(refresh_items)
+        planned_request_cost = max(actual_request_cost, estimated_request_cost)
+        next_delay = self._next_global_sync_delay(
+            planned_request_cost,
+            CSFloatClient.rate_limit_snapshot(),
+        )
+        self._reset_market_rolling_cycle(refresh_items)
+        self._global_sync_cycle_request_start_count = current_request_count
+        self._market_rolling_cycle_wait_until = time.time() + next_delay
+        wait_minutes = max(1, int((next_delay + 59) // 60))
+        self.lbl_market_update.setText(
+            f"本轮同步完成：大盘 → 总览 · 下轮约 {wait_minutes} 分钟后"
+        )
+        self.title_bar.set_sync_status("本轮数据已同步", "#a6e3a1")
+        logger.info(
+            "[全局同步] 本轮 CSFloat 请求=%s，计划成本=%s，下轮等待=%ss，额度=%s",
+            actual_request_cost,
+            planned_request_cost,
+            next_delay,
+            CSFloatClient.rate_limit_snapshot(),
+        )
+        self._update_market_rolling_progress()
+
+    def _estimated_csfloat_cycle_cost(self, refresh_items) -> int:
+        """Estimate requests due at the earliest permitted next cycle."""
+        if not self.db.get_config("csfloat_api_key").strip():
+            return 0
+        earliest_next = time.time() + GLOBAL_SYNC_MIN_CYCLE_SECONDS
+        market_cost = len(refresh_items)  # one listing lookup per stale item
+        market_buy_cost = sum(
+            1
+            for entry in refresh_items
+            if earliest_next - float(entry.get("csfloat_buy_fetched_at", 0) or 0)
+            >= CSFLOAT_BUY_QUOTE_TTL_SECONDS
+        )
+        return market_cost + market_buy_cost
+
+    @staticmethod
+    def _next_global_sync_delay(
+        planned_request_cost: int,
+        rate_snapshot: dict,
+        *,
+        now: float | None = None,
+    ) -> int:
+        """Space complete rounds evenly inside the remaining quota window."""
+        current_time = time.time() if now is None else float(now)
+        fallback = GLOBAL_SYNC_MIN_CYCLE_SECONDS
+        try:
+            remaining = int(rate_snapshot.get("remaining", -1))
+            reset_at = float(rate_snapshot.get("reset_at", 0.0))
+            cost = max(0, int(planned_request_cost))
+        except (AttributeError, TypeError, ValueError):
+            return fallback
+        seconds_to_reset = max(0, int(reset_at - current_time + 0.999))
+        if cost <= 0 or remaining < 0 or seconds_to_reset <= 0:
+            return fallback
+        usable = max(0, remaining - CSFloatClient.RATE_LIMIT_RESERVE)
+        complete_rounds_left = usable // cost
+        if complete_rounds_left <= 0:
+            return max(fallback, seconds_to_reset + 1)
+        evenly_spaced = int(
+            (seconds_to_reset + complete_rounds_left)
+            // (complete_rounds_left + 1)
+        )
+        return max(fallback, evenly_spaced)
+
     def _refresh_all_market_data(
         self,
         force_eco: bool = False,
@@ -3065,14 +3293,6 @@ class CS2ManagerApp(QMainWindow):
         refresh_groups: dict | None = None,
     ):
         """Run either the fast batch layer or one rolling detailed item."""
-        if self._csfloat_buy_refresh_in_progress:
-            if not background:
-                QMessageBox.information(
-                    self,
-                    "数据同步中",
-                    "CSFloat 求购正在读取，请等待当前全局请求完成。",
-                )
-            return
         if refresh_items is None or refresh_groups is None:
             refresh_items, refresh_groups = self._collect_all_market_refresh_items()
         if not refresh_items:
@@ -3122,7 +3342,7 @@ class CS2ManagerApp(QMainWindow):
             token, eco_partner, eco_rsa, items_copy,
             self._build_market_hash_name_for_entry, force_eco,
             csfloat_api_key, usd_cny_rate, auto_usd_cny_rate,
-            fast_only, background,
+            fast_only, False,
         )
         refresh_worker.moveToThread(refresh_thread)
 
@@ -3177,12 +3397,18 @@ class CS2ManagerApp(QMainWindow):
                 entry["updated_at"] = completed_at
                 if self._market_refresh_background:
                     entry["rolling_refreshed_at"] = int(time.time())
-        rolling_cycle_completed = False
         if self._market_refresh_background:
-            self._market_rolling_cycle_pending.difference_update(
-                self._market_refresh_groups.keys()
-            )
-            rolling_cycle_completed = not self._market_rolling_cycle_pending
+            completed_identities = set()
+            for identity, refreshed in zip(
+                self._market_refresh_groups.keys(), refreshed_items
+            ):
+                csfloat_status = str(refreshed.get("csfloat_status") or "")
+                if csfloat_status == "rate_limited" or csfloat_status.startswith(
+                    "skipped_rate_limited"
+                ):
+                    continue
+                completed_identities.add(identity)
+            self._market_rolling_cycle_pending.difference_update(completed_identities)
             self._update_market_rolling_progress()
         market_page_visible = self.tabs.currentIndex() == 1
         if market_page_visible:
@@ -3191,7 +3417,7 @@ class CS2ManagerApp(QMainWindow):
         else:
             self._market_table_render_pending = True
         self._save_market_cache()
-        if not self._market_refresh_background or rolling_cycle_completed:
+        if not self._market_refresh_background:
             if self.tabs.currentIndex() == 0:
                 self.load_data()
         eco_status = str(result.get("eco_status_text", ""))
@@ -3212,11 +3438,18 @@ class CS2ManagerApp(QMainWindow):
         if thread is not self._market_refresh_thread:
             logger.warning("[大盘刷新] 忽略过期线程的清理回调")
             return
+        was_background = self._market_refresh_background
         self._market_refresh_thread = None
         self._market_refresh_worker = None
         self._market_refresh_background = False
         self._market_refresh_fast_only = False
+        self._market_refresh_category_name = ""
         self._update_market_category_controls()
+        if getattr(self, "_inventory_market_sync_pending", False):
+            self._inventory_market_sync_pending = False
+            self._sync_market_after_asset_change()
+        if was_background and getattr(self, "_market_rolling_sync_enabled", False):
+            QTimer.singleShot(0, self._run_rolling_market_refresh)
 
     # ── 市场数据缓存 ──
 
@@ -3255,6 +3488,7 @@ class CS2ManagerApp(QMainWindow):
                 "csfloat_status": entry.get("csfloat_status", ""),
                 "csfloat_buy_fetched_at": entry.get("csfloat_buy_fetched_at", 0),
                 "csfloat_buy_last_attempt_at": entry.get("csfloat_buy_last_attempt_at", 0),
+                "csfloat_buy_query_mhn": entry.get("csfloat_buy_query_mhn", ""),
                 "csfloat_highest_buy_price_cents": entry.get("csfloat_highest_buy_price_cents", 0),
                 "csfloat_highest_buy_usd": entry.get("csfloat_highest_buy_usd", 0.0),
                 "csfloat_highest_buy_cny": entry.get("csfloat_highest_buy_cny", 0.0),
@@ -3291,29 +3525,14 @@ class CS2ManagerApp(QMainWindow):
             "categories": categories,
         }
         self.db.save_market_watchlist(payload)
-        MarketCache.save(payload)
 
     @staticmethod
     def _normalize_market_phase(value) -> str:
-        text = str(value or "-").strip()
-        compact = text.upper().replace(" ", "")
-        aliases = {
-            "": "-", "-": "-", "NONE": "-", "N/A": "-",
-            "P1": "P1", "P2": "P2", "P3": "P3", "P4": "P4", "P1/P3": "P1 / P3",
-            "RUBY": "Ruby", "红宝石": "Ruby",
-            "SAPPHIRE": "Sapphire", "蓝宝石": "Sapphire",
-            "EMERALD": "Emerald", "绿宝石": "Emerald",
-            "BLACKPEARL": "Black Pearl", "黑珍珠": "Black Pearl",
-        }
-        return aliases.get(compact, "")
+        return normalize_phase(value)
 
     @classmethod
     def _market_watch_identity(cls, market_hash_name, phase) -> str:
-        normalized_phase = cls._normalize_market_phase(phase) or str(phase or "-").strip()
-        phase_key = normalized_phase.upper().replace(" ", "")
-        if phase_key in {"P1", "P3", "P1/P3"}:
-            phase_key = "P1/P3"
-        return f"{str(market_hash_name).strip()}|{phase_key}"
+        return watch_identity(market_hash_name, phase)
 
     def _normalize_ai_market_item(self, raw_item: dict) -> tuple[dict | None, str]:
         """Validate an AI item locally and turn it into a market-watch entry."""
@@ -3593,435 +3812,7 @@ class CS2ManagerApp(QMainWindow):
         QMessageBox.warning(self, "绑定失败", str(message))
 
     # ═══════════════════════════════════════════
-    # Tab 3: CSFloat 求购监测
-    # ═══════════════════════════════════════════
-
-    def init_csfloat_buy_orders_tab(self):
-        layout = QVBoxLayout(self.tab_csfloat_buy)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(12)
-
-        header = QHBoxLayout()
-        title = QLabel("CSFloat 求购监测")
-        title.setObjectName("titleLabel")
-        header.addWidget(title)
-        header.addStretch()
-        self.csfloat_buy_status_label = QLabel("尚未读取")
-        self.csfloat_buy_status_label.setStyleSheet("color: #a6adc8; font-size: 12px;")
-        header.addWidget(self.csfloat_buy_status_label)
-        profile_button = QPushButton("打开 CSFloat 求购")
-        profile_button.setToolTip("打开 CSFloat Profile 求购管理页")
-        profile_button.clicked.connect(self._open_csfloat_profile)
-        header.addWidget(profile_button)
-        self.csfloat_sync_progress_button = self._create_global_sync_button()
-        header.addWidget(self.csfloat_sync_progress_button)
-        layout.addLayout(header)
-
-        summary = QGridLayout()
-        summary.setHorizontalSpacing(10)
-        summary.setVerticalSpacing(10)
-        self.csfloat_balance_card = self.create_card("可用余额", "$ --", "#a6e3a1")
-        self.csfloat_pending_card = self.create_card("待结算余额", "$ --", "#f9e2af")
-        self.csfloat_order_count_card = self.create_card("有效求购", "-- 单", "#89b4fa")
-        self.csfloat_top_count_card = self.create_card("处于最高价位", "-- 单", "#cba6f7")
-        for column, card in enumerate((
-            self.csfloat_balance_card,
-            self.csfloat_pending_card,
-            self.csfloat_order_count_card,
-            self.csfloat_top_count_card,
-        )):
-            summary.addWidget(card, 0, column)
-            summary.setColumnStretch(column, 1)
-        layout.addLayout(summary)
-
-        self.csfloat_buy_table = QTableWidget()
-        self.csfloat_buy_table.setColumnCount(7)
-        self.csfloat_buy_table.setHorizontalHeaderLabels([
-            "饰品（点击打开）", "我的求购", "数量 / 条件", "市场最高求购",
-            "排名与差价", "近期成交接近度", "购买力参考",
-        ])
-        header_view = self.csfloat_buy_table.horizontalHeader()
-        header_view.setFont(QFont("Microsoft YaHei", 10, QFont.DemiBold))
-        header_view.setSectionResizeMode(0, QHeaderView.Interactive)
-        self.csfloat_buy_table.setColumnWidth(0, 310)
-        for column in range(1, 7):
-            header_view.setSectionResizeMode(column, QHeaderView.ResizeToContents)
-        header_view.setStretchLastSection(False)
-        self.csfloat_buy_table.verticalHeader().setVisible(False)
-        self.csfloat_buy_table.verticalHeader().setDefaultSectionSize(78)
-        self.csfloat_buy_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.csfloat_buy_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.csfloat_buy_table.setSelectionMode(QAbstractItemView.SingleSelection)
-        self.csfloat_buy_table.setAlternatingRowColors(True)
-        self.csfloat_buy_table.setStyleSheet("alternate-background-color: #1e1e2e;")
-        self.csfloat_buy_table.cellClicked.connect(self._open_csfloat_buy_item_from_cell)
-        layout.addWidget(self.csfloat_buy_table, 1)
-
-    @staticmethod
-    def _set_card_value(card, text, color=None):
-        value = card.findChild(QLabel, "cardValue") if card is not None else None
-        if value is None:
-            return
-        value.setText(text)
-        if color:
-            value.setStyleSheet(f"color: {color}; font-size: 19px; font-weight: bold;")
-
-    def _configured_usd_cny_rate(self):
-        try:
-            rate = float(self.db.get_config("usd_cny_rate") or 7.20)
-        except (TypeError, ValueError):
-            rate = 7.20
-        return rate if 1 <= rate <= 20 else 7.20
-
-    @staticmethod
-    def _fx_source_label(source):
-        return {
-            "CSFloat": "CSFloat 官网汇率",
-            "ECB": "欧洲央行参考汇率",
-            "manual": "手动备用汇率",
-        }.get(str(source or ""), str(source or "备用汇率"))
-
-    @staticmethod
-    def _csfloat_error_text(result):
-        error = str((result or {}).get("error") or "unknown")
-        labels = {
-            "missing_api_key": "未配置 CSFloat API Key",
-            "unauthorized": "CSFloat API Key 无效",
-            "forbidden": "CSFloat 拒绝访问",
-            "rate_limited": "触发 CSFloat 频控，请稍后重试",
-            "network": "网络请求失败",
-            "invalid_json": "CSFloat 返回格式异常",
-        }
-        if error == "rate_limited":
-            source = str((result or {}).get("rate_limit_source") or "CSFloat 服务端频控")
-            retry_after = int((result or {}).get("retry_after") or 0)
-            return source + (f"，约 {retry_after} 秒后自动继续" if retry_after else "")
-        if error.startswith("http_"):
-            return f"CSFloat 服务返回 {error.removeprefix('http_')}"
-        return labels.get(error, error)
-
-    def _maybe_auto_refresh_csfloat_buy_orders(self):
-        """Run due buy-order monitoring inside the shared rolling scheduler."""
-        if not self._market_rolling_sync_enabled:
-            return False
-        api_key = self.db.get_config("csfloat_api_key").strip()
-        if not api_key:
-            return False
-        elapsed = time.time() - self._csfloat_buy_last_auto_refresh_at
-        if elapsed < CSFLOAT_BUY_AUTO_REFRESH_SECONDS:
-            return False
-        cooldown = CSFloatClient.cooldown_remaining()
-        if cooldown > 0:
-            reason = CSFloatClient.cooldown_reason() or "CSFloat 服务端频控"
-            self.csfloat_buy_status_label.setText(
-                f"{reason} · 约 {cooldown} 秒后由全局调度自动继续"
-            )
-            return False
-        return self._refresh_csfloat_buy_orders(background=True)
-
-    def _refresh_csfloat_buy_orders(self, background=False):
-        if self._csfloat_buy_refresh_in_progress:
-            return False
-        if self._market_refresh_is_running():
-            return False
-        api_key = self.db.get_config("csfloat_api_key").strip()
-        if not api_key:
-            self.csfloat_buy_status_label.setText("请先在设置中填写 API Key")
-            if not background:
-                QMessageBox.information(self, "CSFloat 求购", "请先在设置中填写并保存 CSFloat API Key。")
-            return False
-        cooldown = CSFloatClient.cooldown_remaining()
-        if cooldown > 0:
-            reason = CSFloatClient.cooldown_reason() or "CSFloat 服务端频控"
-            self.csfloat_buy_status_label.setText(
-                f"{reason} · 约 {cooldown} 秒后由全局调度自动继续"
-            )
-            return False
-
-        self._csfloat_buy_refresh_in_progress = True
-        self._csfloat_buy_refresh_background = bool(background)
-        prefix = "后台自动读取" if background else "读取"
-        self.csfloat_buy_status_label.setText(f"{prefix}账户和求购；详细分析约需 20–30 秒")
-        self._update_market_rolling_progress()
-
-        manual_fx_rate = self._configured_usd_cny_rate()
-        auto_fx_rate = self.db.get_config("auto_usd_cny_rate") != "0"
-        detail_cursor = self._csfloat_buy_detail_cursor
-        cached_details = {
-            str((record.get("order") or {}).get("id") or ""): copy.deepcopy(
-                record.get("detail") or {}
-            )
-            for record in self._csfloat_buy_order_rows
-            if str((record.get("order") or {}).get("id") or "")
-        }
-
-        def task(worker):
-            if auto_fx_rate:
-                fx_result = ExchangeRateClient().get_usd_cny(manual_fx_rate)
-            else:
-                fx_result = {
-                    "rate": manual_fx_rate,
-                    "source": "manual",
-                    "reference_date": "",
-                    "status": "manual_configured",
-                }
-            client = CSFloatClient(api_key)
-            account = client.get_account()
-            if not account.get("success"):
-                worker.error.emit(self._csfloat_error_text(account))
-                return
-            order_result = client.get_my_buy_orders(limit=100)
-            if not order_result.get("success"):
-                worker.error.emit(self._csfloat_error_text(order_result))
-                return
-
-            orders = order_result.get("orders", [])
-            details = cached_details
-            if orders:
-                offset = detail_cursor % len(orders)
-                detail_orders = (orders[offset:] + orders[:offset])[
-                    :CSFLOAT_BUY_DETAIL_LIMIT
-                ]
-                next_detail_cursor = (offset + len(detail_orders)) % len(orders)
-            else:
-                detail_orders = []
-                next_detail_cursor = 0
-            for order in detail_orders:
-                if worker._is_canceled:
-                    return
-                order_id = str(order.get("id") or "")
-                market_hash_name = str(order.get("market_hash_name") or "")
-                detail = {
-                    "listing": {},
-                    "market_order": {},
-                    "sales": [],
-                    "detail_error": "",
-                }
-                listing = client.get_lowest_buy_now(market_hash_name)
-                detail["listing"] = listing
-                if listing.get("success") and listing.get("found"):
-                    market_order = client.get_highest_buy_order(
-                        listing.get("listing_id", ""), limit=50
-                    )
-                    detail["market_order"] = market_order
-                elif not listing.get("success"):
-                    detail["detail_error"] = self._csfloat_error_text(listing)
-
-                sales_result = client.get_recent_sales(market_hash_name)
-                if sales_result.get("success"):
-                    detail["sales"] = sales_result.get("sales", [])
-                elif not detail["detail_error"]:
-                    detail["detail_error"] = self._csfloat_error_text(sales_result)
-                details[order_id] = detail
-
-                if (
-                    listing.get("error") == "rate_limited"
-                    or sales_result.get("error") == "rate_limited"
-                ):
-                    break
-
-            worker.finished.emit(("csfloat_buy_orders", {
-                "account": account,
-                "orders": orders,
-                "count": order_result.get("count", len(orders)),
-                "details": details,
-                "detail_limit": CSFLOAT_BUY_DETAIL_LIMIT,
-                "detail_updated": len(detail_orders),
-                "next_detail_cursor": next_detail_cursor,
-                "fx": fx_result,
-            }))
-
-        self._start_worker(
-            worker_fn=task,
-            on_finished=self._on_csfloat_buy_orders_loaded,
-            on_error=self._on_csfloat_buy_orders_error,
-        )
-        return True
-
-    def _on_csfloat_buy_orders_error(self, error_message):
-        was_background = self._csfloat_buy_refresh_background
-        self._csfloat_buy_refresh_in_progress = False
-        self._csfloat_buy_refresh_background = False
-        if was_background:
-            self._csfloat_buy_last_auto_refresh_at = time.time()
-        self.csfloat_buy_status_label.setText(str(error_message))
-        self._update_market_rolling_progress()
-        if was_background:
-            logger.warning("[CSFloat求购] 后台自动同步失败: %s", error_message)
-        else:
-            QMessageBox.warning(self, "CSFloat 求购读取失败", str(error_message))
-
-    def _on_csfloat_buy_orders_loaded(self, result):
-        _tag, payload = result
-        self._csfloat_buy_refresh_in_progress = False
-        self._csfloat_buy_refresh_background = False
-        self._csfloat_buy_last_auto_refresh_at = time.time()
-        self._csfloat_buy_has_loaded = True
-        self._csfloat_buy_detail_cursor = int(payload.get("next_detail_cursor") or 0)
-        self._update_market_rolling_progress()
-
-        account = payload.get("account", {})
-        orders = payload.get("orders", [])
-        details = payload.get("details", {})
-        fx = payload.get("fx") or {}
-        try:
-            rate = float(fx.get("rate") or self._configured_usd_cny_rate())
-        except (TypeError, ValueError):
-            rate = self._configured_usd_cny_rate()
-        self._csfloat_buy_fx_rate = rate
-        self._csfloat_buy_fx_source = self._fx_source_label(fx.get("source"))
-        balance = int(account.get("balance_cents") or 0)
-        pending = int(account.get("pending_balance_cents") or 0)
-        self._set_card_value(
-            self.csfloat_balance_card,
-            f"¥{csfloat_cny_display_price(balance, rate):.2f}  /  ${balance / 100:.2f}",
-            "#a6e3a1",
-        )
-        self._set_card_value(
-            self.csfloat_pending_card,
-            f"¥{csfloat_cny_display_price(pending, rate):.2f}  /  ${pending / 100:.2f}",
-            "#f9e2af",
-        )
-        self._set_card_value(self.csfloat_order_count_card, f"{len(orders)} 单", "#89b4fa")
-
-        rows = []
-        top_count = 0
-        for order in orders:
-            detail = details.get(str(order.get("id") or ""), {})
-            market_order = detail.get("market_order", {})
-            market_price = (
-                int(market_order.get("price_cents") or 0)
-                if market_order.get("success") and market_order.get("found") else 0
-            )
-            analysis = _csfloat_buy_order_analysis(
-                order.get("price"), market_price, detail.get("sales", [])
-            )
-            if analysis["at_top"]:
-                top_count += 1
-            rows.append({
-                "order": order,
-                "detail": detail,
-                "analysis": analysis,
-                "observed_at": time.time(),
-            })
-        self._csfloat_buy_order_rows = rows
-        self._set_card_value(self.csfloat_top_count_card, f"{top_count} 单", "#cba6f7")
-        if self.tabs.currentIndex() == 2:
-            self._populate_csfloat_buy_order_table()
-            self._csfloat_buy_table_render_pending = False
-        else:
-            self._csfloat_buy_table_render_pending = True
-
-        analyzed = sum(bool(row["detail"]) for row in rows)
-        username = account.get("username") or "当前账户"
-        updated_details = int(payload.get("detail_updated") or 0)
-        limit_note = (
-            ""
-            if len(orders) <= payload.get("detail_limit", 1)
-            else f"；本轮轮换分析 {updated_details} 单，已有详情 {analyzed} 单"
-        )
-        self.csfloat_buy_status_label.setText(
-            f"{username} · {datetime.now().strftime('%H:%M:%S')} 已更新 · "
-            f"1 USD = ¥{rate:.4f}（{self._csfloat_buy_fx_source}）{limit_note}"
-        )
-
-    def _csfloat_table_item(self, text, color="#cdd6f4", tooltip=""):
-        item = QTableWidgetItem(str(text))
-        item.setForeground(QColor(color))
-        item.setToolTip(tooltip)
-        item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
-        return item
-
-    def _populate_csfloat_buy_order_table(self):
-        table = self.csfloat_buy_table
-        rate = self._csfloat_buy_fx_rate
-        table.setUpdatesEnabled(False)
-        table.setRowCount(len(self._csfloat_buy_order_rows))
-        for row_index, record in enumerate(self._csfloat_buy_order_rows):
-            order = record["order"]
-            detail = record["detail"]
-            analysis = record["analysis"]
-            own_price = analysis["own_price_cents"]
-            market_price = analysis["market_price_cents"]
-            hybrid = order.get("hybrid_properties") or {}
-            table.setRowHeight(row_index, 78)
-
-            market_hash_name = order.get("market_hash_name") or ""
-            name = CS2ItemSchema.chinese_display_name(
-                "", market_hash_name, order.get("phase", "-"), order.get("paint_index", "")
-            )
-            name_item = self._csfloat_table_item(name, "#f5e0dc", market_hash_name)
-            name_item.setFont(QFont("Microsoft YaHei", 10, QFont.DemiBold))
-            table.setItem(row_index, 0, name_item)
-            table.setItem(row_index, 1, self._csfloat_table_item(
-                f"¥{csfloat_cny_display_price(own_price, rate):.2f}\n${own_price / 100:.2f}", "#89b4fa"
-            ))
-            condition_text = "普通求购" if not hybrid else "限定：" + ", ".join(sorted(hybrid.keys()))
-            table.setItem(row_index, 2, self._csfloat_table_item(
-                f"{int(order.get('qty') or 1)} 件\n{condition_text}",
-                "#f9e2af" if hybrid else "#a6adc8",
-                json.dumps(hybrid, ensure_ascii=False) if hybrid else "不含磨损或模板限制",
-            ))
-
-            if market_price > 0:
-                market_text = f"¥{csfloat_cny_display_price(market_price, rate):.2f}\n${market_price / 100:.2f}"
-                market_color = "#a6e3a1"
-            else:
-                market_text = "暂无\n" + (detail.get("detail_error") or "未取得最高价")
-                market_color = "#6c7086"
-            table.setItem(row_index, 3, self._csfloat_table_item(market_text, market_color))
-
-            rank_color = "#a6e3a1" if analysis["at_top"] else "#f38ba8" if market_price else "#6c7086"
-            target = analysis.get("target_price_cents")
-            rank_secondary = f"下一合法档 ${target / 100:.2f}" if target and not analysis["at_top"] else ""
-            table.setItem(row_index, 4, self._csfloat_table_item(
-                analysis["price_status"] + (f"\n{rank_secondary}" if rank_secondary else ""), rank_color
-            ))
-
-            nearest = analysis.get("nearest_sale")
-            if nearest:
-                sold_date = nearest.get("sold_at", "").replace("T", " ")[:10]
-                sales_text = (
-                    f"最接近 ${nearest['price'] / 100:.2f}（{nearest['signed_gap_percent']:+.1f}%）\n"
-                    f"2%内 {analysis['within_2_percent']} · 5%内 {analysis['within_5_percent']} / "
-                    f"{analysis['sales_count']} 笔"
-                )
-                sales_tip = f"最接近成交日期：{sold_date or '未知'}"
-            else:
-                sales_text = "暂无成交样本"
-                sales_tip = detail.get("detail_error") or "接口没有返回可用成交"
-            table.setItem(row_index, 5, self._csfloat_table_item(sales_text, "#cba6f7", sales_tip))
-            table.setItem(row_index, 6, self._csfloat_table_item(
-                analysis["purchase_signal"] + "\n仅作参考", analysis["signal_color"],
-                "近期成交接近求购价，说明该价位曾有成交，但不保证当前一定能成交。",
-            ))
-
-        table.setUpdatesEnabled(True)
-
-    def _open_csfloat_profile(self):
-        QDesktopServices.openUrl(QUrl("https://csfloat.com/profile"))
-        self.csfloat_buy_status_label.setText("已打开 CSFloat 求购管理页")
-
-    def _open_csfloat_buy_item_from_cell(self, row_index, column):
-        if column != 0 or not 0 <= row_index < len(self._csfloat_buy_order_rows):
-            return
-        record = self._csfloat_buy_order_rows[row_index]
-        order = record.get("order") or {}
-        detail = record.get("detail") or {}
-        listing = detail.get("listing") or {}
-        listing_id = str(listing.get("listing_id") or "").strip()
-        market_hash_name = str(order.get("market_hash_name") or "").strip()
-        if listing_id:
-            url = f"https://csfloat.com/item/{quote(listing_id)}"
-        elif market_hash_name:
-            url = f"https://csfloat.com/search?market_hash_name={quote(market_hash_name)}"
-        else:
-            return
-        QDesktopServices.openUrl(QUrl(url))
-        self.csfloat_buy_status_label.setText("已打开对应饰品页面")
-
-    # ═══════════════════════════════════════════
-    # Tab 4: 设置
+    # Tab 3: 设置
     # ═══════════════════════════════════════════
 
     def init_settings_tab(self):
@@ -4031,6 +3822,7 @@ class CS2ManagerApp(QMainWindow):
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setFrameShape(QFrame.NoFrame)
         settings_content = QWidget()
+        settings_content.setObjectName("settingsContent")
         layout = QVBoxLayout(settings_content)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -4054,11 +3846,11 @@ class CS2ManagerApp(QMainWindow):
             "订单与收藏采用合并模式，不删除本机独有数据。"
         )
         cloud_note.setWordWrap(True)
-        cloud_note.setStyleSheet("color: #a6adc8;")
+        cloud_note.setStyleSheet("color: #cdd6f4;")
         cloud_layout.addWidget(cloud_note)
         self.cloud_sync_path_label = QLabel(f"同步收件箱：{get_sync_inbox_directory()}")
         self.cloud_sync_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.cloud_sync_path_label.setStyleSheet("color: #89b4fa; font-size: 12px;")
+        self.cloud_sync_path_label.setStyleSheet("color: #b4d0ff; font-size: 12px;")
         cloud_layout.addWidget(self.cloud_sync_path_label)
         cloud_buttons = QHBoxLayout()
         open_drive_button = QPushButton("打开 Google Drive 网页")
@@ -4139,6 +3931,11 @@ class CS2ManagerApp(QMainWindow):
         idx_map = {"0": 0, "5": 1, "15": 2, "30": 3, "60": 4}
         self.cfg_interval.setCurrentIndex(idx_map.get(cur_int, 2))
         form_time.addRow("自动刷新频率:", self.cfg_interval)
+        self.cfg_reduce_motion = QCheckBox("减少页面切换动效")
+        self.cfg_reduce_motion.setChecked(self._reduce_motion)
+        self.cfg_reduce_motion.setToolTip("保留即时反馈，关闭可能引起不适的页面淡入动效。")
+        self.cfg_reduce_motion.toggled.connect(self._set_reduced_motion)
+        form_time.addRow("减少动效:", self.cfg_reduce_motion)
         self.cfg_startup = QCheckBox("登录 Windows 后自动启动本软件")
         self.cfg_startup.setToolTip(
             "使用当前 Windows 用户的启动项，不需要管理员权限；此设置仅对本机生效。"
@@ -4160,7 +3957,7 @@ class CS2ManagerApp(QMainWindow):
             "费率修改并保存后，已有订单的净收益、累计净收益和年化统计也会立即按新费率重新计算。"
         )
         fee_note.setWordWrap(True)
-        fee_note.setStyleSheet("color: #a6adc8; font-weight: normal;")
+        fee_note.setStyleSheet("color: #cdd6f4; font-weight: normal;")
         form_fee.addRow(fee_note)
         self.cfg_fee_inputs = {}
         fee_fields = (
@@ -4471,12 +4268,14 @@ class CS2ManagerApp(QMainWindow):
         except (TypeError, ValueError):
             return 0.0
 
-    def _order_rental_days(self, order) -> float:
-        stored_days = self._order_number(order.get("rental_days"))
+    @staticmethod
+    def _order_rental_days(order) -> float:
+        stored_days = CS2ManagerApp._order_number(order.get("rental_days"))
         if stored_days > 0:
             return stored_days
-        start = _parse_rental_datetime(order.get("start_time"))
-        end = _parse_rental_datetime(order.get("return_time"))
+        platform = str(order.get("platform", "") or "")
+        start = _parse_platform_datetime_utc(order.get("start_time"), platform)
+        end = _parse_platform_datetime_utc(order.get("return_time"), platform)
         if end <= start:
             return 0.0
         duration = (end - start).total_seconds() / 86400
@@ -4513,9 +4312,11 @@ class CS2ManagerApp(QMainWindow):
         except ValueError:
             return 1.0
 
-    def _rental_end_datetime(self, order) -> datetime:
+    @staticmethod
+    def _rental_end_datetime(order) -> datetime:
         """Use rental end, not the later item-return deadline, for alerts/CD."""
-        stored_end = _parse_rental_datetime(order.get("rental_end_time"))
+        platform = str(order.get("platform", "") or "")
+        stored_end = _parse_platform_datetime_utc(order.get("rental_end_time"), platform)
         if stored_end > datetime.min:
             return stored_end
         raw_text = str(order.get("raw_text", "") or "")
@@ -4526,15 +4327,83 @@ class CS2ManagerApp(QMainWindow):
                 flags=re.DOTALL,
             )
             if match:
-                parsed = _parse_rental_datetime(match.group(1))
+                parsed = _parse_platform_datetime_utc(match.group(1), platform)
                 if parsed > datetime.min:
                     return parsed
         if order.get("platform") == "ECOSteam":
-            start = _parse_rental_datetime(order.get("start_time"))
-            rental_days = self._order_rental_days(order)
+            return_deadline = _parse_platform_datetime_utc(
+                order.get("return_deadline"), platform
+            )
+            if return_deadline > datetime.min:
+                return return_deadline - timedelta(hours=12)
+            start = _parse_platform_datetime_utc(order.get("start_time"), platform)
+            rental_days = CS2ManagerApp._order_rental_days(order)
             if start > datetime.min and rental_days > 0:
                 return start + timedelta(days=rental_days)
-        return _parse_rental_datetime(order.get("return_time"))
+        return _parse_platform_datetime_utc(order.get("return_time"), platform)
+
+    @staticmethod
+    def _order_update_deadline(order) -> datetime:
+        """Return when a still-active order should be refreshed manually."""
+        platform = str(order.get("platform", "") or "")
+        return_deadline = _parse_platform_datetime_utc(
+            order.get("return_deadline"), platform
+        )
+        if return_deadline > datetime.min:
+            return return_deadline
+        rental_end = CS2ManagerApp._rental_end_datetime(order)
+        if rental_end > datetime.min:
+            return rental_end + RENTAL_RELET_WINDOW
+        return datetime.min
+
+    @staticmethod
+    def _orders_needing_update(orders, now=None) -> list[dict]:
+        """Find active orders that have exceeded their known return window."""
+        current_time = now or _utc_now()
+        stale_orders = []
+        for order in orders:
+            if str(order.get("status", "") or "").strip() not in {"租赁中", "待归还"}:
+                continue
+            deadline = CS2ManagerApp._order_update_deadline(order)
+            if deadline > datetime.min and current_time >= deadline:
+                stale_orders.append(order)
+        return stale_orders
+
+    def _update_order_update_status(self, orders=None):
+        """Show a persistent warning only when active-order data is overdue."""
+        label = getattr(self, "order_update_status_label", None)
+        if label is None:
+            return
+        stale_orders = self._orders_needing_update(
+            self.db.get_rental_orders() if orders is None else orders
+        )
+        if not stale_orders:
+            label.clear()
+            label.setVisible(False)
+            return
+        label.setText(f"⚠ 需更新订单（{len(stale_orders)} 笔已超归还截止）")
+        details = []
+        for order in stale_orders[:5]:
+            deadline = self._order_update_deadline(order)
+            details.append(
+                f"{order.get('platform', '未知平台')} · {order.get('order_no', '未知订单')}"
+                f" · 截止 {deadline.strftime('%Y-%m-%d %H:%M')}"
+            )
+        remaining = len(stale_orders) - len(details)
+        if remaining:
+            details.append(f"另有 {remaining} 笔订单")
+        label.setToolTip("请从平台订单页复制最新订单并重新导入：\n" + "\n".join(details))
+        label.setStyleSheet("color: #f9e2af; font-weight: 700; padding: 0 8px;")
+        label.setVisible(True)
+
+    @staticmethod
+    def _returned_datetime(order) -> datetime:
+        """Return the confirmed item-return time for orders marked returned."""
+        if str(order.get("status", "") or "").strip() != "已归还":
+            return datetime.min
+        return _parse_platform_datetime_utc(
+            order.get("return_time"), order.get("platform", "")
+        )
 
     def _order_gross_income(self, order) -> float:
         daily_rent = self._order_daily_rent(order)
@@ -4550,6 +4419,12 @@ class CS2ManagerApp(QMainWindow):
         return max(0.0, self._order_number(order.get("transfer_reward")))
 
     def _order_fee_rate(self, order, history, fee_rates=None) -> float:
+        if order.get("platform") == "IGXE":
+            pricing_mode = str(order.get("pricing_mode", "") or "")
+            if pricing_mode == "one_click":
+                return 0.05
+            if pricing_mode == "manual":
+                return 0.10
         platform_prefix = {
             "C5GAME": "c5",
             "ECOSteam": "eco",
@@ -4600,7 +4475,9 @@ class CS2ManagerApp(QMainWindow):
             return False
         previous_order = history[order_index - 1]
         previous_end = self._rental_end_datetime(previous_order)
-        current_start = _parse_rental_datetime(order.get("start_time"))
+        current_start = _parse_platform_datetime_utc(
+            order.get("start_time"), order.get("platform", "")
+        )
         if previous_end <= datetime.min or current_start <= datetime.min:
             return False
         # Only a new order inside the 12-hour handover window is a transfer.
@@ -4659,14 +4536,17 @@ class CS2ManagerApp(QMainWindow):
         if _is_non_earning_rental_status(order_status):
             return order_status or fallback_status, None
 
+        returned_at = self._returned_datetime(latest_order)
         end_time = self._rental_end_datetime(latest_order)
         if end_time <= datetime.min:
-            if order_status in {"已归还", "已完成"}:
+            if order_status == "已归还":
+                return "已归还 · CD冷却 · 开始时间未知", QColor("#cba6f7")
+            if order_status == "已完成":
                 return "CD冷却 · 开始时间未知", QColor("#cba6f7")
             return f"{rental_label} · 租赁到期未知", QColor("#fab387")
 
-        now = datetime.now()
-        state, state_end = _rental_lifecycle_state(end_time, now)
+        now = _utc_now()
+        state, state_end = _rental_lifecycle_state(end_time, now, returned_at)
         if state == "rented":
             remaining_seconds = (end_time - now).total_seconds()
             color = QColor("#f38ba8") if remaining_seconds <= 12 * 60 * 60 else QColor("#a6e3a1")
@@ -4674,7 +4554,10 @@ class CS2ManagerApp(QMainWindow):
         if state == "pending_relet":
             return f"待转租中 · {self._countdown_text(state_end, now)}", QColor("#fab387")
         if state == "cooldown":
-            return f"CD冷却 · {self._countdown_text(state_end, now)}", QColor("#cba6f7")
+            prefix = "已归还 · " if returned_at > datetime.min else ""
+            return f"{prefix}CD冷却 · {self._countdown_text(state_end, now)}", QColor("#cba6f7")
+        if returned_at > datetime.min:
+            return "已归还 · 在库 · CD已结束", QColor("#a6e3a1")
         return "在库 · CD已结束", QColor("#a6e3a1")
 
     def _manual_cooldown_status(self, cooldown_until):
@@ -4732,12 +4615,9 @@ class CS2ManagerApp(QMainWindow):
             pill.setProperty("rentalStatusStyle", style)
 
     def _update_dashboard_rental_countdowns(self):
-        """Update countdown cells by stable asset id, even after user sorting."""
-        for item_id, state in self._dashboard_rental_rows.items():
-            row = self._dashboard_row_for_item_id(item_id)
-            if row < 0:
-                continue
-            pill = self.table.cellWidget(row, 7)
+        """Update only live status cells; widget references survive table sorting."""
+        for state in self._dashboard_rental_rows.values():
+            pill = state.get("pill")
             if pill is None:
                 continue
             if state.get("manual_cooldown_until") is not None:
@@ -4749,13 +4629,7 @@ class CS2ManagerApp(QMainWindow):
                     state["latest_order"], state["history"], state["fallback_status"]
                 )
             self._update_status_pill(pill, status_text, status_color)
-
-    def _dashboard_row_for_item_id(self, item_id):
-        for row in range(self.table.rowCount()):
-            name_item = self.table.item(row, 1)
-            if name_item is not None and name_item.data(Qt.UserRole) == item_id:
-                return row
-        return -1
+        self._update_order_update_status(self._dashboard_cached_orders or [])
 
     def _dashboard_item_id_at_row(self, row):
         """Read the hidden database ID stored on the visible name cell."""
@@ -4821,35 +4695,22 @@ class CS2ManagerApp(QMainWindow):
 
     def _build_dashboard_market_quote_index(self):
         """Index all cached quotes once while preserving first-match order."""
-        identity_quotes = {}
-        name_quotes = {}
-        for category in self._market_categories.values():
-            for quote_entry in category.get("items", []):
-                quote_identity = self._market_watch_identity(
-                    quote_entry.get(
-                        "market_hash_name", quote_entry.get("name", "")
-                    ),
-                    quote_entry.get("phase", "-"),
-                )
-                identity_quotes.setdefault(quote_identity, quote_entry)
-                fallback_name = (
-                    str(quote_entry.get("name", "")).strip().casefold()
-                )
-                if fallback_name:
-                    name_quotes.setdefault(fallback_name, quote_entry)
-        return identity_quotes, name_quotes
+        return _build_market_quote_index(
+            self._market_categories, self._market_watch_identity
+        )
 
     def _dashboard_market_quote(self, item, quote_index=None):
         """Find the cached market row matching an inventory asset."""
         if quote_index is None:
             quote_index = self._build_dashboard_market_quote_index()
-        identity_quotes, name_quotes = quote_index
         market_hash_name = self._build_market_hash_name(item)
-        target_identity = self._market_watch_identity(
-            market_hash_name, item.get("phase", "-")
+        return _find_market_quote(
+            quote_index,
+            market_hash_name,
+            item.get("phase", "-"),
+            item.get("name", ""),
+            self._market_watch_identity,
         )
-        fallback_name = str(item.get("name", "")).strip().casefold()
-        return identity_quotes.get(target_identity) or name_quotes.get(fallback_name) or {}
 
     @staticmethod
     def _dashboard_gap_item(value, benchmark, tooltip) -> QTableWidgetItem:
@@ -4936,14 +4797,33 @@ class CS2ManagerApp(QMainWindow):
             display_history.append(display_order)
         RentalHistoryDialog(item["name"], item.get("float_val", ""), display_history, self).exec()
 
-    def load_data(self):
-        """Render assets grouped by active-rental platform, item type and cost."""
+    def _queue_dashboard_filter_render(self, *_):
+        """Coalesce quick filter changes and render from the current local snapshot."""
+        self._dashboard_filter_timer.start()
+
+    def _render_dashboard_from_cache(self):
+        """Apply UI-only filters without repeating SQLite reads or schema normalization."""
+        if self._dashboard_cached_items is None or self._dashboard_cached_orders is None:
+            self.load_data()
+            return
+        self.load_data(reload_from_db=False)
+
+    def load_data(self, *, reload_from_db=True):
+        """Render assets by countdown, then active-rental platform, item type and cost."""
+        if reload_from_db:
+            self._dashboard_filter_timer.stop()
         sorting_enabled = self.table.isSortingEnabled()
         self.table.setSortingEnabled(False)
-        self.current_items = self.db.get_all_items()
+        if reload_from_db or self._dashboard_cached_items is None or self._dashboard_cached_orders is None:
+            self._dashboard_cached_items = self.db.get_all_items()
+            for item in self._dashboard_cached_items:
+                self._apply_schema_mapping(item)
+            self._dashboard_cached_orders = self.db.get_rental_orders()
+        self.current_items = self._dashboard_cached_items
+        rental_orders = self._dashboard_cached_orders
         rental_histories = _build_rental_history_index(
             self.current_items,
-            self.db.get_rental_orders(),
+            rental_orders,
         )
         market_quote_index = self._build_dashboard_market_quote_index()
         fee_rates = self._dashboard_fee_rates()
@@ -4967,25 +4847,59 @@ class CS2ManagerApp(QMainWindow):
         portfolio_total_net_income = 0.0
 
         dashboard_records = []
+        dashboard_now = _utc_now()
+        dashboard_local_now = datetime.now()
         for item in self.current_items:
             history = rental_histories.get(item.get("id"), [])
             latest_order = history[-1] if history else None
             is_currently_rented = False
             if latest_order and str(latest_order.get("status", "") or "").strip() == "租赁中":
                 rental_end = self._rental_end_datetime(latest_order)
-                is_currently_rented = rental_end <= datetime.min or rental_end > datetime.now()
+                is_currently_rented = rental_end <= datetime.min or rental_end > dashboard_now
             elif not latest_order and str(item.get("status", "") or "").strip() == "已出租":
                 is_currently_rented = True
             sort_platform = (
                 str(latest_order.get("platform", "")).strip()
                 if is_currently_rented and latest_order else str(item.get("platform", "")).strip()
             )
+            sort_deadline = None
+            has_unknown_timer = False
+            lifecycle_priority = 2
+            if latest_order and not _is_non_earning_rental_status(latest_order.get("status")):
+                rental_end = self._rental_end_datetime(latest_order)
+                returned_at = self._returned_datetime(latest_order)
+                lifecycle_state, lifecycle_deadline = _rental_lifecycle_state(
+                    rental_end, dashboard_now, returned_at
+                )
+                if lifecycle_state in {"rented", "pending_relet", "cooldown"}:
+                    sort_deadline = lifecycle_deadline
+                    lifecycle_priority = 0 if lifecycle_state in {"rented", "pending_relet"} else 1
+                elif lifecycle_state == "unknown" and str(
+                    latest_order.get("status", "") or ""
+                ).strip() == "租赁中":
+                    has_unknown_timer = True
+                    lifecycle_priority = 0
+            if sort_deadline is None and str(item.get("status", "") or "").strip() == "CD冷却":
+                manual_deadline = _parse_cooldown_datetime(item.get("cooldown_until", ""))
+                manual_deadline_utc = _local_datetime_to_utc(manual_deadline)
+                if manual_deadline > dashboard_local_now:
+                    sort_deadline = manual_deadline_utc
+                    lifecycle_priority = 1
+                elif manual_deadline <= datetime.min:
+                    has_unknown_timer = True
+                    lifecycle_priority = 1
+            if not latest_order and str(item.get("status", "") or "").strip() == "已出租":
+                has_unknown_timer = True
+                lifecycle_priority = 0
             dashboard_records.append({
                 "item": item,
                 "latest_order": latest_order,
                 "history": history,
                 "platform": sort_platform or "未分类",
                 "is_currently_rented": is_currently_rented,
+                "sort_deadline": sort_deadline,
+                "has_unknown_timer": has_unknown_timer,
+                "lifecycle_priority": lifecycle_priority,
             })
 
         # Portfolio market P/L always represents every asset, independent of
@@ -5066,9 +4980,10 @@ class CS2ManagerApp(QMainWindow):
 
             status_matches = {
                 "全部状态": True,
-                "在库": status_text.startswith("在库"),
+                "在库": "在库" in status_text,
                 "出租中": status_text.startswith(("已出租", "已转租")),
                 "待转租": "待转租" in status_text,
+                "已归还": str(order_status or "").strip() == "已归还",
                 "CD冷却": "CD冷却" in status_text,
             }.get(status_filter, True)
             if not status_matches:
@@ -5135,7 +5050,9 @@ class CS2ManagerApp(QMainWindow):
                 if column == 0:
                     continue
                 if column == 7:
-                    self.table.setCellWidget(row, column, self._create_status_pill(status_text, status_color))
+                    self.table.setCellWidget(
+                        row, column, self._create_status_pill(status_text, status_color)
+                    )
                     continue
                 if column in (5, 10):
                     continue
@@ -5193,20 +5110,21 @@ class CS2ManagerApp(QMainWindow):
             )
             if latest_order and not _is_non_earning_rental_status(latest_order.get("status")):
                 self._dashboard_rental_rows[item["id"]] = {
-                    "row": row,
+                    "pill": self.table.cellWidget(row, 7),
                     "latest_order": latest_order,
                     "history": history,
                     "fallback_status": item.get("status", "在库"),
                 }
             elif str(item.get("status", "") or "").strip() == "CD冷却":
                 self._dashboard_rental_rows[item["id"]] = {
+                    "pill": self.table.cellWidget(row, 7),
                     "manual_cooldown_until": item.get("cooldown_until", "")
                 }
             row += 1
 
         annual_rate = (daily_rent_total * 365 / total_cost * 100) if total_cost > 0 else 0.0
-        self.card_cost.findChildren(QLabel)[1].setText(f"¥ {total_cost:,.2f}")
-        profit_value_label = self.card_market_profit.findChildren(QLabel)[1]
+        self.card_cost.value_label.setText(f"¥ {total_cost:,.2f}")
+        profit_value_label = self.card_market_profit.value_label
         if priced_asset_count:
             holding_profit = portfolio_market_value - portfolio_priced_cost
             profit_value_label.setText(f"{'+' if holding_profit > 0 else ''}¥ {holding_profit:,.2f}")
@@ -5226,19 +5144,20 @@ class CS2ManagerApp(QMainWindow):
             self.card_market_profit.setToolTip(
                 "暂无可用于计算饰品行情盈亏的 CSQAQ 行情；租金收益仍在旁边单独展示。"
             )
-        self.card_income.findChildren(QLabel)[1].setText(_money_text(daily_rent_total))
-        self.card_total_income.findChildren(QLabel)[1].setText(
+        self.card_income.value_label.setText(_money_text(daily_rent_total))
+        self.card_total_income.value_label.setText(
             _money_text(portfolio_total_net_income)
         )
         self.card_total_income.setToolTip(
             "全部饰品订单的累计净租金；已取消、已关闭、已退款订单不计收益，"
             "不受平台筛选影响。"
         )
-        self.card_rented.findChildren(QLabel)[1].setText(f"{rented_count} / {row} 件")
-        self.card_rate.findChildren(QLabel)[1].setText(f"{annual_rate:.2f}%")
+        self.card_rented.value_label.setText(f"{rented_count} / {row} 件")
+        self.card_rate.value_label.setText(f"{annual_rate:.2f}%")
         self.lbl_last_update.setText(f"最后更新：{QTime.currentTime().toString('HH:mm:ss')}")
         if hasattr(self, "title_bar"):
             self.title_bar.set_sync_status("本地数据已同步", "#a6e3a1")
+        self._update_order_update_status(rental_orders)
         self.dashboard_empty_label.setVisible(row == 0)
         self.table.setSortingEnabled(sorting_enabled)
         return
@@ -5327,6 +5246,7 @@ class CS2ManagerApp(QMainWindow):
         if dialog.exec() != QDialog.Accepted or not dialog.import_decisions:
             return
         counts = apply_asset_import_plan(self.db, dialog.import_decisions)
+        self._sync_market_after_asset_change()
         self.load_data()
         self._show_toast(
             "AI 资产导入完成："
@@ -5350,6 +5270,7 @@ class CS2ManagerApp(QMainWindow):
             if dialog.exec() == QDialog.Accepted:
                 new_data = dialog.get_data()
                 self.db.update_item(item_id, new_data)
+                self._sync_market_after_asset_change()
                 self.load_data()
                 self._show_toast("饰品修改已保存")
 
@@ -5358,6 +5279,7 @@ class CS2ManagerApp(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             new_data = dialog.get_data()
             self.db.add_item(new_data)
+            self._sync_market_after_asset_change()
             self.load_data()
             self._show_toast("新饰品已添加")
 
@@ -5380,6 +5302,7 @@ class CS2ManagerApp(QMainWindow):
         )
         if confirm == QMessageBox.Yes:
             self.db.delete_item(item_id)
+            self._sync_market_after_asset_change()
             self.load_data()
             self._last_deleted_item_id = item_id
             self.undo_delete_button.setVisible(True)

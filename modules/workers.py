@@ -13,6 +13,7 @@ from modules.image_cache import ImageCache
 logger = logging.getLogger("CS2Rental")
 CSQAQ_DETAIL_CACHE_TTL_SECONDS = 10 * 60
 CSFLOAT_CACHE_TTL_SECONDS = 10 * 60
+CSFLOAT_BUY_QUOTE_TTL_SECONDS = 30 * 60
 CSFLOAT_MAX_REQUESTS_PER_REFRESH = 40
 
 
@@ -44,6 +45,26 @@ def csfloat_quote_is_fresh(entry: dict, market_hash_name: str, now: float | None
         fetched_at > 0
         and query_name == market_hash_name
         and current_time - fetched_at < CSFLOAT_CACHE_TTL_SECONDS
+    )
+
+
+def csfloat_buy_quote_is_fresh(
+    entry: dict,
+    market_hash_name: str,
+    now: float | None = None,
+) -> bool:
+    """Reuse the slower-moving highest buy quote for thirty minutes."""
+    fetched_at = float(entry.get("csfloat_buy_fetched_at", 0) or 0)
+    query_name = str(
+        entry.get("csfloat_buy_query_mhn")
+        or entry.get("csfloat_query_mhn")
+        or ""
+    )
+    current_time = time.time() if now is None else now
+    return (
+        fetched_at > 0
+        and query_name == market_hash_name
+        and current_time - fetched_at < CSFLOAT_BUY_QUOTE_TTL_SECONDS
     )
 
 
@@ -569,40 +590,48 @@ class MarketRefreshWorker(QObject):
                         entry["csfloat_paint_seed"] = result.get("paint_seed")
                         entry["csfloat_status"] = "ok"
 
-                        buy_result = csfloat_client.get_highest_buy_order(
-                            entry["csfloat_listing_id"]
+                        buy_is_fresh = (
+                            not force_csfloat
+                            and csfloat_buy_quote_is_fresh(entry, mhn)
                         )
-                        csfloat_network_attempts += int(bool(buy_result.get("request_made")))
-                        entry["csfloat_buy_last_attempt_at"] = int(time.time())
-                        if buy_result.get("success"):
-                            entry["csfloat_buy_fetched_at"] = int(time.time())
-                            if buy_result.get("found"):
-                                buy_cents = int(buy_result.get("price_cents") or 0)
-                                entry["csfloat_highest_buy_price_cents"] = buy_cents
-                                entry["csfloat_highest_buy_usd"] = _number(
-                                    buy_result.get("price_usd")
-                                )
-                                entry["csfloat_highest_buy_cny"] = csfloat_cny_display_price(
-                                    buy_cents, csfloat_fx_rate
-                                )
-                                entry["csfloat_highest_buy_qty"] = int(
-                                    buy_result.get("quantity") or 0
-                                )
-                                entry["csfloat_highest_buy_hybrid_properties"] = (
-                                    buy_result.get("hybrid_properties") or {}
-                                )
-                                entry["csfloat_buy_status"] = "ok"
-                            else:
-                                entry["csfloat_highest_buy_price_cents"] = 0
-                                entry["csfloat_highest_buy_usd"] = 0.0
-                                entry["csfloat_highest_buy_cny"] = 0.0
-                                entry["csfloat_highest_buy_qty"] = 0
-                                entry["csfloat_highest_buy_hybrid_properties"] = {}
-                                entry["csfloat_buy_status"] = "no_buy_order"
+                        if buy_is_fresh:
+                            entry.setdefault("csfloat_buy_status", "ok")
                         else:
-                            entry["csfloat_buy_status"] = str(
-                                buy_result.get("error") or "unknown"
+                            buy_result = csfloat_client.get_highest_buy_order(
+                                entry["csfloat_listing_id"]
                             )
+                            csfloat_network_attempts += int(bool(buy_result.get("request_made")))
+                            entry["csfloat_buy_last_attempt_at"] = int(time.time())
+                            if buy_result.get("success"):
+                                entry["csfloat_buy_fetched_at"] = int(time.time())
+                                entry["csfloat_buy_query_mhn"] = mhn
+                                if buy_result.get("found"):
+                                    buy_cents = int(buy_result.get("price_cents") or 0)
+                                    entry["csfloat_highest_buy_price_cents"] = buy_cents
+                                    entry["csfloat_highest_buy_usd"] = _number(
+                                        buy_result.get("price_usd")
+                                    )
+                                    entry["csfloat_highest_buy_cny"] = csfloat_cny_display_price(
+                                        buy_cents, csfloat_fx_rate
+                                    )
+                                    entry["csfloat_highest_buy_qty"] = int(
+                                        buy_result.get("quantity") or 0
+                                    )
+                                    entry["csfloat_highest_buy_hybrid_properties"] = (
+                                        buy_result.get("hybrid_properties") or {}
+                                    )
+                                    entry["csfloat_buy_status"] = "ok"
+                                else:
+                                    entry["csfloat_highest_buy_price_cents"] = 0
+                                    entry["csfloat_highest_buy_usd"] = 0.0
+                                    entry["csfloat_highest_buy_cny"] = 0.0
+                                    entry["csfloat_highest_buy_qty"] = 0
+                                    entry["csfloat_highest_buy_hybrid_properties"] = {}
+                                    entry["csfloat_buy_status"] = "no_buy_order"
+                            else:
+                                entry["csfloat_buy_status"] = str(
+                                    buy_result.get("error") or "unknown"
+                                )
                     else:
                         entry["csfloat_min_sell_usd"] = 0.0
                         entry["csfloat_min_sell_cny"] = 0.0
