@@ -95,7 +95,11 @@ def _c5_transfer_reward(text: str) -> tuple[float, str, bool]:
 
 
 def parse_c5_detail_clipboard(text: str) -> list[dict[str, Any]]:
-    """Parse one copied C5 order-detail page, including a settled reward."""
+    """Parse one copied C5 order-detail page, including Markdown-styled copies."""
+    # C5's browser copy can include Markdown bold markers around labels and
+    # values.  Remove only those markers so the normal detail-page grammar is
+    # shared by both plain-text and rich-text clipboard copies.
+    text = re.sub(r"\*{1,3}", "", text)
     order_no = _first(r"订单(?:编号|号)\s*[：:]?\s*(\d{8,})", text)
     if not order_no:
         return []

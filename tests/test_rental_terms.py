@@ -89,6 +89,37 @@ class RentalTermRuleTests(unittest.TestCase):
         self.assertEqual(order["transfer_reward"], 0.62)
         self.assertTrue(order["transfer_reward_known"])
 
+    def test_c5_detail_accepts_markdown_styled_active_order(self):
+        text = """订单号：1553943924146884608
+**订单状态:** **租赁中**
+流浪者匕首（★） | 多普勒 (崭新出厂)
+磨损度：0.0106204133480787
+**￥2.5/天**
+**下单时间：**
+2026-07-21 23:44:25
+**租赁价格：**
+**￥**
+2.5/天*8天 = 20元
+**租期时长：**
+8天 （最多可租45天）
+**饰品押金：**
+**￥** **3700**
+**租赁到期：**
+2026-07-30 00:02:11
+**转租状态：**
+未转租
+**转租奖励：**
+最高奖励 ￥1
+"""
+        order = parse_c5_detail_clipboard(text)[0]
+        self.assertEqual(order["order_no"], "1553943924146884608")
+        self.assertEqual(order["daily_rent"], 2.5)
+        self.assertEqual(order["income"], 20.0)
+        self.assertEqual(order["rental_end_time"], "2026-07-30 00:02:11")
+        self.assertEqual(order["transfer_status"], "未转租")
+        self.assertEqual(order["reward_status"], "最高奖励")
+        self.assertEqual(order["transfer_reward"], 1.0)
+
     def test_c5_list_marks_returned_order_and_keeps_actual_return_time(self):
         text = """订单号：1551387067139190784
 2026-07-14 22:24:23

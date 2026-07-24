@@ -504,8 +504,7 @@ class RentalHistoryDialog(QDialog):
                 f"{rental_days:g} 天" if rental_days > 0 else "—",
                 _money_text(daily) if daily > 0 else "—",
                 _money_text(income),
-                _money_text(order.get("transfer_reward_cost", 0.0) or 0.0)
-                if order.get("transfer_reward_cost", 0.0) else "—",
+                order.get("transfer_reward_cost_text") or "—",
                 _money_text(order.get("net_income", income) or 0.0),
             ]
             for column, value in enumerate(values):
@@ -547,10 +546,12 @@ class RentalHistoryDialog(QDialog):
         reward_status = str(order.get("reward_status", "未读取") or "未读取")
         transfer_status = str(order.get("transfer_status", "未读取") or "未读取")
         cost = order.get("transfer_reward_cost", 0.0) or 0.0
-        settlement = (
-            f"已结算并计入成本：{_money_text(cost)}"
-            if cost else "未计入成本（仅在 C5 显示“已发放”后结算）"
-        )
+        if cost:
+            settlement = f"已结算并计入成本：{_money_text(cost)}"
+        elif order.get("reward_settlement_due"):
+            settlement = "奖励待结算：下一笔 C5 订单已到期，请复制原订单详情重新导入。"
+        else:
+            settlement = "未计入成本（仅在 C5 显示“已发放”后结算）"
         return (
             f"C5 页面奖励：{_money_text(order.get('transfer_reward', 0.0) or 0.0)}"
             f"（{reward_status}）\n"
@@ -4443,6 +4444,30 @@ class CS2ManagerApp(QMainWindow):
         maximum = max(0.0, self._order_gross_income(order)) * 0.05
         return min(reward, maximum)
 
+    def _reward_settlement_due(self, order, history, now=None) -> bool:
+        """Whether a transferred C5 reward should now be reconciled from C5."""
+        if (
+            order.get("platform") != "C5GAME"
+            or str(order.get("transfer_status", "") or "") != "已转交"
+            or str(order.get("reward_status", "") or "") not in {"待发放", "最高奖励"}
+        ):
+            return False
+        order_index = next(
+            (index for index, candidate in enumerate(history)
+             if self._order_key(candidate) == self._order_key(order)),
+            -1,
+        )
+        if order_index < 0 or order_index + 1 >= len(history):
+            return False
+        next_order = history[order_index + 1]
+        if (
+            next_order.get("platform") != "C5GAME"
+            or not self._is_relet_order(next_order, history)
+        ):
+            return False
+        next_end = self._rental_end_datetime(next_order)
+        return next_end > datetime.min and next_end <= (now or _utc_now())
+
     def _order_fee_rate(self, order, history, fee_rates=None) -> float:
         if order.get("platform") == "IGXE":
             pricing_mode = str(order.get("pricing_mode", "") or "")
@@ -4823,7 +4848,13 @@ class CS2ManagerApp(QMainWindow):
             # their derived values here so the history dialog remains useful.
             display_order["rental_days"] = self._order_rental_days(order)
             display_order["daily_rent"] = self._order_daily_rent(order)
-            display_order["transfer_reward_cost"] = self._order_transfer_reward(order, history)
+            reward_cost = self._order_transfer_reward(order, history)
+            display_order["transfer_reward_cost"] = reward_cost
+            display_order["reward_settlement_due"] = self._reward_settlement_due(order, history)
+            display_order["transfer_reward_cost_text"] = (
+                _money_text(reward_cost)
+                if reward_cost else ("待结算" if display_order["reward_settlement_due"] else "")
+            )
             display_order["net_income"] = self._order_net_income(order, history)
             rental_end = self._rental_end_datetime(order)
             if rental_end > datetime.min:

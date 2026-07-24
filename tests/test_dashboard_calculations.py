@@ -362,6 +362,25 @@ class DashboardCalculationTests(unittest.TestCase):
         non_c5 = dict(original, platform="IGXE")
         self.assertEqual(app._order_transfer_reward(non_c5, [non_c5]), 0.0)
 
+    def test_c5_transferred_reward_is_due_after_the_following_c5_order_ends(self):
+        app = CS2ManagerApp.__new__(CS2ManagerApp)
+        original = {
+            "platform": "C5GAME", "order_no": "original",
+            "transfer_status": "已转交", "reward_status": "待发放",
+            "rental_end_time": "2026-07-20 12:00:00",
+        }
+        next_order = {
+            "platform": "C5GAME", "order_no": "next",
+            "start_time": "2026-07-20 12:05:00",
+            "rental_end_time": "2026-07-22 12:00:00",
+        }
+        self.assertTrue(app._reward_settlement_due(
+            original, [original, next_order], datetime(2026, 7, 23, 12, 0, 0),
+        ))
+        self.assertFalse(app._reward_settlement_due(
+            original, [original, next_order], datetime(2026, 7, 21, 12, 0, 0),
+        ))
+
     def test_igxe_confirmed_pricing_mode_overrides_legacy_fee_settings(self):
         class DBStub:
             @staticmethod
