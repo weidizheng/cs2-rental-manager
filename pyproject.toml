@@ -20,7 +20,7 @@ ignore = ["E501"]
 [tool.coverage.run]
 branch = true
 source = ["modules"]
-omit = ["test_*.py"]
+omit = ["tests/*"]
 
 [tool.coverage.report]
 fail_under = 60

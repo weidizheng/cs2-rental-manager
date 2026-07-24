@@ -18,7 +18,7 @@
 - 桌面 `CS2刀具出租选品报告.html`
 - 桌面 `CS2四代手套出租选品报告.html`
 - 桌面生成器 `generate_cs2_knife_rental_report.py`
-- 本方法论文档 `RENTAL_SELECTION_METHODOLOGY.md`
+- 本方法论文档 `docs/RENTAL_SELECTION_METHODOLOGY.md`
 
 报告只包含公开市场数据和计算结果，不写入 API Token、私钥或项目账号信息。
 

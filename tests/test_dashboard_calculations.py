@@ -71,19 +71,25 @@ class DashboardCalculationTests(unittest.TestCase):
         stale = CS2ManagerApp._orders_needing_update(orders, now)
         self.assertEqual([order["order_no"] for order in stale], ["overdue"])
 
-    def test_update_status_derives_deadline_without_a_return_deadline(self):
+    def test_update_status_requires_an_explicit_deadline_and_rental_status(self):
         orders = [
             {
                 "platform": "C5GAME",
                 "order_no": "derived-deadline",
                 "status": "租赁中",
                 "rental_end_time": "2026-07-24 12:00:00",
-            }
+            },
+            {
+                "platform": "C5GAME",
+                "order_no": "pending-return",
+                "status": "待归还",
+                "return_deadline": "2026-07-24 12:00:00",
+            },
         ]
 
         stale = CS2ManagerApp._orders_needing_update(orders, datetime(2099, 1, 1))
 
-        self.assertEqual([order["order_no"] for order in stale], ["derived-deadline"])
+        self.assertEqual(stale, [])
 
     def test_one_percent_cost_surcharge_is_added_and_rounded_to_cents(self):
         self.assertEqual(_adjust_cost_by_percent(2121.76, 1), 2142.98)

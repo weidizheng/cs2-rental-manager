@@ -20,10 +20,10 @@ jobs:
       - name: Compile
         run: python -m compileall -q main.py modules
       - name: Lint
-        run: python -m ruff check main.py modules test_*.py
+        run: python -m ruff check main.py modules tests
       - name: Test
         env:
           QT_QPA_PLATFORM: offscreen
-        run: python -m coverage run -m unittest discover -v
+        run: python -m coverage run -m unittest discover -s tests -v
       - name: Coverage report
         run: python -m coverage report

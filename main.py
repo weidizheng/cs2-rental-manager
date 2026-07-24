@@ -1099,7 +1099,13 @@ class CustomTitleBar(QFrame):
         button.setAccessibleName(tooltip)
         return button
 
-    def set_sync_status(self, text, tone="#a6e3a1"):
+    def set_sync_status(self, text, tone="#65d69b"):
+        tone = {
+            "#a6e3a1": "#65d69b",
+            "#89b4fa": "#70a5f7",
+            "#f9e2af": "#f5b942",
+            "#f38ba8": "#fb7185",
+        }.get(tone.lower(), tone)
         self.sync_label.setText(f"● {text}")
         self.sync_label.setStyleSheet(f"color: {tone};")
 
@@ -1228,6 +1234,21 @@ class CS2ManagerApp(QMainWindow):
     def apply_theme(self):
         self.setStyleSheet(APP_QSS)
 
+    @staticmethod
+    def _page_heading(title_text, subtitle_text):
+        """Create a compact, readable page landmark with supporting context."""
+        heading = QWidget()
+        heading_layout = QVBoxLayout(heading)
+        heading_layout.setContentsMargins(0, 0, 0, 0)
+        heading_layout.setSpacing(1)
+        title = QLabel(title_text)
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(subtitle_text)
+        subtitle.setObjectName("pageSubtitle")
+        heading_layout.addWidget(title)
+        heading_layout.addWidget(subtitle)
+        return heading
+
     def init_ui(self):
         central_widget = QWidget()
         central_widget.setObjectName("appRoot")
@@ -1279,10 +1300,6 @@ class CS2ManagerApp(QMainWindow):
         self.settings_button.setText("设置")
         self.settings_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.settings_button.setToolTip("系统与 API 设置")
-        self.settings_button.setStyleSheet(
-            "QToolButton { color: #a6adc8; padding: 7px 8px; border-radius: 6px; }"
-            "QToolButton:hover { color: #cdd6f4; background: #1e1e2e; }"
-        )
         self.settings_button.clicked.connect(lambda: self.switch_page(2))
         nav_layout.addWidget(self.settings_button)
         footer = QLabel(f"CS2 Rental Manager\nv{__version__} · 本地优先")
@@ -1315,16 +1332,8 @@ class CS2ManagerApp(QMainWindow):
         self.undo_delete_button.setObjectName("primaryBtn")
         self.undo_delete_button.clicked.connect(self._undo_last_delete)
         self.undo_delete_button.setVisible(False)
-        self.order_update_status_label = QLabel()
-        self.order_update_status_label.setObjectName("orderUpdateStatus")
-        self.order_update_status_label.setVisible(False)
-        self.statusBar().addPermanentWidget(self.order_update_status_label)
         self.statusBar().addPermanentWidget(self.undo_delete_button)
-        self.statusBar().setStyleSheet(
-            "QStatusBar { background: #11111b; color: #cdd6f4; border-top: 1px solid #313244; }"
-        )
         self._last_deleted_item_id = None
-        self._update_order_update_status()
 
     def _install_shortcuts(self):
         self._app_shortcuts = []
@@ -1447,10 +1456,15 @@ class CS2ManagerApp(QMainWindow):
             page.setGraphicsEffect(effect)
         if self._page_animation is not None:
             self._page_animation.stop()
-        effect.setOpacity(0.0)
+        # Read the live presentation value when navigation interrupts a
+        # transition. This avoids a flash during rapid keyboard navigation.
+        start_opacity = effect.opacity()
+        if start_opacity >= 0.99:
+            start_opacity = 0.72
+        effect.setOpacity(start_opacity)
         animation = QPropertyAnimation(effect, b"opacity", self)
-        animation.setDuration(160)
-        animation.setStartValue(0.0)
+        animation.setDuration(150)
+        animation.setStartValue(start_opacity)
         animation.setEndValue(1.0)
         animation.setEasingCurve(QEasingCurve.OutCubic)
         animation.finished.connect(lambda: effect.setOpacity(1.0))
@@ -1639,12 +1653,10 @@ class CS2ManagerApp(QMainWindow):
 
         # ── 顶部标题栏 ──
         header = QHBoxLayout()
-        title = QLabel("资产总览")
-        title.setObjectName("titleLabel")
-        header.addWidget(title)
+        header.addWidget(self._page_heading("资产总览", "资产、租金收益与到期安排一览"))
         header.addStretch()
         self.lbl_last_update = QLabel("最后更新: --")
-        self.lbl_last_update.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        self.lbl_last_update.setObjectName("lastUpdatedLabel")
         header.addWidget(self.lbl_last_update)
         self.dashboard_sync_progress_button = self._create_global_sync_button()
         header.addWidget(self.dashboard_sync_progress_button)
@@ -1654,20 +1666,20 @@ class CS2ManagerApp(QMainWindow):
         self.dashboard_card_layout = QGridLayout()
         self.dashboard_card_layout.setHorizontalSpacing(10)
         self.dashboard_card_layout.setVerticalSpacing(10)
-        self.card_cost = self.create_card("买入总资产", "¥ 0.00", "#89b4fa")
+        self.card_cost = self.create_card("买入总资产", "¥ 0.00", "#60a5fa")
         self.card_market_profit = self.create_card(
-            "饰品行情盈亏", "—", "#bac2de", emphasis=True
+            "饰品行情盈亏", "—", "#cbd5e1", emphasis=True
         )
         self.card_market_profit.setToolTip(
             "CSQAQ 当前全网最低售价合计 − 对应饰品总成本；不包含租金收益，不受平台筛选影响。"
         )
-        self.card_total_income = self.create_card("累计租金净收益", "¥ 0.00", "#cba6f7")
+        self.card_total_income = self.create_card("累计租金净收益", "¥ 0.00", "#a78bfa")
         self.card_total_income.setToolTip(
             "全部饰品订单的累计净租金；已取消、已关闭、已退款订单不计收益，不受平台筛选影响。"
         )
-        self.card_income = self.create_card("当前每日净收益", "¥ 0.00", "#a6e3a1")
-        self.card_rented = self.create_card("在租件数", "0 / 0 件", "#f9e2af")
-        self.card_rate = self.create_card("在租年化（总资产）", "0.0%", "#f38ba8")
+        self.card_income = self.create_card("当前每日净收益", "¥ 0.00", "#4ade80")
+        self.card_rented = self.create_card("在租件数", "0 / 0 件", "#fbbf24")
+        self.card_rate = self.create_card("在租年化（总资产）", "0.0%", "#fb7185")
         self.dashboard_cards = [
             self.card_cost, self.card_market_profit, self.card_total_income,
             self.card_income, self.card_rented, self.card_rate,
@@ -1681,20 +1693,19 @@ class CS2ManagerApp(QMainWindow):
         toolbar.setSpacing(8)
 
         add_btn = QPushButton("新增饰品")
+        add_btn.setObjectName("primaryBtn")
         self._set_button_icon(add_btn, "add")
         add_btn.clicked.connect(self.add_item)
 
         ai_asset_import_btn = QPushButton("AI 批量导入")
-        ai_asset_import_btn.setObjectName("primaryBtn")
-        self._set_button_icon(ai_asset_import_btn, "clipboard", "#11111b")
+        self._set_button_icon(ai_asset_import_btn, "clipboard")
         ai_asset_import_btn.setToolTip(
             "复制资产识别模板和截图给 AI，再粘贴 JSON 一键导入"
         )
         ai_asset_import_btn.clicked.connect(self._open_ai_asset_import)
 
         edit_btn = QPushButton("修改选中")
-        edit_btn.setObjectName("primaryBtn")
-        self._set_button_icon(edit_btn, "edit", "#11111b")
+        self._set_button_icon(edit_btn, "edit")
         edit_btn.clicked.connect(self.edit_selected_item)
 
         history_btn = QPushButton("订单历史")
@@ -1812,7 +1823,7 @@ class CS2ManagerApp(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setSectionsMovable(True)
         self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet("alternate-background-color: #1e1e2e;")
+        self.table.setShowGrid(False)
         self.table.verticalHeader().setDefaultSectionSize(64)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_dashboard_context_menu)
@@ -1834,10 +1845,10 @@ class CS2ManagerApp(QMainWindow):
         """创建美化后的统计卡片"""
         w = QFrame()
         w.setObjectName("emphasisCard" if emphasis else "cardFrame")
-        w.setMinimumHeight(82)
+        w.setMinimumHeight(88)
         w.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(13, 9, 13, 9)
+        lay.setContentsMargins(15, 11, 15, 11)
         lay.setSpacing(4)
 
         t = QLabel(title)
@@ -1845,7 +1856,7 @@ class CS2ManagerApp(QMainWindow):
         t.setWordWrap(True)
         v = QLabel(val)
         v.setObjectName("cardValue")
-        v.setStyleSheet(f"color: {color}; font-size: 19px; font-weight: bold;")
+        v.setStyleSheet(f"color: {color}; font-size: 20px; font-weight: 700;")
         w.value_label = v
 
         lay.addWidget(t)
@@ -1853,7 +1864,11 @@ class CS2ManagerApp(QMainWindow):
         return w
 
     @staticmethod
-    def _set_button_icon(button, icon_name, color="#cdd6f4"):
+    def _set_button_icon(button, icon_name, color="#d7e0ee"):
+        # Legacy callers passed a dark icon for pastel buttons.  Semantic action
+        # buttons now use deeper fills, so their icons must remain readable.
+        if color.lower() == "#11111b":
+            color = "#f8fbff"
         button.setIcon(make_line_icon(icon_name, color, 16))
         button.setIconSize(QSize(16, 16))
 
@@ -1946,12 +1961,10 @@ class CS2ManagerApp(QMainWindow):
 
         # ── 顶部标题栏 ──
         header = QHBoxLayout()
-        title = QLabel("大盘行情")
-        title.setObjectName("titleLabel")
-        header.addWidget(title)
+        header.addWidget(self._page_heading("大盘行情", "按分类跟踪报价、租金与更新时间"))
         header.addStretch()
         self.lbl_market_update = QLabel("最后更新: --")
-        self.lbl_market_update.setStyleSheet("color: #a6adc8; font-size: 12px;")
+        self.lbl_market_update.setObjectName("lastUpdatedLabel")
         header.addWidget(self.lbl_market_update)
         layout.addLayout(header)
 
@@ -2002,15 +2015,13 @@ class CS2ManagerApp(QMainWindow):
         search_layout.addWidget(self.market_search_btn)
 
         ai_import_btn = QPushButton("AI 批量添加")
-        ai_import_btn.setObjectName("primaryBtn")
-        self._set_button_icon(ai_import_btn, "clipboard", "#11111b")
+        self._set_button_icon(ai_import_btn, "clipboard")
         ai_import_btn.setToolTip("复制提示词和截图交给 AI，再将 JSON 返回结果粘贴进来批量添加")
         ai_import_btn.clicked.connect(self._open_ai_market_import)
         search_layout.addWidget(ai_import_btn)
 
         refresh_market_btn = QPushButton("立即同步")
-        refresh_market_btn.setObjectName("successBtn")
-        self._set_button_icon(refresh_market_btn, "refresh", "#11111b")
+        self._set_button_icon(refresh_market_btn, "refresh")
         refresh_market_btn.clicked.connect(self._request_global_sync_now)
         refresh_market_btn.setToolTip("按全局频率排队同步；不会绕过 CSFloat 频控（快捷键：F5）")
         search_layout.addWidget(refresh_market_btn)
@@ -2071,7 +2082,7 @@ class CS2ManagerApp(QMainWindow):
         self.market_table.setSortingEnabled(True)
         self.market_table.horizontalHeader().setSectionsMovable(True)
         self.market_table.setAlternatingRowColors(True)
-        self.market_table.setStyleSheet("alternate-background-color: #1e1e2e;")
+        self.market_table.setShowGrid(False)
         for column in range(2, 9):
             hdr.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.market_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
@@ -3830,9 +3841,9 @@ class CS2ManagerApp(QMainWindow):
         outer_layout.addWidget(settings_scroll)
 
         settings_header = QHBoxLayout()
-        settings_title = QLabel("设置")
-        settings_title.setObjectName("titleLabel")
-        settings_header.addWidget(settings_title)
+        settings_header.addWidget(
+            self._page_heading("设置", "本机保存的同步、连接与显示偏好")
+        )
         settings_header.addStretch()
         self.settings_sync_progress_button = self._create_global_sync_button()
         settings_header.addWidget(self.settings_sync_progress_button)
@@ -4344,57 +4355,46 @@ class CS2ManagerApp(QMainWindow):
 
     @staticmethod
     def _order_update_deadline(order) -> datetime:
-        """Return when a still-active order should be refreshed manually."""
+        """Return an explicit platform return deadline, if the page provided one."""
         platform = str(order.get("platform", "") or "")
-        return_deadline = _parse_platform_datetime_utc(
+        return _parse_platform_datetime_utc(
             order.get("return_deadline"), platform
         )
-        if return_deadline > datetime.min:
-            return return_deadline
-        rental_end = CS2ManagerApp._rental_end_datetime(order)
-        if rental_end > datetime.min:
-            return rental_end + RENTAL_RELET_WINDOW
-        return datetime.min
 
     @staticmethod
     def _orders_needing_update(orders, now=None) -> list[dict]:
-        """Find active orders that have exceeded their known return window."""
+        """Find rentals whose explicit return deadline has actually passed."""
         current_time = now or _utc_now()
         stale_orders = []
         for order in orders:
-            if str(order.get("status", "") or "").strip() not in {"租赁中", "待归还"}:
+            if str(order.get("status", "") or "").strip() != "租赁中":
                 continue
             deadline = CS2ManagerApp._order_update_deadline(order)
             if deadline > datetime.min and current_time >= deadline:
                 stale_orders.append(order)
         return stale_orders
 
-    def _update_order_update_status(self, orders=None):
-        """Show a persistent warning only when active-order data is overdue."""
-        label = getattr(self, "order_update_status_label", None)
-        if label is None:
-            return
-        stale_orders = self._orders_needing_update(
-            self.db.get_rental_orders() if orders is None else orders
+    @staticmethod
+    def _order_update_tooltip(order) -> str:
+        deadline = CS2ManagerApp._order_update_deadline(order)
+        if deadline <= datetime.min:
+            return ""
+        return (
+            "该当前订单已超过平台给出的归还截止时间。\n"
+            f"平台：{order.get('platform', '未知')}\n"
+            f"订单号：{order.get('order_no', '未知')}\n"
+            f"归还截止：{deadline.strftime('%Y-%m-%d %H:%M')}\n"
+            "请从订单工具重新复制并导入该平台的最新订单。"
         )
-        if not stale_orders:
-            label.clear()
-            label.setVisible(False)
+
+    def _set_order_update_tooltip(self, pill, order) -> None:
+        if pill is None:
             return
-        label.setText(f"⚠ 需更新订单（{len(stale_orders)} 笔已超归还截止）")
-        details = []
-        for order in stale_orders[:5]:
-            deadline = self._order_update_deadline(order)
-            details.append(
-                f"{order.get('platform', '未知平台')} · {order.get('order_no', '未知订单')}"
-                f" · 截止 {deadline.strftime('%Y-%m-%d %H:%M')}"
-            )
-        remaining = len(stale_orders) - len(details)
-        if remaining:
-            details.append(f"另有 {remaining} 笔订单")
-        label.setToolTip("请从平台订单页复制最新订单并重新导入：\n" + "\n".join(details))
-        label.setStyleSheet("color: #f9e2af; font-weight: 700; padding: 0 8px;")
-        label.setVisible(True)
+        pill.setToolTip(
+            self._order_update_tooltip(order)
+            if self._orders_needing_update([order])
+            else ""
+        )
 
     @staticmethod
     def _returned_datetime(order) -> datetime:
@@ -4535,6 +4535,8 @@ class CS2ManagerApp(QMainWindow):
         rental_label = "已转租" if self._is_relet_order(latest_order, history) else "已出租"
         if _is_non_earning_rental_status(order_status):
             return order_status or fallback_status, None
+        if self._orders_needing_update([latest_order]):
+            return "需更新订单 · 请重新导入", QColor("#f9e2af")
 
         returned_at = self._returned_datetime(latest_order)
         end_time = self._rental_end_datetime(latest_order)
@@ -4576,19 +4578,25 @@ class CS2ManagerApp(QMainWindow):
         """Use status colour on text only, without a filled badge background."""
         tone = color.name().lower() if isinstance(color, QColor) else ""
         if tone == "#f38ba8" or "已到期" in text:
-            foreground = "#f38ba8"
+            foreground = "#fb7185"
         elif tone == "#a6e3a1":
-            foreground = "#a6e3a1"
-        elif tone == "#fab387" or "待转租中" in text or "未导入" in text or "未知" in text:
-            foreground = "#fab387"
+            foreground = "#4ade80"
+        elif (
+            tone == "#fab387"
+            or "待转租中" in text
+            or "未导入" in text
+            or "未知" in text
+            or "需更新订单" in text
+        ):
+            foreground = "#fbbf24"
         elif tone == "#cba6f7" or "CD冷却" in text:
-            foreground = "#cba6f7"
+            foreground = "#a78bfa"
         elif "已转租" in text:
-            foreground = "#cba6f7"
+            foreground = "#a78bfa"
         elif "已出租" in text:
-            foreground = "#89b4fa"
+            foreground = "#60a5fa"
         else:
-            foreground = "#bac2de"
+            foreground = "#cbd5e1"
         return (
             f"background: transparent; color: {foreground}; border: none; "
             "padding: 3px 4px; font-weight: 700;"
@@ -4628,8 +4636,8 @@ class CS2ManagerApp(QMainWindow):
                 status_text, status_color = self._rental_status_display(
                     state["latest_order"], state["history"], state["fallback_status"]
                 )
+                self._set_order_update_tooltip(pill, state["latest_order"])
             self._update_status_pill(pill, status_text, status_color)
-        self._update_order_update_status(self._dashboard_cached_orders or [])
 
     def _dashboard_item_id_at_row(self, row):
         """Read the hidden database ID stored on the visible name cell."""
@@ -5115,6 +5123,9 @@ class CS2ManagerApp(QMainWindow):
                     "history": history,
                     "fallback_status": item.get("status", "在库"),
                 }
+                self._set_order_update_tooltip(
+                    self.table.cellWidget(row, 7), latest_order
+                )
             elif str(item.get("status", "") or "").strip() == "CD冷却":
                 self._dashboard_rental_rows[item["id"]] = {
                     "pill": self.table.cellWidget(row, 7),
@@ -5157,7 +5168,6 @@ class CS2ManagerApp(QMainWindow):
         self.lbl_last_update.setText(f"最后更新：{QTime.currentTime().toString('HH:mm:ss')}")
         if hasattr(self, "title_bar"):
             self.title_bar.set_sync_status("本地数据已同步", "#a6e3a1")
-        self._update_order_update_status(rental_orders)
         self.dashboard_empty_label.setVisible(row == 0)
         self.table.setSortingEnabled(sorting_enabled)
         return
