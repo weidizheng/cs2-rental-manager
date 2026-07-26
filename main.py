@@ -147,7 +147,7 @@ AI_ASSET_IMPORT_PROMPT = """你是 CS2 库存录入助手。请根据我提供�
       "pattern": "图案模板；看不清填 -",
       "float_val": "完整磨损值，例如 0.123456789",
       "cost": 1234.56,
-      "platform": "C5GAME、ECOSteam、悠悠有品、IGXE 或 BUFF",
+      "platform": "C5GAME、ECOSteam、IGXE 或 BUFF",
       "status": "在库 或 CD冷却",
       "cooldown_hours": 0,
       "note": "可选备注"
@@ -245,7 +245,7 @@ class ItemEditDialog(QDialog):
             field.setValidator(validator)
 
         self.platform_box = QComboBox()
-        self.platform_box.addItems(["BUFF", "C5GAME", "ECOSteam", "悠悠有品", "IGXE"])
+        self.platform_box.addItems(["BUFF", "C5GAME", "ECOSteam", "IGXE"])
         self.platform_box.setCurrentText(self.item_data.get("platform", "C5GAME"))
 
         self.status_box = QComboBox()
@@ -471,22 +471,29 @@ class ItemEditDialog(QDialog):
 
 
 class RentalHistoryDialog(QDialog):
-    """Shows all manually imported orders for one physical float value."""
+    """Shows either one asset's orders or the saved, intentionally unlinked orders."""
 
-    def __init__(self, item_name, float_value, orders, parent=None):
+    def __init__(self, item_name, float_value, orders, parent=None, *, unlinked=False):
         super().__init__(parent)
         self.orders = sorted(orders, key=lambda order: _parse_rental_datetime(order.get("start_time")))
-        self.setWindowTitle("出租订单历史")
-        self.resize(920, 430)
+        self.unlinked = unlinked
+        self.setWindowTitle("未关联出租订单" if unlinked else "出租订单历史")
+        self.resize(1160 if unlinked else 920, 460)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(f"{item_name}  ·  磨损 {float_value}"))
+        if unlinked:
+            layout.addWidget(QLabel("这些订单已写入本地，但尚未归属到任何资产；可在详情中核对订单号和磨损。"))
+        else:
+            layout.addWidget(QLabel(f"{item_name}  ·  磨损 {float_value}"))
         layout.addWidget(QLabel("双击订单查看完整日期、收入和同步来源。"))
 
         self.table = QTableWidget()
-        self.table.setColumnCount(9)
-        self.table.setHorizontalHeaderLabels([
-            "平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "C5 转租奖励（已结算成本）", "净收入",
-        ])
+        headers = (
+            ["平台", "订单号", "饰品", "磨损", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "定价方式"]
+            if unlinked else
+            ["平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "C5 转租奖励（已结算成本）", "净收入"]
+        )
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setWordWrap(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -498,15 +505,25 @@ class RentalHistoryDialog(QDialog):
             daily = float(order.get("daily_rent", 0.0) or 0.0)
             if daily <= 0 and rental_days > 0:
                 daily = income / rental_days
-            values = [
-                order.get("platform", ""), order.get("status", ""),
-                order.get("start_time", ""), order.get("return_time", ""),
-                f"{rental_days:g} 天" if rental_days > 0 else "—",
-                _money_text(daily) if daily > 0 else "—",
-                _money_text(income),
-                order.get("transfer_reward_cost_text") or "—",
-                _money_text(order.get("net_income", income) or 0.0),
-            ]
+            if unlinked:
+                values = [
+                    order.get("platform", ""), order.get("order_no", ""),
+                    order.get("item_name", ""), order.get("float_val", ""),
+                    order.get("status", ""), order.get("start_time", ""), order.get("return_time", ""),
+                    f"{rental_days:g} 天" if rental_days > 0 else "—",
+                    _money_text(daily) if daily > 0 else "—",
+                    _money_text(income), order.get("pricing_mode", "") or "—",
+                ]
+            else:
+                values = [
+                    order.get("platform", ""), order.get("status", ""),
+                    order.get("start_time", ""), order.get("return_time", ""),
+                    f"{rental_days:g} 天" if rental_days > 0 else "—",
+                    _money_text(daily) if daily > 0 else "—",
+                    _money_text(income),
+                    order.get("transfer_reward_cost_text") or "—",
+                    _money_text(order.get("net_income", income) or 0.0),
+                ]
             for column, value in enumerate(values):
                 self.table.setItem(index, column, QTableWidgetItem(str(value)))
         self.table.doubleClicked.connect(self._show_order_detail)
@@ -724,7 +741,7 @@ class RentalImportPreviewDialog(QDialog):
         asset = asset_by_label.get(selected)
         if asset is None:
             order.pop("item_id", None)
-            order["match_method"] = "unmatched"
+            order["match_method"] = "user_unlinked"
             order["match_confidence"] = 0.0
         else:
             order["item_id"] = int(asset["id"])
@@ -1765,6 +1782,11 @@ class CS2ManagerApp(QMainWindow):
         self._set_button_icon(history_btn, "history")
         history_btn.clicked.connect(self.show_selected_rental_history)
 
+        unlinked_history_btn = QPushButton("未关联订单")
+        self._set_button_icon(unlinked_history_btn, "history")
+        unlinked_history_btn.setToolTip("查看选择“暂不关联”后仍已成功保存的出租订单")
+        unlinked_history_btn.clicked.connect(self.show_unlinked_rental_orders)
+
         del_btn = QPushButton("删除")
         del_btn.setObjectName("dangerBtn")
         self._set_button_icon(del_btn, "delete", "#11111b")
@@ -1791,7 +1813,7 @@ class CS2ManagerApp(QMainWindow):
         self.status_filter_box.setToolTip("资产生命周期分类；在资产总览页可按 A / D 循环切换")
 
         self.filter_box = QComboBox()
-        self.filter_box.addItems(["全部平台", "C5GAME", "ECOSteam", "悠悠有品", "IGXE", "BUFF"])
+        self.filter_box.addItems(["全部平台", "C5GAME", "ECOSteam", "IGXE", "BUFF"])
         self.filter_box.currentTextChanged.connect(self._queue_dashboard_filter_render)
         self.filter_box.setFixedWidth(120)
 
@@ -1799,6 +1821,7 @@ class CS2ManagerApp(QMainWindow):
         toolbar.addWidget(ai_asset_import_btn)
         toolbar.addWidget(edit_btn)
         toolbar.addWidget(history_btn)
+        toolbar.addWidget(unlinked_history_btn)
         toolbar.addWidget(del_btn)
         toolbar.addWidget(refresh_btn)
         toolbar.addWidget(self.dashboard_search)
@@ -2001,10 +2024,18 @@ class CS2ManagerApp(QMainWindow):
             return
         self.db.upsert_rental_orders(platform, orders)
         self.load_data()
+        unlinked_count = sum(
+            1 for order in orders
+            if str(order.get("match_method") or "") == "user_unlinked"
+        )
+        unlinked_hint = (
+            f"\n其中 {unlinked_count} 条选择了暂不关联，可在“未关联订单”查看。"
+            if unlinked_count else ""
+        )
         QMessageBox.information(
             self,
             "剪贴板导入完成",
-            f"已导入 {len(orders)} 条 {platform} 订单。\n重复订单会按订单号更新，不会重复累计收益。",
+            f"已导入 {len(orders)} 条 {platform} 订单。\n重复订单会按订单号更新，不会重复累计收益。{unlinked_hint}",
         )
 
     def init_market_tab(self):
@@ -4897,6 +4928,17 @@ class CS2ManagerApp(QMainWindow):
             display_history.append(display_order)
         RentalHistoryDialog(item["name"], item.get("float_val", ""), display_history, self).exec()
 
+    def show_unlinked_rental_orders(self):
+        """Expose saved orders that deliberately have no asset association."""
+        orders = [
+            order for order in self.db.get_rental_orders()
+            if order.get("item_id") in (None, "")
+        ]
+        if not orders:
+            QMessageBox.information(self, "未关联订单", "目前没有未关联的出租订单。")
+            return
+        RentalHistoryDialog("", "", orders, self, unlinked=True).exec()
+
     def _queue_dashboard_filter_render(self, *_):
         """Coalesce quick filter changes and render from the current local snapshot."""
         self._dashboard_filter_timer.start()
@@ -5292,13 +5334,12 @@ class CS2ManagerApp(QMainWindow):
         platform_aliases = {
             "C5": "C5GAME", "C5GAME": "C5GAME",
             "ECO": "ECOSteam", "ECOSTEAM": "ECOSteam",
-            "悠悠": "悠悠有品", "悠悠有品": "悠悠有品",
             "IGXE": "IGXE", "BUFF": "BUFF",
         }
         platform_raw = str(raw_item.get("platform") or "C5GAME").strip()
         platform = platform_aliases.get(platform_raw.upper(), platform_aliases.get(platform_raw))
         if not platform:
-            return None, "平台必须是 C5GAME、ECOSteam、悠悠有品、IGXE 或 BUFF"
+            return None, "平台必须是 C5GAME、ECOSteam、IGXE 或 BUFF"
 
         status = str(raw_item.get("status") or "在库").strip()
         if status not in {"在库", "CD冷却"}:

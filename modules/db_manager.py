@@ -623,10 +623,13 @@ class DBManager:
                     transfer_reward_known=MAX(rental_orders.transfer_reward_known, excluded.transfer_reward_known),
                     pricing_mode=CASE WHEN excluded.pricing_mode!=''
                         THEN excluded.pricing_mode ELSE rental_orders.pricing_mode END,
-                    item_id=COALESCE(excluded.item_id, rental_orders.item_id),
+                    item_id=CASE WHEN excluded.match_method='user_unlinked'
+                        THEN NULL ELSE COALESCE(excluded.item_id, rental_orders.item_id) END,
                     match_method=CASE WHEN excluded.item_id IS NOT NULL
+                        OR excluded.match_method='user_unlinked'
                         THEN excluded.match_method ELSE rental_orders.match_method END,
                     match_confidence=CASE WHEN excluded.item_id IS NOT NULL
+                        OR excluded.match_method='user_unlinked'
                         THEN excluded.match_confidence ELSE rental_orders.match_confidence END,
                     synced_at=excluded.synced_at
                 WHERE excluded.synced_at >= rental_orders.synced_at

@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 CANONICAL_FLOAT_DECIMAL_PLACES = 8
 
 
@@ -303,6 +303,21 @@ def _migration_8(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migration_9(conn: sqlite3.Connection) -> None:
+    """Retire the no-longer-used Youyou asset platform without touching orders."""
+    tables = {
+        str(row[0]) for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+    if "items" not in tables or "platform" not in _columns(conn, "items"):
+        return
+    # Platform is the asset acquisition/source category.  Cooldown remains an
+    # item status, so an old 悠悠有品 asset becomes an unclassified inventory/CD
+    # item rather than being mislabelled as a different marketplace.
+    conn.execute("UPDATE items SET platform='' WHERE platform='悠悠有品'")
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
@@ -312,6 +327,7 @@ MIGRATIONS = {
     6: _migration_6,
     7: _migration_7,
     8: _migration_8,
+    9: _migration_9,
 }
 
 

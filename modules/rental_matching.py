@@ -125,6 +125,10 @@ def match_order_to_items(
     on another, while its float remains the stable cross-platform identity.
     """
     inventory = list(items)
+    # "暂不关联" is an intentional user decision, not an invitation to run the
+    # automatic float matcher again while persisting the import.
+    if str(order.get("match_method") or "") == "user_unlinked":
+        return {"item_id": None, "method": "user_unlinked", "confidence": 0.0}
     explicit_id = order.get("item_id")
     if explicit_id not in (None, ""):
         try:

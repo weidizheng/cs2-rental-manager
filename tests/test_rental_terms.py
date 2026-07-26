@@ -4,6 +4,7 @@ import tempfile
 import unittest
 
 from modules.db_manager import DBManager
+from modules.db_migrations import _migration_9
 from modules.c5_rental_browser import parse_c5_rent_text
 from modules.rental_order_parsers import (
     detect_clipboard_platform,
@@ -250,6 +251,47 @@ P1
         self.assertEqual(orders[0]["rental_days"], 8.0)
         self.assertEqual(orders[0]["income"], 20.96)
 
+    def test_igxe_pasted_doppler_order_keeps_the_source_fields(self):
+        text = """订单类型：
+出租
+创建时间：
+2026-07-25 17:00:25
+转租折扣：
+9折
+租赁价格：
+**￥2.78/天** **连续出租**
+饰品押金：
+**￥** **3192.00**
+出租天数：
+**8天**
+（最长60天）
+租赁到期时间：
+2026-08-02 17:01:14
+归还截止时间：
+2026-08-03 05:01:14
+商品信息连续出租跟踪
+
+[折叠刀（★） | 多普勒 (崭新出厂)](https://www.igxe.cn/lease/trade/730/7851705?$referrer=x)
+磨损 0.0236933026
+
+P3
+数量
+*x1*
+租赁租金
+*￥2.78/天*
+操作
+-
+"""
+        orders = parse_igxe_clipboard(text)
+        self.assertEqual(len(orders), 1)
+        order = orders[0]
+        self.assertEqual(order["order_no"], "IGXE-7851705")
+        self.assertEqual(order["item_name"], "折叠刀（★） | 多普勒 (崭新出厂)")
+        self.assertEqual(order["float_val"], "0.0236933026")
+        self.assertEqual(order["daily_rent"], 2.78)
+        self.assertEqual(order["income"], 22.24)
+        self.assertEqual(order["rental_days"], 8.0)
+
 
 class RentalTermStorageTests(unittest.TestCase):
     def setUp(self):
@@ -304,6 +346,42 @@ class RentalTermStorageTests(unittest.TestCase):
         self.assertEqual(
             self.db.get_rental_orders()[0]["pricing_mode"], "manual"
         )
+
+    def test_user_unlinked_order_is_saved_and_stays_unlinked_on_reimport(self):
+        order = {
+            "order_no": "IGXE-7851705",
+            "item_name": "折叠刀（★） | 多普勒 (崭新出厂)",
+            "float_val": "0.0236933026",
+            "daily_rent": 2.78,
+            "rental_days": 8,
+            "income": 22.24,
+            "match_method": "user_unlinked",
+            "match_confidence": 0.0,
+        }
+        self.db.upsert_rental_orders("IGXE", [order])
+        stored = self.db.get_rental_orders()[0]
+        self.assertIsNone(stored["item_id"])
+        self.assertEqual(stored["match_method"], "user_unlinked")
+        self.assertEqual(stored["float_val"], "0.02369330")
+
+        self.db.upsert_rental_orders("IGXE", [order])
+        stored = self.db.get_rental_orders()[0]
+        self.assertIsNone(stored["item_id"])
+        self.assertEqual(stored["match_method"], "user_unlinked")
+
+    def test_youyou_asset_platform_migration_clears_only_the_asset_category(self):
+        connection = self.db.get_connection()
+        self.db.add_item({
+            "name": "测试饰品", "market_hash_name": "Test | Item (Factory New)",
+            "float_val": "0.12345678", "platform": "C5GAME", "status": "CD冷却",
+        })
+        connection.execute("UPDATE items SET platform='悠悠有品' WHERE name='测试饰品'")
+        _migration_9(connection)
+        connection.commit()
+        row = connection.execute(
+            "SELECT platform, status FROM items WHERE name='测试饰品'"
+        ).fetchone()
+        self.assertEqual(row, ("", "CD冷却"))
 
     def test_read_classifies_a_legacy_blank_value(self):
         connection = self.db.get_connection()
