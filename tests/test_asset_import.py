@@ -10,6 +10,7 @@ CHINESE_NAME = "折叠刀（★） | 多普勒 (崭新出厂)"
 STANDARD_MHN = "★ Flip Knife | Doppler (Factory New)"
 SHORT_FLOAT = "0.02071962"
 FULL_FLOAT = "0.0207196157425642"
+CANONICAL_FLOAT = "0.02071962"
 
 
 def asset_record(
@@ -163,7 +164,7 @@ class AssetImportApplicationTests(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["id"], old_item["id"])
         self.assertEqual(items[0]["asset_id"], "stable-old-asset")
-        self.assertEqual(items[0]["float_val"], FULL_FLOAT)
+        self.assertEqual(items[0]["float_val"], CANONICAL_FLOAT)
         self.assertEqual(items[0]["market_hash_name"], STANDARD_MHN)
 
         orders = self.db.get_rental_orders("C5GAME")
@@ -189,7 +190,7 @@ class AssetImportApplicationTests(unittest.TestCase):
             [(item["id"], item["asset_id"], item["float_val"]) for item in before],
         )
 
-    def test_batch_duplicates_are_written_once_with_full_precision(self):
+    def test_batch_duplicates_are_written_once_with_canonical_precision(self):
         decisions = plan_asset_import(
             [],
             [asset_record(SHORT_FLOAT), asset_record(FULL_FLOAT)],
@@ -201,7 +202,7 @@ class AssetImportApplicationTests(unittest.TestCase):
         self.assertEqual(report["skipped"], 1)
         items = self.db.get_all_items()
         self.assertEqual(len(items), 1)
-        self.assertEqual(items[0]["float_val"], FULL_FLOAT)
+        self.assertEqual(items[0]["float_val"], CANONICAL_FLOAT)
 
 
 if __name__ == "__main__":

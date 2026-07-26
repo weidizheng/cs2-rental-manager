@@ -1,3 +1,3 @@
 """Single application version source for UI, docs and packaging."""
 
-__version__ = "3.1.2"
+__version__ = "3.1.3"

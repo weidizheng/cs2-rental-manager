@@ -5,6 +5,7 @@ from modules.rental_matching import (
     float_match_precision,
     float_precision,
     match_order_to_items,
+    normalise_float_value,
     rental_float_matches,
 )
 
@@ -73,6 +74,11 @@ class RentalFloatMatchingTests(unittest.TestCase):
         )
         self.assertEqual(result["item_id"], 18)
         self.assertEqual(result["method"], "fuzzy_float")
+
+    def test_normalises_platform_float_values_to_eight_half_up_decimals(self):
+        self.assertEqual(normalise_float_value("0.0207196157425642"), "0.02071962")
+        self.assertEqual(normalise_float_value("0.3505181372"), "0.35051814")
+        self.assertEqual(normalise_float_value("0.350518137216568"), "0.35051814")
 
 
 if __name__ == "__main__":

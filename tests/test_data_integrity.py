@@ -102,8 +102,54 @@ class DataIntegrityTests(unittest.TestCase):
             "SELECT cooldown_until FROM items"
         ).fetchone()[0]
         connection.close()
-        self.assertEqual(version, 7)
+        self.assertEqual(version, CURRENT_SCHEMA_VERSION)
         self.assertTrue(deadline)
+
+    def test_float_migration_rounds_and_merges_duplicate_assets_into_c5(self):
+        legacy_path = Path(self.temp.name) / "legacy-float-v7.db"
+        connection = sqlite3.connect(legacy_path)
+        connection.execute(
+            """CREATE TABLE items (
+                id INTEGER PRIMARY KEY,
+                name TEXT, market_hash_name TEXT, float_val TEXT,
+                platform TEXT, note TEXT DEFAULT '', asset_id TEXT,
+                deleted_at TEXT DEFAULT ''
+            )"""
+        )
+        connection.execute(
+            """CREATE TABLE rental_orders (
+                id INTEGER PRIMARY KEY, float_val TEXT, item_id INTEGER,
+                match_method TEXT DEFAULT '', match_confidence REAL DEFAULT 0
+            )"""
+        )
+        connection.execute(
+            """INSERT INTO items VALUES
+               (3, '★ 折叠刀 | 多普勒 (崭新出厂)', '', '0.02071962', 'C5GAME', '', 'c5-asset', ''),
+               (14, '折叠刀（★） | 多普勒 (崭新出厂)', '', '0.0207196157425642', '悠悠有品', '', 'uup-asset', '')"""
+        )
+        connection.execute(
+            "INSERT INTO rental_orders VALUES (1, '0.0207196157425642', 14, '', 0)"
+        )
+        connection.execute("PRAGMA user_version=7")
+        connection.commit()
+
+        run_migrations(connection)
+        active = connection.execute(
+            "SELECT id, float_val, asset_id, note FROM items WHERE deleted_at=''"
+        ).fetchall()
+        archived = connection.execute(
+            "SELECT deleted_at FROM items WHERE id=14"
+        ).fetchone()[0]
+        order = connection.execute(
+            "SELECT float_val, item_id, match_method FROM rental_orders"
+        ).fetchone()
+        connection.close()
+
+        self.assertEqual(len(active), 1)
+        self.assertEqual(active[0][:3], (3, "0.02071962", "c5-asset"))
+        self.assertIn("悠悠有品", active[0][3])
+        self.assertTrue(archived)
+        self.assertEqual(order, ("0.02071962", 3, "precision_merge"))
 
     def test_blank_asset_ids_are_generated_and_preserved(self):
         self.db.add_item(self.item("A", "0.111"))

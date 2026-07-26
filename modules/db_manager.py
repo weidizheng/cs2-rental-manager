@@ -6,12 +6,13 @@ import sqlite3
 import threading
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from modules.atomic_io import atomic_write_json
-from modules.db_migrations import run_migrations
+from modules.db_migrations import CURRENT_SCHEMA_VERSION, run_migrations
 from modules.domain_models import cents_to_money, money_to_cents
 from modules.paths import get_private_data_dir
-from modules.rental_matching import match_order_to_items
+from modules.rental_matching import match_order_to_items, normalise_float_value
 from modules.rental_terms import classify_rental_term
 from modules.secret_store import protect_secret, unprotect_secret
 
@@ -229,6 +230,7 @@ class DBManager:
         )
         """)
 
+        self._backup_before_float_normalisation(conn)
         schema_version = run_migrations(conn)
         logger.info("SQLite schema version: %s", schema_version)
 
@@ -283,6 +285,29 @@ class DBManager:
         conn.commit()
         if credentials_upgraded:
             self.save_all_configs_to_json()
+
+    def _backup_before_float_normalisation(self, conn):
+        """Make a recoverable SQLite copy before the one-time precision migration."""
+        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version >= CURRENT_SCHEMA_VERSION:
+            return
+        item_count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+        order_count = conn.execute("SELECT COUNT(*) FROM rental_orders").fetchone()[0]
+        if not item_count and not order_count:
+            return
+        backup_path = Path(self.db_path).with_name(
+            f"{Path(self.db_path).stem}.pre-float-normalization-"
+            f"{datetime.now().strftime('%Y%m%d-%H%M%S')}.bak"
+        )
+        # ``init_db`` may have just inserted default configuration rows. SQLite
+        # backup blocks while the source connection owns that write transaction,
+        # so checkpoint those harmless initial writes before opening the backup.
+        conn.commit()
+        destination = sqlite3.connect(backup_path)
+        try:
+            conn.backup(destination)
+        finally:
+            destination.close()
 
     def load_configs_from_json(self):
         """读取 configs.json 备份文件"""
@@ -372,7 +397,7 @@ class DBManager:
                         item.get("market_hash_name", ""),
                         item.get("phase", "-"),
                         item.get("pattern", "-"),
-                        item.get("float_val", "0.000"),
+                        normalise_float_value(item.get("float_val", "0.000")),
                         item.get("cost", 0.0),
                         money_to_cents(item.get("cost", 0.0)),
                         item.get("platform", "BUFF"),
@@ -463,7 +488,7 @@ class DBManager:
                     item.get("market_hash_name", ""),
                     item.get("phase", "-"),
                     item.get("pattern", "-"),
-                    item.get("float_val", "0.000"),
+                    normalise_float_value(item.get("float_val", "0.000")),
                     item.get("cost", 0.0),
                     money_to_cents(item.get("cost", 0.0)),
                     item.get("platform", "BUFF"),
@@ -500,7 +525,7 @@ class DBManager:
                     item.get("market_hash_name", ""),
                     item.get("phase"),
                     item.get("pattern"),
-                    item.get("float_val"),
+                    normalise_float_value(item.get("float_val")),
                     item.get("cost"),
                     money_to_cents(item.get("cost", 0.0)),
                     item.get("platform"),
@@ -547,6 +572,8 @@ class DBManager:
             conn = self.get_connection()
             cursor = conn.cursor()
             for order in orders:
+                order = dict(order)
+                order["float_val"] = normalise_float_value(order.get("float_val", ""))
                 order_no = str(order.get("order_no", "")).strip()
                 if not order_no:
                     continue

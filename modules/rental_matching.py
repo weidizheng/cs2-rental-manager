@@ -7,6 +7,29 @@ from typing import Any, Iterable
 
 
 MIN_FLOAT_MATCH_DECIMAL_PLACES = 6
+CANONICAL_FLOAT_DECIMAL_PLACES = 8
+
+
+def normalise_float_value(
+    value: Any,
+    *,
+    decimal_places: int = CANONICAL_FLOAT_DECIMAL_PLACES,
+) -> str:
+    """Return the stable stored float format, using decimal half-up rounding.
+
+    Platform pages report different source precisions.  All persisted values
+    use the same eight decimal places while malformed values remain unchanged
+    so a user never loses an unparseable source value silently.
+    """
+    try:
+        number = Decimal(str(value).strip())
+        if not number.is_finite():
+            return str(value or "").strip()
+        precision = max(0, int(decimal_places))
+        quantum = Decimal(1).scaleb(-precision)
+        return format(number.quantize(quantum, rounding=ROUND_HALF_UP), f".{precision}f")
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value or "").strip()
 
 
 def _decimal_with_precision(value: Any) -> tuple[Decimal, int] | None:
