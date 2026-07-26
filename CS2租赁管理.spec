@@ -1,5 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+
 
 a = Analysis(
     ['main.py'],
@@ -22,7 +24,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='CS2租赁管理',
+    name=os.environ.get('CS2_RENTAL_EXE_NAME', 'CS2租赁管理'),
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

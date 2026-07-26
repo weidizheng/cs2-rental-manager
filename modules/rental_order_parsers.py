@@ -213,6 +213,7 @@ def parse_igxe_clipboard(text: str) -> list[dict[str, Any]]:
             if "http" in item_name.lower():
                 item_name = ""
         float_val = _first(r"磨损\s*([0-9.]+)", block)
+        phase = _first(r"(?mi)^\s*(P[1-4]|Ruby|Sapphire|Emerald|Black Pearl)\s*$", block)
         daily_rent = _float(_first(r"租赁价格[\s\S]{0,80}?￥\s*([0-9.]+)\s*/\s*天", block))
         # IGXE copied text often preserves Markdown emphasis, for example
         # ``**8天**`` and ``**￥** **3288.48**``.
@@ -237,6 +238,7 @@ def parse_igxe_clipboard(text: str) -> list[dict[str, Any]]:
         orders.append({
             "order_no": f"IGXE-{trade_id}",
             "item_name": item_name,
+            "phase": phase or "-",
             "float_val": float_val,
             "daily_rent": daily_rent,
             "rental_days": rental_days,

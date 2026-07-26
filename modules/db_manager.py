@@ -504,8 +504,10 @@ class DBManager:
                     item.get("asset_id") or uuid.uuid4().hex,
                 ),
             )
+            item_id = int(cursor.lastrowid)
             conn.commit()
         self.export_items_to_json()
+        return item_id
 
     def update_item(self, item_id, item):
         with self._db_lock:

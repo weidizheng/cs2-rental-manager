@@ -288,6 +288,7 @@ P3
         self.assertEqual(order["order_no"], "IGXE-7851705")
         self.assertEqual(order["item_name"], "折叠刀（★） | 多普勒 (崭新出厂)")
         self.assertEqual(order["float_val"], "0.0236933026")
+        self.assertEqual(order["phase"], "P3")
         self.assertEqual(order["daily_rent"], 2.78)
         self.assertEqual(order["income"], 22.24)
         self.assertEqual(order["rental_days"], 8.0)
@@ -368,6 +369,26 @@ class RentalTermStorageTests(unittest.TestCase):
         stored = self.db.get_rental_orders()[0]
         self.assertIsNone(stored["item_id"])
         self.assertEqual(stored["match_method"], "user_unlinked")
+
+    def test_newly_created_asset_can_be_bound_to_the_imported_order(self):
+        item_id = self.db.add_item({
+            "name": "折叠刀（★） | 多普勒 (崭新出厂)",
+            "market_hash_name": "★ Flip Knife | Doppler (Factory New)",
+            "float_val": "0.02369330",
+            "platform": "IGXE",
+            "status": "已出租",
+            "cost": 0,
+        })
+        self.assertIsInstance(item_id, int)
+        self.db.upsert_rental_orders("IGXE", [{
+            "order_no": "IGXE-created-asset", "float_val": "0.0236933026",
+            "item_id": item_id, "match_method": "created_from_order",
+            "match_confidence": 1.0,
+        }])
+        stored = self.db.get_rental_orders()[0]
+        self.assertEqual(stored["item_id"], item_id)
+        self.assertEqual(stored["match_method"], "created_from_order")
+        self.assertEqual(stored["float_val"], "0.02369330")
 
     def test_youyou_asset_platform_migration_clears_only_the_asset_category(self):
         connection = self.db.get_connection()

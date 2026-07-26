@@ -470,13 +470,44 @@ class ItemEditDialog(QDialog):
         return self._validated_data()
 
 
+def _new_asset_draft_from_rental_order(order):
+    """Build a user-editable asset draft from an order without inventing cost."""
+    status = "已出租" if str(order.get("status") or "").strip() == "租赁中" else "在库"
+    platform = str(order.get("platform") or "C5GAME").strip()
+    if platform not in {"BUFF", "C5GAME", "ECOSteam", "IGXE"}:
+        platform = "C5GAME"
+    phase = str(order.get("phase") or "-").strip()
+    if phase not in {"-", "P1", "P2", "P3", "P4", "Ruby", "Sapphire", "Emerald", "Black Pearl"}:
+        phase = "-"
+    return {
+        "name": str(order.get("item_name") or "").strip(),
+        "market_hash_name": "",
+        "phase": phase,
+        "pattern": "-",
+        "float_val": str(order.get("float_val") or "").strip(),
+        "cost": 0.0,
+        "platform": platform,
+        "status": status,
+        "rent": float(order.get("daily_rent", 0.0) or 0.0),
+        "days": 0,
+        "income": 0.0,
+        "expire_hours": 999.0,
+        "note": (
+            f"由 {platform} 出租订单 {order.get('order_no', '')} 新建；"
+            "买入成本与买入平台请按实际情况确认。"
+        ),
+    }
+
+
 class RentalHistoryDialog(QDialog):
     """Shows either one asset's orders or the saved, intentionally unlinked orders."""
 
-    def __init__(self, item_name, float_value, orders, parent=None, *, unlinked=False):
+    def __init__(self, item_name, float_value, orders, parent=None, *, unlinked=False,
+                 on_create_asset=None):
         super().__init__(parent)
         self.orders = sorted(orders, key=lambda order: _parse_rental_datetime(order.get("start_time")))
         self.unlinked = unlinked
+        self._on_create_asset = on_create_asset
         self.setWindowTitle("未关联出租订单" if unlinked else "出租订单历史")
         self.resize(1160 if unlinked else 920, 460)
         layout = QVBoxLayout(self)
@@ -529,9 +560,25 @@ class RentalHistoryDialog(QDialog):
         self.table.doubleClicked.connect(self._show_order_detail)
         layout.addWidget(self.table)
 
+        buttons = QHBoxLayout()
+        if self.unlinked and self._on_create_asset is not None:
+            create_button = QPushButton("为选中订单新建资产")
+            create_button.setObjectName("primaryBtn")
+            create_button.clicked.connect(self._create_asset_for_selected_order)
+            buttons.addWidget(create_button)
+        buttons.addStretch()
         close_button = QPushButton("关闭")
         close_button.clicked.connect(self.accept)
-        layout.addWidget(close_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+    def _create_asset_for_selected_order(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.orders):
+            QMessageBox.information(self, "新建资产", "请先选择一条未关联订单。")
+            return
+        if self._on_create_asset(self.orders[row]):
+            self.accept()
 
     def _show_order_detail(self, index):
         if not index.isValid() or index.row() >= len(self.orders):
@@ -717,7 +764,11 @@ class RentalImportPreviewDialog(QDialog):
         return False
 
     def _ask_asset_association(self, order):
-        labels = ["暂不关联（仍导入此订单）"]
+        if order.get("_new_asset_draft"):
+            return True
+        create_label = "新建资产并关联（补充成本后保存）"
+        unlinked_label = "暂不关联（仍导入此订单）"
+        labels = [create_label, unlinked_label]
         asset_by_label = {}
         for asset in self.items:
             label = (
@@ -731,13 +782,24 @@ class RentalImportPreviewDialog(QDialog):
         picker.setWindowTitle("选择关联资产")
         picker.setLabelText(
             f"订单 {order.get('order_no', '（未识别订单号）')} 无法唯一自动关联。\n"
-            "请选择资产，或选择“暂不关联”继续导入。"
+            "请选择已有资产；也可新建资产并补充成本，或暂不关联继续导入。"
         )
         picker.setComboBoxItems(labels)
         picker.resize(680, 260)
         if picker.exec() != QDialog.Accepted:
             return False
         selected = picker.textValue()
+        if selected == create_label:
+            editor = ItemEditDialog(_new_asset_draft_from_rental_order(order), self)
+            editor.resize(560, 620)
+            editor._auto_build_mhn()
+            if editor.exec() != QDialog.Accepted:
+                return False
+            order["_new_asset_draft"] = editor.get_data()
+            order["match_method"] = "created_from_order"
+            order["match_confidence"] = 1.0
+            return True
+
         asset = asset_by_label.get(selected)
         if asset is None:
             order.pop("item_id", None)
@@ -2022,6 +2084,15 @@ class CS2ManagerApp(QMainWindow):
         )
         if preview.exec() != QDialog.Accepted:
             return
+        created_count = 0
+        for order in orders:
+            draft = order.pop("_new_asset_draft", None)
+            if draft is None:
+                continue
+            order["item_id"] = self.db.add_item(draft)
+            order["match_method"] = "created_from_order"
+            order["match_confidence"] = 1.0
+            created_count += 1
         self.db.upsert_rental_orders(platform, orders)
         self.load_data()
         unlinked_count = sum(
@@ -2032,10 +2103,11 @@ class CS2ManagerApp(QMainWindow):
             f"\n其中 {unlinked_count} 条选择了暂不关联，可在“未关联订单”查看。"
             if unlinked_count else ""
         )
+        created_hint = f"\n已按订单新建并关联 {created_count} 件资产。" if created_count else ""
         QMessageBox.information(
             self,
             "剪贴板导入完成",
-            f"已导入 {len(orders)} 条 {platform} 订单。\n重复订单会按订单号更新，不会重复累计收益。{unlinked_hint}",
+            f"已导入 {len(orders)} 条 {platform} 订单。\n重复订单会按订单号更新，不会重复累计收益。{created_hint}{unlinked_hint}",
         )
 
     def init_market_tab(self):
@@ -4937,7 +5009,23 @@ class CS2ManagerApp(QMainWindow):
         if not orders:
             QMessageBox.information(self, "未关联订单", "目前没有未关联的出租订单。")
             return
-        RentalHistoryDialog("", "", orders, self, unlinked=True).exec()
+        RentalHistoryDialog(
+            "", "", orders, self, unlinked=True,
+            on_create_asset=self._create_asset_from_unlinked_order,
+        ).exec()
+
+    def _create_asset_from_unlinked_order(self, order):
+        """Let a saved order become an asset after the user supplies ownership data."""
+        editor = ItemEditDialog(_new_asset_draft_from_rental_order(order), self)
+        editor.resize(560, 620)
+        editor._auto_build_mhn()
+        if editor.exec() != QDialog.Accepted:
+            return False
+        item_id = self.db.add_item(editor.get_data())
+        self.db.associate_rental_order(order["platform"], order["order_no"], item_id)
+        self.load_data()
+        self._show_toast("已新建资产并关联该出租订单")
+        return True
 
     def _queue_dashboard_filter_render(self, *_):
         """Coalesce quick filter changes and render from the current local snapshot."""
