@@ -4,6 +4,7 @@ from modules.rental_matching import (
     MIN_FLOAT_MATCH_DECIMAL_PLACES,
     float_match_precision,
     float_precision,
+    match_order_to_items,
     rental_float_matches,
 )
 
@@ -54,6 +55,16 @@ class RentalFloatMatchingTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertEqual(float_precision(value), -1)
                 self.assertIsNone(float_match_precision(value, "0.123456"))
+
+    def test_reuses_a_cross_platform_asset_history_link(self):
+        result = match_order_to_items(
+            {"float_val": "0.3505181372", "item_name": "专业手套（★） | 狂澜 (久经沙场)"},
+            [{"id": 17, "name": "专业手套（★） | 狂澜 (久经沙场)", "float_val": "0.111111"}],
+            [{"platform": "购买平台", "float_val": "0.3505181372", "item_id": 42}],
+        )
+        self.assertEqual(result["item_id"], 42)
+        self.assertEqual(result["method"], "history_float")
+        self.assertEqual(result["confidence"], 0.95)
 
 
 if __name__ == "__main__":

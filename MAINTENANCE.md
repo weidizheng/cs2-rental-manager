@@ -69,8 +69,8 @@ git push origin main
 | `market_cache.json` | 旧版行情数据迁移输入；新版只在 SQLite 尚无对应报价时读取，不再写入 | 无需复制 |
 | `eco_market_cache.db` | ECO 全量行情快照（约 4 万条） | 建议复制，可省去首次重新下载 |
 | `exchange_rate_cache.json` | CSFloat/ECB 汇率、来源与失败冷却时间 | 建议复制，也可自动重建 |
-| `schema-source/` | ByMykel 英文/中文原始饰品数据 | 是 |
-| `cs2_items_schema.json` | 从上述两个源文件生成的本地索引 | 可复制，也可自动重建 |
+| `assets/schema-source/` | 程序内置的 ByMykel 英文/中文原始饰品数据 | 随程序发布 |
+| `cs2_items_schema.json` | 从内置源文件生成的私有索引 | 可复制，也可自动重建 |
 | `images/` | 饰品图片缓存 | 可选 |
 | `browser-profiles/c5game/` | 历史隔离 C5 读取器的登录状态 | 可选，当前界面不使用 |
 | `logs/` | 轮转日志 `app.log` | 可选，排障时有用 |
@@ -86,7 +86,7 @@ git push origin main
 | --- | ---: | --- | --- | --- |
 | `private-data/app.db`、`items.json`、`configs.json` | 小 | 业务真源/恢复备份 | 否 | 先做加密同步包或离线备份；`configs.json` 的 DPAPI 凭据只可由原 Windows 用户读取。 |
 | `private-data/app.db-wal`、`app.db-shm` | 小、波动 | SQLite 运行时 | 不手动清理 | 软件运行时不得移动或删除；正常关闭数据库后由 SQLite 自行检查点/收敛。 |
-| `private-data/schema-source/` | 约 70MB | 本地映射的原始中英文源数据 | 当前不可 | 当前 `CS2ItemSchema` 需要两份源 JSON 校验并构建索引；源文件缺失时名称映射为空。未来应改为只发布紧凑索引或可选源数据更新包。 |
+| `assets/schema-source/` | 约 70MB | 程序内置的原始中英文映射资源 | 当前不可 | `CS2ItemSchema` 需要两份源 JSON 校验并构建私有索引；资源随 EXE 打包，不会进入 `private-data/` 或云盘同步包。 |
 | `private-data/cs2_items_schema.json` | 约 34MB | 由原始源数据生成的索引 | 当前不可单独清理 | 与源数据共同构成本地离线搜索；删除后会在下次启动重建。 |
 | `private-data/browser-profiles/c5game/` | 约 28MB | 旧隔离浏览器 Profile，可能含登录态 | 是，确认后 | 当前界面不使用它；先移至项目外的加密归档，确认不需要旧 C5 登录档案后再删除，绝不可提交或上传。 |
 | `private-data/images/` | 约 5.4MB | 可下载缩略图缓存 | 是 | 程序自动限制为 250MB 或 2,000 张；手动清理只会导致后续重新下载。 |
@@ -98,7 +98,7 @@ git push origin main
 | `release/` | 约 97MB | 发布候选 EXE | 是，需选择 | 只保留一个已验证的正式 `CS2租赁管理.exe`；带“界面优化版”后缀的候选包确认后应归档到项目外或删除，避免双份约 51MB EXE 常驻。 |
 | `__pycache__/`、`.ruff_cache/`、`.coverage`、`.idea/` | 当前小于 1MB | 开发缓存/IDE 元数据 | 是 | 均已被 Git 忽略，删除不影响正式 EXE；体积很小，不是优先项。 |
 
-发布一个可独立使用的目录时，不能只复制 EXE：当前实现还需要相邻项目根目录的 `private-data/schema-source/` 两份原始映射文件（或未来改造后的等价紧凑资源）。`modules/paths.py` 会让 `release/` 下的 EXE 回到其父目录寻找 `private-data/`；复制整个项目时要保持这一相对关系，或通过 `CS2_RENTAL_DATA_DIR` 指向私密数据目录。
+发布包会把 `assets/schema-source/` 的两份映射文件内置到 EXE；`private-data/` 只保留用户数据和可重建索引。`modules/paths.py` 会让 `release/` 下的 EXE 回到其父目录寻找私密数据；复制整个项目时要保持这一相对关系，或通过 `CS2_RENTAL_DATA_DIR` 指向私密数据目录。
 
 ### 3.2 源码、测试与文档的目录定位
 
@@ -188,7 +188,7 @@ Google Drive 手动同步只导出 `rental_orders`、行情观察分类/观察�
 | ECO | `订单编号` 加 ECO 商品链接、`前归还` 或 `ECO_` | 订单号、磨损、原始日租、长/短租天数、押金、状态；页面时间按北京时间解释，优先用“前归还 − 12 小时”作为租赁到期，不再用创建时间机械加租期 |
 | IGXE | 交易链接；或无链接时至少四项 `订单类型`、`创建时间`、`租赁到期时间`、`归还截止时间`、`租赁租金` | 交易 ID、磨损、原始日租、出租天数、押金、可用时的订单金额、连续出租折扣、**租赁到期时间**；Chrome 纯文本复制可能丢失交易链接，此时用订单关键字段生成稳定本地键去重。未结算订单没有金额也可导入，预览必须选择一键定价 5% 或手动定价 10%；页面时间按北京时间解释 |
 
-`rental_orders` 使用 `(platform, order_no)` 唯一键，因此再次复制同一页面只更新订单而不会重复计算。资产与订单优先使用显式 `item_id`；只有磨损匹配到唯一资产时才自动关联，冲突时由用户在预览中选择。与前一单**租赁到期**间隔少于 7 天的订单显示为“已转租”，间隔达到 7 天或没有前序订单则显示为“已出租”。任何解析失败或被用户在预览中取消的订单都不会写入数据库。
+`rental_orders` 使用 `(platform, order_no)` 唯一键，因此再次复制同一页面只更新订单而不会重复计算。关联按以下顺序进行：已确认的 `item_id`、稳定 `asset_id`、唯一的库存磨损，最后是已有资产历史中唯一的已关联磨损。最后一项**不按平台过滤**：一件饰品可在 A 平台买入、在 B 平台出租；本次导入的平台始终写入订单本身，不会覆盖资产的买入平台。若候选不唯一，订单保持未关联并在预览中要求用户选择。预览窗口已加大，定价方式与关联资产列固定为可见宽度，悬停关联框可查看自动关联原因。与前一单**租赁到期**间隔少于 7 天的订单显示为“已转租”，间隔达到 7 天或没有前序订单则显示为“已出租”。任何解析失败或被用户在预览中取消的订单都不会写入数据库。
 
 
 ## 6. 本地 CS2 饰品映射
@@ -198,8 +198,8 @@ Google Drive 手动同步只导出 `rental_orders`、行情观察分类/观察�
 来源是 ByMykel/CSGO-API 的两个本地 JSON 文件：
 
 ```text
-private-data/schema-source/skins_not_grouped.en.json
-private-data/schema-source/skins_not_grouped.zh-CN.json
+assets/schema-source/skins_not_grouped.en.json
+assets/schema-source/skins_not_grouped.zh-CN.json
 ```
 
 首次运行或源文件变化时，程序会自动生成 `private-data/cs2_items_schema.json`。索引将中文名映射到：

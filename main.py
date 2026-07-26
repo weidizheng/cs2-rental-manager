@@ -563,13 +563,15 @@ class RentalHistoryDialog(QDialog):
 class RentalImportPreviewDialog(QDialog):
     """Show parsed clipboard orders before the user allows a database write."""
 
-    def __init__(self, platform, orders, items=None, parent=None):
+    def __init__(self, platform, orders, items=None, known_orders=None, parent=None):
         super().__init__(parent)
         self.platform = platform
         self.orders = orders
         self.items = list(items or [])
+        self.known_orders = list(known_orders or [])
         self.setWindowTitle("确认导入出租订单")
-        self.resize(1240, 500)
+        self.resize(1480, 780)
+        self.setMinimumSize(1260, 680)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
@@ -591,7 +593,11 @@ class RentalImportPreviewDialog(QDialog):
         header.setFont(QFont("Microsoft YaHei", 11, QFont.DemiBold))
         self.table.setFont(QFont("Microsoft YaHei", 11))
         header.setSectionResizeMode(2, QHeaderView.Stretch)
-        for column in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 11):
+        header.setSectionResizeMode(11, QHeaderView.Interactive)
+        header.setSectionResizeMode(12, QHeaderView.Interactive)
+        self.table.setColumnWidth(11, 210)
+        self.table.setColumnWidth(12, 320)
+        for column in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
 
         for row, order in enumerate(orders):
@@ -611,7 +617,7 @@ class RentalImportPreviewDialog(QDialog):
             ]
             for column, value in enumerate(values):
                 self.table.setItem(row, column, QTableWidgetItem(str(value)))
-            association = match_order_to_items(order, self.items)
+            association = match_order_to_items(order, self.items, self.known_orders)
             if association["item_id"] is not None:
                 order["item_id"] = association["item_id"]
                 order["match_method"] = association["method"]
@@ -629,7 +635,9 @@ class RentalImportPreviewDialog(QDialog):
                 "asset_id": "Asset ID 唯一匹配",
                 "exact_float": "磨损精确匹配",
                 "fuzzy_float": "磨损截断匹配，请核对",
+                "history_float": "按资产历史的磨损自动关联（跨平台）",
                 "ambiguous_float": "存在多个候选，请手动选择",
+                "ambiguous_history": "历史记录存在多个关联资产，请手动选择",
                 "unmatched": "未自动匹配",
             }.get(association["method"], association["method"])
             selector.setToolTip(method_label)
@@ -1961,7 +1969,7 @@ class CS2ManagerApp(QMainWindow):
             QMessageBox.warning(self, "剪贴板导入", f"已识别 {platform}，但未解析到有效订单。")
             return
         preview = RentalImportPreviewDialog(
-            platform, orders, self.db.get_all_items(), self
+            platform, orders, self.db.get_all_items(), self.db.get_rental_orders(), self
         )
         if preview.exec() != QDialog.Accepted:
             return
@@ -3874,6 +3882,7 @@ class CS2ManagerApp(QMainWindow):
             "同步出租订单、行情收藏分类和 API 配置。同步包整体采用 AES-256-GCM 口令加密；"
             "上传到 Google Drive 后，另一台电脑下载并放入下方收件箱目录即可导入。"
             "订单与收藏采用合并模式，不删除本机独有数据。"
+            "中英文饰品映射资源随程序内置，不包含在同步包中。"
         )
         cloud_note.setWordWrap(True)
         cloud_note.setStyleSheet("color: #cdd6f4;")

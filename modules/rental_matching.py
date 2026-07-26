@@ -88,9 +88,16 @@ def rental_float_matches(asset_value: Any, order_value: Any) -> bool:
 
 
 def match_order_to_items(
-    order: dict[str, Any], items: Iterable[dict[str, Any]]
+    order: dict[str, Any],
+    items: Iterable[dict[str, Any]],
+    known_orders: Iterable[dict[str, Any]] = (),
 ) -> dict[str, Any]:
-    """Return one safe association, or an explicit ambiguous/unmatched result."""
+    """Return one safe association, or an explicit ambiguous/unmatched result.
+
+    ``known_orders`` carries prior order-to-asset links.  It deliberately does
+    not filter by platform: an asset can be bought on one platform and rented
+    on another, while its float remains the stable cross-platform identity.
+    """
     inventory = list(items)
     explicit_id = order.get("item_id")
     if explicit_id not in (None, ""):
@@ -138,9 +145,27 @@ def match_order_to_items(
         if named:
             candidates = named
     if len(candidates) != 1:
+        history_item_ids = set()
+        for historic_order in known_orders:
+            linked_id = historic_order.get("item_id")
+            try:
+                linked_id = int(linked_id) if linked_id not in (None, "") else None
+            except (TypeError, ValueError):
+                linked_id = None
+            if linked_id is None:
+                continue
+            if rental_float_matches(historic_order.get("float_val"), order_float):
+                history_item_ids.add(linked_id)
+        if len(history_item_ids) == 1:
+            return {
+                "item_id": history_item_ids.pop(),
+                "method": "history_float",
+                "confidence": 0.95,
+            }
         return {
             "item_id": None,
-            "method": "ambiguous_float" if candidates else "unmatched",
+            "method": "ambiguous_history" if history_item_ids
+            else ("ambiguous_float" if candidates else "unmatched"),
             "confidence": 0.0,
         }
 

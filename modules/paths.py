@@ -20,6 +20,20 @@ if getattr(sys, "frozen", False):
 else:
     PROJECT_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_PRIVATE_DATA_DIR = PROJECT_DIR / "private-data"
+RESOURCE_DIR = PROJECT_DIR / "assets"
+
+
+def get_resource_path(*parts: str) -> Path:
+    """Return a bundled, read-only application resource path.
+
+    PyInstaller exposes bundled files under ``_MEIPASS`` while a source run
+    keeps them in the repository's ``assets`` folder.  These files are
+    application resources, not user data, and must therefore never be placed
+    in a cloud-synchronised private-data directory.
+    """
+    bundle_dir = getattr(sys, "_MEIPASS", None)
+    root = Path(bundle_dir) if bundle_dir else RESOURCE_DIR
+    return root.joinpath(*parts)
 
 
 def get_private_data_dir() -> Path:

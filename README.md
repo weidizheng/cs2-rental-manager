@@ -102,7 +102,11 @@ CSFloat 的公开文档没有给出一个适用于所有接口的固定额度，
 3. 另一台电脑从 Google Drive 网页下载文件，放入 `private-data/cloud-sync/inbox/`，再点击“导入下载的同步包”并输入相同口令。
 4. 导入按 `(平台, 订单号)` 合并订单，按分类与观察品标识合并收藏，不删除本机独有数据；导入前会在 `private-data/cloud-sync/backups/` 自动生成加密备份。
 
+同步包只包含出租订单、行情收藏和 API 配置；中英文饰品映射资源随程序内置，不会写进 `private-data/` 或同步包。
+
 忘记同步口令时无法恢复同步包内容，只能在原电脑重新生成。不要把口令与同步包存放在同一个云盘目录。
+
+本次版本的导入关联规则、离线资源位置、同步范围和打包发布步骤见 [发布说明](docs/RELEASE_NOTES.md)。
 
 ## 私密数据与换电脑
 
@@ -112,7 +116,7 @@ CSFloat 的公开文档没有给出一个适用于所有接口的固定额度，
 - `items.json`、`configs.json`：原子写入的恢复备份；`configs.json` 中的接口凭据为 Windows 当前用户加密值
 - `market_cache.json`、`eco_market_cache.db`：前者仅为旧版行情数据迁移来源；后者为可重建的 ECO 全量快照
 - `exchange_rate_cache.json`：CSFloat/ECB 汇率及网络失败冷却缓存
-- `schema-source/`、`cs2_items_schema.json`：本地饰品映射资源
+- 内置的 `assets/schema-source/`：本地中英文饰品映射原始资源；`cs2_items_schema.json` 是可重建的私有索引
 - `browser-profiles/c5game/`：旧版浏览器读取功能留下的登录档案；当前界面不使用，保留仅用于避免误删历史登录状态
 - `logs/`：轮转日志
 - `cloud-sync/`：Google Drive 手动同步的收件箱、发件箱与导入前加密备份
@@ -126,7 +130,7 @@ CSFloat 的公开文档没有给出一个适用于所有接口的固定额度，
 - `release/` 应只保留已验证的一个正式 EXE（约 51MB）。当前的 `CS2租赁管理.exe` 与 `CS2租赁管理-界面优化版.exe` 属于两份候选包；确认新包可正常运行后，只保留正式文件名的那一份，另一份可移至外部归档或删除。
 - `build/` 是 PyInstaller 工作目录（约 54MB），可随时由 `build_exe.bat` 重建，不是运行软件或备份数据所必需。成功打包后脚本会自动清理；只有失败时才暂留供排障。
 - `browser-profiles/c5game/` 约 28MB，且当前版本只调用系统默认浏览器打开 C5 页面，不读取此隔离 Profile。确认不再需要旧登录档案后，可先压缩归档到项目外，再删除此目录；其中可能含登录状态，绝不能上传或提交。
-- `schema-source/` 的两份原始中英文饰品数据约 70MB，`cs2_items_schema.json` 是由它们生成的约 34MB 本地索引。它们在当前实现中都不能单独删除：源数据缺失时本地名称映射不会加载。后续若要进一步瘦身，应改为只发布一份紧凑索引，或把原始源数据放入可选更新包，而不是手动删除。
+- `assets/schema-source/` 的两份原始中英文饰品数据约 70MB，会随程序打包；`private-data/cs2_items_schema.json` 是由它们生成的约 34MB 私有索引。源数据缺失时本地名称映射不会加载，因此不要手动删除内置资源。
 - `images/`、`eco_market_cache.db`、日志均是可重建缓存；程序已有图片 250MB/2,000 张、日志约 6MB、ECO 最近两个账号快照的上限。当前分别约 5.4MB、7.5MB、0.8MB，无需处理。
 - `app.db`、`items.json`、`configs.json` 是业务数据或恢复备份，不能以“清理空间”为目的删除。`app.db-wal` 与 `app.db-shm` 是 SQLite 运行时文件：软件运行时不要手动移动或删除；关闭软件并完成数据库检查后会自行收敛。
 - 根目录的 `__pycache__/`、`.ruff_cache/`、`.coverage`、`.idea/` 是开发缓存且当前不足 1MB，已被 Git 忽略；`keys/`、`logs/`、`.agents/` 为空的历史目录不影响体积，可在确认没有外部工具依赖后再整理。

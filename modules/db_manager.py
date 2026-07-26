@@ -542,6 +542,7 @@ class DBManager:
         """Store manually read rental orders without changing inventory rows."""
         synced_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         inventory = self.get_all_items()
+        known_orders = self.get_rental_orders()
         with self._db_lock:
             conn = self.get_connection()
             cursor = conn.cursor()
@@ -549,7 +550,7 @@ class DBManager:
                 order_no = str(order.get("order_no", "")).strip()
                 if not order_no:
                     continue
-                association = match_order_to_items(order, inventory)
+                association = match_order_to_items(order, inventory, known_orders)
                 income = float(order.get("income", 0.0) or 0.0)
                 daily_rent = float(order.get("daily_rent", 0.0) or 0.0)
                 deposit = float(order.get("deposit", 0.0) or 0.0)

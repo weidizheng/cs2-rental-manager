@@ -9,10 +9,10 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
-from modules.paths import get_private_path
+from modules.paths import get_private_path, get_resource_path
 
 
-SOURCE_DIR = get_private_path("schema-source")
+SOURCE_DIR = get_resource_path("schema-source")
 EN_SOURCE_PATH = SOURCE_DIR / "skins_not_grouped.en.json"
 ZH_SOURCE_PATH = SOURCE_DIR / "skins_not_grouped.zh-CN.json"
 INDEX_PATH = get_private_path("cs2_items_schema.json")
