@@ -66,12 +66,12 @@ def float_match_precision(
 
 
 def rental_float_matches(asset_value: Any, order_value: Any) -> bool:
-    """Match an order to legacy asset precision using the original strict bound.
+    """Match an order float to an asset float without discarding source digits.
 
-    Order association predates AI asset merging and intentionally keeps its
-    half-unit boundary strict.  The broader truncation-or-rounding rule belongs
-    to the same-type asset import planner, where ambiguous candidates are shown
-    to the user instead of silently attaching an order.
+    Platforms frequently show fewer decimals than the stored inventory value.
+    A match is safe when the higher-precision value truncates or rounds to the
+    displayed value at a sufficiently distinctive shared precision.  Exact
+    legacy values remain compatible even when the page reports few decimals.
     """
     asset = _decimal_with_precision(asset_value)
     order = _decimal_with_precision(order_value)
@@ -81,8 +81,11 @@ def rental_float_matches(asset_value: Any, order_value: Any) -> bool:
     order_number, _order_precision = order
     if asset_number == order_number:
         return True
-    if asset_precision <= 0:
-        return False
+    if asset_precision >= _order_precision:
+        return float_match_precision(asset_value, order_value) is not None
+    # For legacy assets that retained fewer digits than an order, keep the
+    # original strict half-unit boundary. This avoids merging the adjacent
+    # float exactly at the rounding midpoint.
     tolerance = Decimal("0.5") * (Decimal(10) ** -asset_precision)
     return abs(asset_number - order_number) < tolerance
 

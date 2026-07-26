@@ -66,6 +66,14 @@ class RentalFloatMatchingTests(unittest.TestCase):
         self.assertEqual(result["method"], "history_float")
         self.assertEqual(result["confidence"], 0.95)
 
+    def test_matches_a_displayed_short_float_to_a_precise_inventory_float(self):
+        result = match_order_to_items(
+            {"float_val": "0.3505181372"},
+            [{"id": 18, "name": "专业手套", "float_val": "0.350518137216568"}],
+        )
+        self.assertEqual(result["item_id"], 18)
+        self.assertEqual(result["method"], "fuzzy_float")
+
 
 if __name__ == "__main__":
     unittest.main()

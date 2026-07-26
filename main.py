@@ -588,7 +588,14 @@ class RentalImportPreviewDialog(QDialog):
         self.table.setWordWrap(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setAlternatingRowColors(True)
-        self.table.setStyleSheet("alternate-background-color: #1e1e2e;")
+        # The preview has no need for spreadsheet-like row numbers. Hiding the
+        # vertical header also removes the otherwise unthemed grey/white strip.
+        self.table.verticalHeader().setVisible(False)
+        self.table.setStyleSheet(
+            "alternate-background-color: #1e1e2e;"
+            "QHeaderView::section { background: #202735; color: #bdc8d9; }"
+            "QTableCornerButton::section { background: #202735; border: none; }"
+        )
         header = self.table.horizontalHeader()
         header.setFont(QFont("Microsoft YaHei", 11, QFont.DemiBold))
         self.table.setFont(QFont("Microsoft YaHei", 11))
@@ -622,15 +629,6 @@ class RentalImportPreviewDialog(QDialog):
                 order["item_id"] = association["item_id"]
                 order["match_method"] = association["method"]
                 order["match_confidence"] = association["confidence"]
-            selector = QComboBox()
-            selector.addItem("暂不关联", None)
-            selected_index = 0
-            for asset in self.items:
-                label = f"{asset.get('name', '未命名')} · {asset.get('float_val', '')}"
-                selector.addItem(label, asset.get("id"))
-                if asset.get("id") == association["item_id"]:
-                    selected_index = selector.count() - 1
-            selector.setCurrentIndex(selected_index)
             method_label = {
                 "asset_id": "Asset ID 唯一匹配",
                 "exact_float": "磨损精确匹配",
@@ -640,26 +638,26 @@ class RentalImportPreviewDialog(QDialog):
                 "ambiguous_history": "历史记录存在多个关联资产，请手动选择",
                 "unmatched": "未自动匹配",
             }.get(association["method"], association["method"])
-            selector.setToolTip(method_label)
-            selector.currentIndexChanged.connect(
-                lambda _index, target=order, field=selector: self._set_order_asset(target, field)
+            linked_asset = next(
+                (asset for asset in self.items if asset.get("id") == order.get("item_id")),
+                None,
             )
+            asset_text = (
+                f"{linked_asset.get('name', '未命名')} · {linked_asset.get('float_val', '')}"
+                if linked_asset else "导入时询问"
+            )
+            asset_cell = QTableWidgetItem(asset_text)
+            asset_cell.setToolTip(method_label)
+            self.table.setItem(row, 12, asset_cell)
             if platform == "IGXE":
-                pricing_selector = QComboBox()
-                pricing_selector.addItem("请选择", "")
-                pricing_selector.addItem("一键定价（服务费 5%）", "one_click")
-                pricing_selector.addItem("手动定价（服务费 10%）", "manual")
                 selected_mode = str(order.get("pricing_mode", "") or "")
-                selected_mode_index = pricing_selector.findData(selected_mode)
-                pricing_selector.setCurrentIndex(max(0, selected_mode_index))
-                pricing_selector.currentIndexChanged.connect(
-                    lambda _index, target=order, field=pricing_selector:
-                    self._set_order_pricing_mode(target, field)
-                )
-                self.table.setCellWidget(row, 11, pricing_selector)
+                pricing_text = {
+                    "one_click": "一键定价（服务费 5%）",
+                    "manual": "手动定价（服务费 10%）",
+                }.get(selected_mode, "导入时询问")
+                self.table.setItem(row, 11, QTableWidgetItem(pricing_text))
             else:
                 self.table.setItem(row, 11, QTableWidgetItem("不适用"))
-            self.table.setCellWidget(row, 12, selector)
         layout.addWidget(self.table)
 
         buttons = QHBoxLayout()
@@ -673,38 +671,66 @@ class RentalImportPreviewDialog(QDialog):
         buttons.addWidget(confirm_button)
         layout.addLayout(buttons)
 
-    @staticmethod
-    def _set_order_asset(order, selector):
-        item_id = selector.currentData()
-        if item_id is None:
+    def _accept_import(self):
+        if self.platform == "IGXE":
+            for order in self.orders:
+                if not order.get("pricing_mode") and not self._ask_igxe_pricing_mode(order):
+                    return
+        for order in self.orders:
+            if order.get("item_id") in (None, "") and not self._ask_asset_association(order):
+                return
+        self.accept()
+
+    def _ask_igxe_pricing_mode(self, order):
+        prompt = QMessageBox(self)
+        prompt.setWindowTitle("确认 IGXE 定价方式")
+        prompt.setIcon(QMessageBox.Question)
+        prompt.setText(f"订单 {order.get('order_no', '（未识别订单号）')} 未包含定价方式。")
+        prompt.setInformativeText("请选择本次出租使用的一种定价方式；取消将返回导入预览。")
+        one_click = prompt.addButton("一键定价（服务费 5%）", QMessageBox.AcceptRole)
+        manual = prompt.addButton("手动定价（服务费 10%）", QMessageBox.ActionRole)
+        prompt.addButton(QMessageBox.Cancel)
+        prompt.exec()
+        if prompt.clickedButton() is one_click:
+            order["pricing_mode"] = "one_click"
+            return True
+        if prompt.clickedButton() is manual:
+            order["pricing_mode"] = "manual"
+            return True
+        return False
+
+    def _ask_asset_association(self, order):
+        labels = ["暂不关联（仍导入此订单）"]
+        asset_by_label = {}
+        for asset in self.items:
+            label = (
+                f"#{asset.get('id')} · {asset.get('name', '未命名')}"
+                f" · 磨损 {asset.get('float_val', '')}"
+            )
+            labels.append(label)
+            asset_by_label[label] = asset
+
+        picker = QInputDialog(self)
+        picker.setWindowTitle("选择关联资产")
+        picker.setLabelText(
+            f"订单 {order.get('order_no', '（未识别订单号）')} 无法唯一自动关联。\n"
+            "请选择资产，或选择“暂不关联”继续导入。"
+        )
+        picker.setComboBoxItems(labels)
+        picker.resize(680, 260)
+        if picker.exec() != QDialog.Accepted:
+            return False
+        selected = picker.textValue()
+        asset = asset_by_label.get(selected)
+        if asset is None:
             order.pop("item_id", None)
             order["match_method"] = "unmatched"
             order["match_confidence"] = 0.0
-            return
-        order["item_id"] = int(item_id)
-        order["match_method"] = "manual"
-        order["match_confidence"] = 1.0
-
-    @staticmethod
-    def _set_order_pricing_mode(order, selector):
-        order["pricing_mode"] = str(selector.currentData() or "")
-
-    def _accept_import(self):
-        if self.platform == "IGXE":
-            unselected = [
-                str(order.get("order_no", "")) for order in self.orders
-                if not order.get("pricing_mode")
-            ]
-            if unselected:
-                QMessageBox.warning(
-                    self,
-                    "请选择 IGXE 定价方式",
-                    "IGXE 页面不提供定价方式，无法由文字可靠判断。\n"
-                    "请为每笔订单选择“一键定价（5%）”或“手动定价（10%）”后再导入：\n"
-                    + "、".join(unselected),
-                )
-                return
-        self.accept()
+        else:
+            order["item_id"] = int(asset["id"])
+            order["match_method"] = "manual"
+            order["match_confidence"] = 1.0
+        return True
 
 
 class MarketAIImportDialog(QDialog):

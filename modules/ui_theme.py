@@ -153,6 +153,12 @@ QHeaderView::section {
     border-right: 1px solid #303a4c;
     font-weight: 700;
 }
+QTableCornerButton::section, QHeaderView::section:vertical {
+    background: #202735;
+    color: #bdc8d9;
+    border: none;
+    border-right: 1px solid #303a4c;
+}
 QLineEdit, QComboBox, QPlainTextEdit {
     background: #1c2431;
     color: #f1f5fb;
