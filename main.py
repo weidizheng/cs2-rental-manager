@@ -607,6 +607,11 @@ class RentalHistoryDialog(QDialog):
             return "C5 转租奖励：不适用于此平台"
         cost = order.get("transfer_reward_cost", 0.0) or 0.0
         if cost:
+            if (
+                order.get("transfer_reward_known")
+                and str(order.get("reward_status", "") or "") == "已发放"
+            ):
+                return f"C5 转租奖励成本：{_money_text(cost)}（以 C5 已发放的最终金额为准）"
             return f"C5 转租奖励成本：{_money_text(cost)}（按下一单时间与链路比例计算）"
         return "C5 转租奖励：暂无符合条件的后续转租订单"
 
@@ -4674,6 +4679,13 @@ class CS2ManagerApp(QMainWindow):
         """Calculate the C5 reward cost borne by this relet source order."""
         if order.get("platform") != "C5GAME" or _is_non_earning_rental_status(order.get("status")):
             return 0.0
+        # A completed C5 payout is the authoritative settlement value. The
+        # following-order timing is only a forecast until C5 marks it paid.
+        if (
+            order.get("transfer_reward_known")
+            and str(order.get("reward_status", "") or "") == "已发放"
+        ):
+            return max(0.0, self._order_number(order.get("transfer_reward")))
         source_key = self._order_key(order)
         source_end = self._rental_end_datetime(order)
         if source_end <= datetime.min:

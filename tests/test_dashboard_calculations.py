@@ -405,6 +405,21 @@ class DashboardCalculationTests(unittest.TestCase):
         successor["start_time"] = "2026-07-02 03:00:00"
         self.assertEqual(app._order_transfer_reward(source, [source, successor]), 3.0)
 
+    def test_c5_final_paid_reward_overrides_the_timing_forecast(self):
+        app = CS2ManagerApp.__new__(CS2ManagerApp)
+        source = {
+            "platform": "C5GAME", "order_no": "source", "daily_rent": 20.8,
+            "rental_days": 1.0, "rental_end_time": "2026-07-13 17:24:08",
+            "transfer_reward": 0.62, "transfer_reward_known": True,
+            "reward_status": "已发放",
+        }
+        successor = {
+            "platform": "C5GAME", "order_no": "next",
+            "start_time": "2026-07-13 18:53:39",
+        }
+        # Timestamp forecast would be 0.832; C5's final payout wins.
+        self.assertEqual(app._order_transfer_reward(source, [source, successor]), 0.62)
+
     def test_c5_second_and_multiple_reward_factors(self):
         app = CS2ManagerApp.__new__(CS2ManagerApp)
         source = {
