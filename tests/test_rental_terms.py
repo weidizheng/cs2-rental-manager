@@ -348,6 +348,18 @@ class RentalTermStorageTests(unittest.TestCase):
             self.db.get_rental_orders()[0]["pricing_mode"], "manual"
         )
 
+    def test_upsert_persists_c5_relet_chain_decision(self):
+        self.db.upsert_rental_orders(
+            "C5GAME",
+            [{
+                "order_no": "C5-retry", "relet_kind": "second",
+                "relet_root_order_no": "C5-source",
+            }],
+        )
+        order = self.db.get_rental_orders()[0]
+        self.assertEqual(order["relet_kind"], "second")
+        self.assertEqual(order["relet_root_order_no"], "C5-source")
+
     def test_user_unlinked_order_is_saved_and_stays_unlinked_on_reimport(self):
         order = {
             "order_no": "IGXE-7851705",
@@ -468,6 +480,8 @@ class RentalTermStorageTests(unittest.TestCase):
         }
         self.assertIn("rental_type", columns)
         self.assertIn("pricing_mode", columns)
+        self.assertIn("relet_kind", columns)
+        self.assertIn("relet_root_order_no", columns)
         self.assertEqual(self.db.get_rental_orders()[0]["rental_type"], "short")
 
 

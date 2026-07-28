@@ -51,7 +51,7 @@ CSQAQ 的“当前出租数量/在租数量”视为供给和市场覆盖代理�
 ### 2.3 项目缓存与费率
 
 `private-data/app.db` 提供项目已经刷新过的市场报价、四代手套分类和出租平台报价；旧版 `market_cache.json` 只在升级时作为一次性迁移来源。
-`private-data/configs.json` 提供 C5、IGXE、ECO 等平台的首租/转租费率以及 CSFloat 官方汇率获取所需配置。
+`private-data/configs.json` 保留 CSFloat 官方汇率获取所需配置；出租平台费率已改为程序固定规则，详见 `FEE_AND_RELET_RULES.md`。
 
 悠悠租金只用于判断其他平台租金是否异常，不作为实际出租收入来源。
 

@@ -320,6 +320,7 @@ class DashboardCalculationTests(unittest.TestCase):
         self.assertIs(exact, exact_quote)
         self.assertIs(fallback, fallback_quote)
 
+    @unittest.skip("Platform fees are now fixed and settings are not read.")
     def test_dashboard_fee_rates_are_loaded_once_per_config(self):
         class DBStub:
             def __init__(self):
@@ -339,6 +340,7 @@ class DashboardCalculationTests(unittest.TestCase):
         self.assertEqual(rates["c5_first_fee"], 0.05)
         self.assertEqual(rates["eco_relet_fee"], 0.05)
 
+    @unittest.skip("C5 rewards are now calculated from the following order's timing.")
     def test_c5_transfer_reward_only_uses_c5_final_settlement_and_caps_at_five_percent(self):
         app = CS2ManagerApp.__new__(CS2ManagerApp)
         original = {
@@ -361,6 +363,64 @@ class DashboardCalculationTests(unittest.TestCase):
 
         non_c5 = dict(original, platform="IGXE")
         self.assertEqual(app._order_transfer_reward(non_c5, [non_c5]), 0.0)
+
+    def test_fixed_platform_fee_rules_do_not_read_settings(self):
+        class Stub:
+            pass
+
+        self.assertEqual(CS2ManagerApp._dashboard_fee_rates(Stub()), {})
+        self.assertEqual(
+            CS2ManagerApp._order_fee_rate(Stub(), {"platform": "C5GAME"}, []), 0.15
+        )
+        self.assertEqual(
+            CS2ManagerApp._order_fee_rate(Stub(), {"platform": "ECOSteam"}, []), 0.0
+        )
+        self.assertEqual(
+            CS2ManagerApp._order_fee_rate(
+                Stub(), {"platform": "IGXE", "pricing_mode": "one_click"}, []
+            ), 0.05,
+        )
+        self.assertEqual(
+            CS2ManagerApp._order_fee_rate(
+                Stub(), {"platform": "IGXE", "pricing_mode": "manual"}, []
+            ), 0.15,
+        )
+
+    def test_c5_transfer_reward_is_deducted_from_the_source_order(self):
+        app = CS2ManagerApp.__new__(CS2ManagerApp)
+        source = {
+            "platform": "C5GAME", "order_no": "source", "daily_rent": 100.0,
+            "rental_days": 1.0, "start_time": "2026-07-01 00:00:00",
+            "rental_end_time": "2026-07-02 00:00:00",
+        }
+        successor = {
+            "platform": "C5GAME", "order_no": "next",
+            "start_time": "2026-07-02 00:15:00",
+            "rental_end_time": "2026-07-10 00:00:00",
+        }
+        # First relet in under 30 minutes: the entire 5% reward pool.
+        self.assertEqual(app._order_transfer_reward(source, [source, successor]), 5.0)
+        successor["start_time"] = "2026-07-02 01:00:00"
+        self.assertEqual(app._order_transfer_reward(source, [source, successor]), 4.0)
+        successor["start_time"] = "2026-07-02 03:00:00"
+        self.assertEqual(app._order_transfer_reward(source, [source, successor]), 3.0)
+
+    def test_c5_second_and_multiple_reward_factors(self):
+        app = CS2ManagerApp.__new__(CS2ManagerApp)
+        source = {
+            "platform": "C5GAME", "order_no": "source", "daily_rent": 100.0,
+            "rental_days": 1.0, "start_time": "2026-07-01 00:00:00",
+            "rental_end_time": "2026-07-02 00:00:00",
+        }
+        second = {
+            "platform": "C5GAME", "order_no": "retry", "relet_root_order_no": "source",
+            "relet_kind": "second", "start_time": "2026-07-02 01:00:00",
+        }
+        self.assertEqual(app._order_transfer_reward(source, [source, second]), 2.0)
+        second["start_time"] = "2026-07-02 03:00:00"
+        self.assertEqual(app._order_transfer_reward(source, [source, second]), 1.5)
+        multiple = dict(second, relet_kind="multiple", start_time="2026-07-03 12:00:00")
+        self.assertEqual(app._order_transfer_reward(source, [source, multiple]), 1.0)
 
     def test_c5_transferred_reward_is_due_after_the_following_c5_order_ends(self):
         app = CS2ManagerApp.__new__(CS2ManagerApp)
@@ -401,7 +461,7 @@ class DashboardCalculationTests(unittest.TestCase):
             Stub(), {"platform": "IGXE", "pricing_mode": "manual"}, []
         )
         self.assertEqual(one_click, 0.05)
-        self.assertEqual(manual, 0.10)
+        self.assertEqual(manual, 0.15)
 
 
 if __name__ == "__main__":

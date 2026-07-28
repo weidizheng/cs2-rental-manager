@@ -521,7 +521,7 @@ class RentalHistoryDialog(QDialog):
         headers = (
             ["平台", "订单号", "饰品", "磨损", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "定价方式"]
             if unlinked else
-            ["平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "C5 转租奖励（已结算成本）", "净收入"]
+            ["平台", "状态", "出租时间", "租赁到期", "租期", "日租（原价）", "订单金额", "C5 转租奖励成本", "净收入"]
         )
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
@@ -605,23 +605,10 @@ class RentalHistoryDialog(QDialog):
     def _reward_detail_text(order):
         if order.get("platform") != "C5GAME":
             return "C5 转租奖励：不适用于此平台"
-        if not order.get("transfer_reward_known"):
-            return "C5 转租奖励：未从 C5 订单详情读取"
-        reward_status = str(order.get("reward_status", "未读取") or "未读取")
-        transfer_status = str(order.get("transfer_status", "未读取") or "未读取")
         cost = order.get("transfer_reward_cost", 0.0) or 0.0
         if cost:
-            settlement = f"已结算并计入成本：{_money_text(cost)}"
-        elif order.get("reward_settlement_due"):
-            settlement = "奖励待结算：下一笔 C5 订单已到期，请复制原订单详情重新导入。"
-        else:
-            settlement = "未计入成本（仅在 C5 显示“已发放”后结算）"
-        return (
-            f"C5 页面奖励：{_money_text(order.get('transfer_reward', 0.0) or 0.0)}"
-            f"（{reward_status}）\n"
-            f"转租状态：{transfer_status}\n"
-            f"{settlement}"
-        )
+            return f"C5 转租奖励成本：{_money_text(cost)}（按下一单时间与链路比例计算）"
+        return "C5 转租奖励：暂无符合条件的后续转租订单"
 
 
 class RentalImportPreviewDialog(QDialog):
@@ -717,7 +704,7 @@ class RentalImportPreviewDialog(QDialog):
                 selected_mode = str(order.get("pricing_mode", "") or "")
                 pricing_text = {
                     "one_click": "一键定价（服务费 5%）",
-                    "manual": "手动定价（服务费 10%）",
+                    "manual": "手动定价（服务费 15%）",
                 }.get(selected_mode, "导入时询问")
                 self.table.setItem(row, 11, QTableWidgetItem(pricing_text))
             else:
@@ -752,7 +739,7 @@ class RentalImportPreviewDialog(QDialog):
         prompt.setText(f"订单 {order.get('order_no', '（未识别订单号）')} 未包含定价方式。")
         prompt.setInformativeText("请选择本次出租使用的一种定价方式；取消将返回导入预览。")
         one_click = prompt.addButton("一键定价（服务费 5%）", QMessageBox.AcceptRole)
-        manual = prompt.addButton("手动定价（服务费 10%）", QMessageBox.ActionRole)
+        manual = prompt.addButton("手动定价（服务费 15%）", QMessageBox.ActionRole)
         prompt.addButton(QMessageBox.Cancel)
         prompt.exec()
         if prompt.clickedButton() is one_click:
@@ -2066,6 +2053,131 @@ class CS2ManagerApp(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl(url))
 
+    @staticmethod
+    def _c5_chain_root_order_no(order):
+        return str(
+            order.get("relet_root_order_no") or order.get("order_no") or ""
+        )
+
+    def _c5_previous_order_for_import(self, order, all_orders):
+        """Find the preceding C5 order for this physical asset."""
+        try:
+            item_id = int(order.get("item_id"))
+        except (TypeError, ValueError):
+            return None
+        current_start = _parse_platform_datetime_utc(
+            order.get("start_time"), "C5GAME"
+        )
+        if current_start <= datetime.min:
+            return None
+        candidates = []
+        for candidate in all_orders:
+            if candidate.get("platform") != "C5GAME":
+                continue
+            try:
+                same_item = int(candidate.get("item_id")) == item_id
+            except (TypeError, ValueError):
+                same_item = False
+            if not same_item or self._order_key(candidate) == self._order_key(order):
+                continue
+            candidate_start = _parse_platform_datetime_utc(
+                candidate.get("start_time"), "C5GAME"
+            )
+            if candidate_start < current_start:
+                candidates.append(candidate)
+        if not candidates:
+            return None
+        return max(candidates, key=self._rental_end_datetime)
+
+    def _ask_c5_gap_decision(self, previous, order, gap_hours):
+        prompt = QMessageBox(self)
+        prompt.setWindowTitle("确认 C5 转租链")
+        prompt.setIcon(QMessageBox.Question)
+        prompt.setText("同一资产的两笔 C5 订单间隔超过 12 小时。")
+        prompt.setInformativeText(
+            "上一单租赁到期："
+            f"{previous.get('rental_end_time') or previous.get('return_time') or '未知'}\n"
+            f"下一单订单时间：{order.get('start_time') or '未知'}\n"
+            f"间隔约 {gap_hours:.1f} 小时。请选择这笔后续订单的归属；"
+            "“已归还”不会计算转租奖励。"
+        )
+        second = prompt.addButton("次单", QMessageBox.AcceptRole)
+        multiple = prompt.addButton("多单", QMessageBox.ActionRole)
+        returned = prompt.addButton("已归还 / 非转租", QMessageBox.DestructiveRole)
+        prompt.addButton(QMessageBox.Cancel)
+        prompt.exec()
+        if prompt.clickedButton() is second:
+            return "second"
+        if prompt.clickedButton() is multiple:
+            return "multiple"
+        if prompt.clickedButton() is returned:
+            return "returned"
+        return None
+
+    def _assign_c5_relet_context(self, orders):
+        """Persist automatic or user-confirmed C5 relet-chain decisions."""
+        all_orders = list(self.db.get_rental_orders())
+        for order in sorted(
+            (candidate for candidate in orders if candidate.get("platform") == "C5GAME"),
+            key=lambda candidate: _parse_platform_datetime_utc(
+                candidate.get("start_time"), "C5GAME"
+            ),
+        ):
+            existing = next(
+                (
+                    candidate for candidate in all_orders
+                    if self._order_key(candidate) == self._order_key(order)
+                ),
+                None,
+            )
+            if existing and str(existing.get("relet_kind") or ""):
+                order["relet_kind"] = existing["relet_kind"]
+                order["relet_root_order_no"] = existing.get("relet_root_order_no", "")
+                all_orders.append(dict(order))
+                continue
+            previous = self._c5_previous_order_for_import(order, all_orders)
+            if previous is None:
+                all_orders.append(dict(order))
+                continue
+            previous_end = self._rental_end_datetime(previous)
+            current_start = _parse_platform_datetime_utc(
+                order.get("start_time"), "C5GAME"
+            )
+            if previous_end <= datetime.min or current_start <= datetime.min:
+                all_orders.append(dict(order))
+                continue
+            gap_hours = (current_start - previous_end).total_seconds() / 3600
+            # A completed predecessor becomes the source of its own handover.
+            # A cancelled attempted handover remains linked to its original
+            # source because a later retry is still compensating that source.
+            root_order_no = (
+                self._c5_chain_root_order_no(previous)
+                if _is_non_earning_rental_status(previous.get("status"))
+                else str(previous.get("order_no") or "")
+            )
+            if gap_hours > RENTAL_RELET_WINDOW.total_seconds() / 3600:
+                kind = self._ask_c5_gap_decision(previous, order, gap_hours)
+                if kind is None:
+                    return False
+                order["relet_kind"] = kind
+                order["relet_root_order_no"] = (
+                    "" if kind == "returned" else root_order_no
+                )
+            else:
+                if _is_non_earning_rental_status(previous.get("status")):
+                    cancelled = sum(
+                        1 for candidate in all_orders
+                        if self._c5_chain_root_order_no(candidate) == root_order_no
+                        and _is_non_earning_rental_status(candidate.get("status"))
+                    )
+                    kind = "second" if cancelled <= 1 else "multiple"
+                else:
+                    kind = "first"
+                order["relet_kind"] = kind
+                order["relet_root_order_no"] = root_order_no
+            all_orders.append(dict(order))
+        return True
+
     def _import_rental_orders_from_clipboard(self):
         text = QApplication.clipboard().text().strip()
         if not text:
@@ -2093,6 +2205,8 @@ class CS2ManagerApp(QMainWindow):
             order["match_method"] = "created_from_order"
             order["match_confidence"] = 1.0
             created_count += 1
+        if not self._assign_c5_relet_context(orders):
+            return
         self.db.upsert_rental_orders(platform, orders)
         self.load_data()
         unlinked_count = sum(
@@ -4119,28 +4233,15 @@ class CS2ManagerApp(QMainWindow):
         form_time.addRow("开机自启动:", self.cfg_startup)
         layout.addWidget(group_time)
 
-        group_fee = QGroupBox("出租手续费率（用于订单净收益与年化计算）")
+        group_fee = QGroupBox("出租计费规则")
         form_fee = QFormLayout(group_fee)
         fee_note = QLabel(
-            "费率修改并保存后，已有订单的净收益、累计净收益和年化统计也会立即按新费率重新计算。"
+            "固定规则：C5 服务费 15%；ECO 服务费 0%；IGXE 一键定价 5%、"
+            "自定义定价 15%。IGXE 连续出租先应用订单中的转租折扣，再扣服务费。"
         )
         fee_note.setWordWrap(True)
         fee_note.setStyleSheet("color: #cdd6f4; font-weight: normal;")
         form_fee.addRow(fee_note)
-        self.cfg_fee_inputs = {}
-        fee_fields = (
-            ("c5_first_fee", "C5 首次出租费率:"),
-            ("c5_relet_fee", "C5 转租费率:"),
-            ("eco_first_fee", "ECO 首次出租费率:"),
-            ("eco_relet_fee", "ECO 转租费率:"),
-            ("igxe_first_fee", "IGXE 首次出租费率:"),
-            ("igxe_relet_fee", "IGXE 转租费率:"),
-        )
-        for config_key, label in fee_fields:
-            field = QLineEdit(self.db.get_config(config_key))
-            field.setPlaceholderText("例如 0.15 = 15%")
-            self.cfg_fee_inputs[config_key] = field
-            form_fee.addRow(label, field)
         layout.addWidget(group_fee)
 
         save_btn = QPushButton("保存全部设置")
@@ -4570,17 +4671,95 @@ class CS2ManagerApp(QMainWindow):
         return self._order_number(order.get("income"))
 
     def _order_transfer_reward(self, order, history) -> float:
-        """Return the final C5 reward, never a provisional maximum or estimate."""
-        if (
-            order.get("platform") != "C5GAME"
-            or not order.get("transfer_reward_known")
-            or str(order.get("reward_status", "") or "") != "已发放"
-            or str(order.get("transfer_status", "") or "") != "已转交"
-        ):
+        """Calculate the C5 reward cost borne by this relet source order."""
+        if order.get("platform") != "C5GAME" or _is_non_earning_rental_status(order.get("status")):
             return 0.0
-        reward = max(0.0, self._order_number(order.get("transfer_reward")))
-        maximum = max(0.0, self._order_gross_income(order)) * 0.05
-        return min(reward, maximum)
+        source_key = self._order_key(order)
+        source_end = self._rental_end_datetime(order)
+        if source_end <= datetime.min:
+            return 0.0
+        c5_history = sorted(
+            (candidate for candidate in history if candidate.get("platform") == "C5GAME"),
+            key=lambda candidate: _parse_platform_datetime_utc(
+                candidate.get("start_time"), "C5GAME"
+            ),
+        )
+        explicit_successors = [
+            candidate for candidate in c5_history
+            if str(candidate.get("relet_root_order_no") or "") == source_key[1]
+            and str(candidate.get("relet_kind") or "") in {"first", "second", "multiple"}
+        ]
+        if explicit_successors:
+            successor, kind = self._first_completed_c5_successor(
+                explicit_successors
+            )
+        else:
+            successor, kind = self._infer_c5_successor(order, c5_history)
+        if successor is None or not kind:
+            return 0.0
+        successor_start = _parse_platform_datetime_utc(
+            successor.get("start_time"), "C5GAME"
+        )
+        elapsed_hours = (successor_start - source_end).total_seconds() / 3600
+        factor = self._c5_reward_factor(kind, elapsed_hours)
+        return self._order_gross_income(order) * 0.05 * factor
+
+    @staticmethod
+    def _first_completed_c5_successor(successors):
+        for candidate in sorted(
+            successors,
+            key=lambda value: _parse_platform_datetime_utc(
+                value.get("start_time"), "C5GAME"
+            ),
+        ):
+            if not _is_non_earning_rental_status(candidate.get("status")):
+                return candidate, str(candidate.get("relet_kind") or "")
+        return None, ""
+
+    def _infer_c5_successor(self, source_order, c5_history):
+        """Infer old C5 chains whose adjacent handovers stayed inside 12 hours."""
+        source_key = self._order_key(source_order)
+        try:
+            source_index = next(
+                index for index, candidate in enumerate(c5_history)
+                if self._order_key(candidate) == source_key
+            )
+        except StopIteration:
+            return None, ""
+        previous = source_order
+        cancelled_count = 0
+        source_end = self._rental_end_datetime(source_order)
+        for candidate in c5_history[source_index + 1:]:
+            previous_end = self._rental_end_datetime(previous)
+            candidate_start = _parse_platform_datetime_utc(
+                candidate.get("start_time"), "C5GAME"
+            )
+            if previous_end <= datetime.min or candidate_start <= datetime.min:
+                return None, ""
+            if candidate_start - previous_end > RENTAL_RELET_WINDOW:
+                return None, ""
+            if _is_non_earning_rental_status(candidate.get("status")):
+                cancelled_count += 1
+                previous = candidate
+                continue
+            kind = "first" if cancelled_count == 0 else (
+                "second" if cancelled_count == 1 else "multiple"
+            )
+            if source_end <= datetime.min:
+                return None, ""
+            return candidate, kind
+        return None, ""
+
+    @staticmethod
+    def _c5_reward_factor(kind, elapsed_hours) -> float:
+        kind = str(kind or "")
+        if kind == "multiple":
+            return 0.20
+        if elapsed_hours < 0.5:
+            return 1.00 if kind == "first" else 0.60
+        if elapsed_hours <= 2:
+            return 0.80 if kind == "first" else 0.40
+        return 0.60 if kind == "first" else 0.30
 
     def _reward_settlement_due(self, order, history, now=None) -> bool:
         """Whether a transferred C5 reward should now be reconciled from C5."""
@@ -4607,45 +4786,26 @@ class CS2ManagerApp(QMainWindow):
         return next_end > datetime.min and next_end <= (now or _utc_now())
 
     def _order_fee_rate(self, order, history, fee_rates=None) -> float:
-        if order.get("platform") == "IGXE":
+        platform = str(order.get("platform") or "")
+        if platform == "C5GAME":
+            return 0.15
+        if platform == "ECOSteam":
+            return 0.0
+        if platform == "IGXE":
             pricing_mode = str(order.get("pricing_mode", "") or "")
             if pricing_mode == "one_click":
                 return 0.05
             if pricing_mode == "manual":
-                return 0.10
-        platform_prefix = {
-            "C5GAME": "c5",
-            "ECOSteam": "eco",
-            "IGXE": "igxe",
-        }.get(order.get("platform", ""), "")
-        if not platform_prefix:
-            return 0.0
-        fee_kind = "relet" if self._is_relet_order(order, history) else "first"
-        config_key = f"{platform_prefix}_{fee_kind}_fee"
-        try:
-            raw_rate = (
-                fee_rates.get(config_key, 0.0)
-                if fee_rates is not None
-                else self.db.get_config(config_key)
-            )
-            return min(0.999, max(0.0, float(raw_rate or 0.0)))
-        except ValueError:
-            return 0.0
+                return 0.15
+            # Legacy IGXE rows were imported before the pricing-mode prompt.
+            # Keep the previous conservative one-click treatment until they
+            # are re-imported with a confirmed mode.
+            return 0.05
+        return 0.0
 
     def _dashboard_fee_rates(self) -> dict[str, float]:
-        """Read every dashboard fee once for one render pass."""
-        rates = {}
-        for platform_prefix in ("c5", "eco", "igxe"):
-            for fee_kind in ("first", "relet"):
-                config_key = f"{platform_prefix}_{fee_kind}_fee"
-                try:
-                    rates[config_key] = min(
-                        0.999,
-                        max(0.0, float(self.db.get_config(config_key) or 0.0)),
-                    )
-                except ValueError:
-                    rates[config_key] = 0.0
-        return rates
+        """Retained call shape for renderers; platform rates are now fixed."""
+        return {}
 
     @staticmethod
     def _order_key(order):
@@ -5573,20 +5733,7 @@ class CS2ManagerApp(QMainWindow):
         if csqaq_token and len(csqaq_token) < 8:
             QMessageBox.warning(self, "校验提示", "CSQAQ ApiToken 格式似乎不正确，请确认。")
 
-        fee_values = {}
-        for config_key, field in self.cfg_fee_inputs.items():
-            try:
-                fee_rate = float(field.text().strip())
-            except ValueError:
-                QMessageBox.warning(self, "费率校验", f"{config_key} 必须是 0 到 1 之间的小数，例如 0.15。")
-                return
-            if not 0 <= fee_rate < 1:
-                QMessageBox.warning(self, "费率校验", f"{config_key} 必须介于 0 和 1 之间。")
-                return
-            fee_values[config_key] = f"{fee_rate:g}"
-
-        # Validate every field before the first write so a bad fee cannot leave
-        # the API section only partially saved.
+        # Fee policies are platform rules, not mutable user preferences.
         int_val_map = {0: "0", 1: "5", 2: "15", 3: "30", 4: "60"}
         config_values = {
             "csqaq_token": csqaq_token,
@@ -5596,7 +5743,6 @@ class CS2ManagerApp(QMainWindow):
             "eco_partner_id": partner_id,
             "eco_rsa_key": rsa_key,
             "refresh_interval": int_val_map[self.cfg_interval.currentIndex()],
-            **fee_values,
         }
         self.db.save_configs(config_values)
 

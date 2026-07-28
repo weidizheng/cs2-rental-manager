@@ -221,6 +221,8 @@ class DBManager:
             reward_status TEXT DEFAULT '',
             transfer_reward_known INTEGER DEFAULT 0,
             pricing_mode TEXT NOT NULL DEFAULT '',
+            relet_kind TEXT NOT NULL DEFAULT '',
+            relet_root_order_no TEXT NOT NULL DEFAULT '',
             item_id INTEGER DEFAULT NULL,
             match_method TEXT NOT NULL DEFAULT '',
             match_confidence REAL NOT NULL DEFAULT 0.0,
@@ -593,8 +595,9 @@ class DBManager:
                     start_time, return_time, rental_end_time, return_deadline, transfer_status,
                     status, raw_text, transfer_reward, transfer_reward_cents,
                     reward_status, transfer_reward_known,
-                    pricing_mode, item_id, match_method, match_confidence, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    pricing_mode, relet_kind, relet_root_order_no,
+                    item_id, match_method, match_confidence, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(platform, order_no) DO UPDATE SET
                     item_name=excluded.item_name,
                     float_val=excluded.float_val,
@@ -625,6 +628,10 @@ class DBManager:
                     transfer_reward_known=MAX(rental_orders.transfer_reward_known, excluded.transfer_reward_known),
                     pricing_mode=CASE WHEN excluded.pricing_mode!=''
                         THEN excluded.pricing_mode ELSE rental_orders.pricing_mode END,
+                    relet_kind=CASE WHEN excluded.relet_kind!=''
+                        THEN excluded.relet_kind ELSE rental_orders.relet_kind END,
+                    relet_root_order_no=CASE WHEN excluded.relet_root_order_no!=''
+                        THEN excluded.relet_root_order_no ELSE rental_orders.relet_root_order_no END,
                     item_id=CASE WHEN excluded.match_method='user_unlinked'
                         THEN NULL ELSE COALESCE(excluded.item_id, rental_orders.item_id) END,
                     match_method=CASE WHEN excluded.item_id IS NOT NULL
@@ -666,6 +673,8 @@ class DBManager:
                     order.get("reward_status", ""),
                     1 if order.get("transfer_reward_known", False) else 0,
                     str(order.get("pricing_mode", "") or ""),
+                    str(order.get("relet_kind", "") or ""),
+                    str(order.get("relet_root_order_no", "") or ""),
                     association["item_id"],
                     association["method"],
                     association["confidence"],
@@ -686,7 +695,8 @@ class DBManager:
                        income_cents, daily_rent_cents, rental_days, rental_type, deposit_cents,
                        start_time, return_time, rental_end_time, return_deadline, transfer_status,
                        status, raw_text, transfer_reward_cents, reward_status,
-                       transfer_reward_known, pricing_mode, item_id, match_method, match_confidence, synced_at
+                       transfer_reward_known, pricing_mode, relet_kind, relet_root_order_no,
+                       item_id, match_method, match_confidence, synced_at
                 FROM rental_orders WHERE platform=?
                 ORDER BY synced_at DESC, id DESC
                 """,
@@ -698,7 +708,8 @@ class DBManager:
                        income_cents, daily_rent_cents, rental_days, rental_type, deposit_cents,
                        start_time, return_time, rental_end_time, return_deadline, transfer_status,
                        status, raw_text, transfer_reward_cents, reward_status,
-                       transfer_reward_known, pricing_mode, item_id, match_method, match_confidence, synced_at
+                       transfer_reward_known, pricing_mode, relet_kind, relet_root_order_no,
+                       item_id, match_method, match_confidence, synced_at
                 FROM rental_orders ORDER BY synced_at DESC, id DESC
             """)
             rows = cursor.fetchall()
@@ -706,7 +717,8 @@ class DBManager:
             "platform", "order_no", "item_name", "float_val", "income_cents", "daily_rent_cents", "rental_days", "rental_type", "deposit_cents",
             "start_time", "return_time", "rental_end_time", "return_deadline", "transfer_status",
             "status", "raw_text", "transfer_reward_cents", "reward_status",
-            "transfer_reward_known", "pricing_mode", "item_id", "match_method", "match_confidence", "synced_at",
+            "transfer_reward_known", "pricing_mode", "relet_kind", "relet_root_order_no",
+            "item_id", "match_method", "match_confidence", "synced_at",
         )
         orders = [dict(zip(columns, row)) for row in rows]
         # Keep reads compatible with rows imported before ``rental_type`` was

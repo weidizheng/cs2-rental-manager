@@ -9,7 +9,7 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
 CANONICAL_FLOAT_DECIMAL_PLACES = 8
 
 
@@ -318,6 +318,22 @@ def _migration_9(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE items SET platform='' WHERE platform='悠悠有品'")
 
 
+def _migration_10(conn: sqlite3.Connection) -> None:
+    """Persist explicit C5 handover decisions for ambiguous rental gaps."""
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='rental_orders'"
+    ).fetchone():
+        return
+    _add_columns(
+        conn,
+        "rental_orders",
+        (
+            ("relet_kind", "TEXT NOT NULL DEFAULT ''"),
+            ("relet_root_order_no", "TEXT NOT NULL DEFAULT ''"),
+        ),
+    )
+
+
 MIGRATIONS = {
     1: _migration_1,
     2: _migration_2,
@@ -328,6 +344,7 @@ MIGRATIONS = {
     7: _migration_7,
     8: _migration_8,
     9: _migration_9,
+    10: _migration_10,
 }
 
 
